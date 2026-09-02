@@ -57,6 +57,17 @@ standoff = 0.65      # GraspDriver base standoff at the work height (m)
 segment_cap = 0      # per-segment step cap; 0 = the mission's stage table
 stall_k = 40         # StallDetector: steps without progress (eef->target: reach_stall;
                      # base->dock on any nav leg: nav_stall)
+drop_over_dz = 0.12  # PointPlaceDriver: "over" height above the drop point (m)
+drop_edge_margin = 0.10  # ClusterDropDriver: past the stove bbox edge, toward the counter (m)
+drop_spread = 0.07   # ClusterDropDriver: per-can lateral pitch along the stove edge (m)
+drop_dz = 0.05       # ClusterDropDriver: release height above the stove-top plane (m)
+
+# failure_mode -> the tunables evolve's proposer perturbs FIRST for a first death
+# in that mode (manifest.mount_params hands it to the proposer as
+# params["tunable_hints"]); knobs not listed follow, in name order.
+[tunable_hints]
+reach_stall = ["drop_edge_margin", "drop_over_dz", "standoff", "hover_dz", "reach_tol"]
+nav_stall = ["stall_k"]
 
 # Predicates this card provides (the free-oracle factories in predicates.py;
 # harness.predicates folds them). reads = sigma keys, args = factory params.

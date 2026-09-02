@@ -953,6 +953,7 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
                     failed = left + bad_preds or [node["skill"]]
                     fault = {"kind": "node_failure", "node": node["id"],
                              "failed": failed, "done": done, "left": left,
+                             "failure_mode": (entry.get("diagnostics") or {}).get("failure_mode"),
                              "msg": (f"node {node['id']!r} failed: stages {left}, "
                                      f"predicates {bad_preds}; done {done}")}
                     opstream.emit("node_failed", node=node["id"],
@@ -964,6 +965,11 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
                 # done/left above: the planner keeps finished NODES too.
                 nodes_done = [nid for nid, n in nodes_out.items() if n["success"]]
                 fault["nodes_done"] = nodes_done
+                # a done recover-<id> and the strategy it ran (a stateless planner
+                # re-inserts it byte-identically -- protocol.recover_plan)
+                fault["recoveries_done"] = {
+                    nid[len("recover-"):]: done_specs[nid]["skill"]
+                    for nid in nodes_done if nid.startswith("recover-")}
                 fault["nodes_left"] = [n["id"] for n in plan["nodes"]
                                        if n["id"] not in nodes_done]
         if fault is None:

@@ -58,7 +58,7 @@ minimal form needs only a task name; the runtime runs allocate → calibrate →
 gates → prereg → dev → held-out → install by itself. See
 `docs/project-documentation.md` §4.
 `kind:"evolve"` is the lightweight loop (evolution mode only): per round look →
-try one change (executor switch or ±20% tunable) → same-seed re-run → publish
+try one change (executor switch or ±30% tunable, failure-mode-hinted) → same-seed re-run → publish
 only if the success count improves; cancel lands at the round boundary and a
 resubmit resumes from `campaign.json` cursor. See §4.0.
 An outside proposal (`submit_proposal` (JSON string on store/CLI, `proposal: dict` on MCP) → `runs/<session>/proposals/`, kind tunables|executor|card) replaces the built-in proposer for one round; same publish rule.

@@ -95,7 +95,6 @@ class PointPlaceDriver:
     interior centroid to ``_drop_point(env)`` (subclass-supplied). done() is the
     subclass's own live truth."""
 
-    OVER_DZ = 0.12
     RELEASE_TICKS = 6
 
     def __init__(self, obj_name: str):
@@ -104,6 +103,7 @@ class PointPlaceDriver:
         self.phase = "over"
         self._ticks = 0
         self._reach_tol = t["reach_tol"]
+        self._over_dz = t["drop_over_dz"]
         self._stall = D.StallDetector(t["stall_k"])
         self.failure_mode = None  # "reach_stall": over/lower made no progress
 
@@ -123,7 +123,7 @@ class PointPlaceDriver:
         c = np.asarray(self._drop_point(env), float)
         eef = D._eef(env)
         if self.phase == "over":
-            goal = np.array([c[0], c[1], c[2] + self.OVER_DZ])
+            goal = np.array([c[0], c[1], c[2] + self._over_dz])
             if np.linalg.norm((eef - goal)[:2]) < self._reach_tol:
                 self.phase = "lower"
             elif self._stall.update(float(np.linalg.norm(goal - eef))):
@@ -264,10 +264,12 @@ class CompositePolicies:
     driver armed with the owning mission's stage table."""
 
     def __init__(self, stages: dict[str, tuple[Any, int]], identity: str,
-                 tunables: dict | None = None) -> None:
+                 tunables: dict | None = None, tunable_hints: dict | None = None) -> None:
         self._stages = stages
         self._identity = identity
         D.mount_tunables(tunables)  # the card's [tunables] (+ an evolve trial's overlay)
+        # tunable_hints rides the same mount (manifest.mount_params); only evolve's
+        # proposer reads it -- accepted so the card's mount shape stays one dict.
 
     def make_driver(self, spec: Any) -> CompositeStageDriver:
         return CompositeStageDriver(self._stages, self._identity)

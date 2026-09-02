@@ -196,7 +196,8 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
             "failure_mode": (nodes[dead].get("diagnostics") or {}).get("failure_mode") if dead else None,
             "fault": {k: faults[0].get(k) for k in ("kind", "node", "msg")} if faults else None,
             "nodes": {nid: {"skill": skills.get(nid), "success": bool(n["success"]),
-                            "executor": n.get("executor") or "scripted"}
+                            "executor": n.get("executor") or "scripted",
+                            "tunables_sha": (n.get("diagnostics") or {}).get("tunables_sha")}
                       for nid, n in nodes.items()}}
         tick(per_seed_partial=per_seed({"seeds": per}))
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per)}
@@ -204,9 +205,12 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
 
 def per_seed(suite: dict) -> list[dict]:
     """The operator-facing per-seed summary sealed with every round (rsi_step /
-    campaign.json): ``[{seed, success, first_death, failure_mode}]`` -- the seed
-    detail that otherwise lives only in this process."""
-    return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")}}
+    campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha}]``
+    (the knobs the dying node ran under) -- the seed detail that otherwise lives
+    only in this process."""
+    return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
+             "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")
+             if s.get("first_death") else None}
             for seed, s in suite["seeds"].items()]
 
 
@@ -273,11 +277,16 @@ def _tunables(params: dict) -> tuple[dict, list]:
 def propose(before: dict, records: dict, emb: str, arm: str, binding: dict,
             round_no: int, applied: dict, history: list | None = None) -> dict:
     """``history`` = earlier round rows: an executor switch already tried on the
-    first-death node (won or lost) is not proposed again."""
+    first-death node (won or lost) is not proposed again, nor is a (knob,
+    direction) tunables step. Knobs the card's ``[tunable_hints]`` ties to the
+    node's failure_mode go first, each in both directions (-30% then +30%)."""
     deaths = Counter(s["first_death"] for s in before["seeds"].values() if s["first_death"])
     if not deaths:
         return _none("no first death: every seed succeeded", needs=())
     node = deaths.most_common(1)[0][0]
+    modes = Counter(s.get("failure_mode") for s in before["seeds"].values()
+                    if s["first_death"] == node and s.get("failure_mode"))
+    mode = modes.most_common(1)[0][0] if modes else None
     runs = [s["nodes"][node] for s in before["seeds"].values() if node in s["nodes"]]
     skill, current = runs[0]["skill"], runs[0]["executor"]
     rate = sum(r["success"] for r in runs) / len(runs)
@@ -305,18 +314,27 @@ def propose(before: dict, records: dict, emb: str, arm: str, binding: dict,
                            "evidence": dict(cands.get(untried[0]) or {}), "measured": rate}}
     ref = (rearm(spec, arm, current if current in bound else None).get("policy_provider")
            or binding["policy"])
-    tun, path = _tunables(mount_params(ref))
-    f = 1.2 if round_no % 2 else 0.8
-    # the card re-types the overlay (int stays int): a knob the step leaves where it
-    # is (0, a small int) is no trial -- skip it rather than burn a suite on it
-    step = {k: to for k, v in tun.items() if (to := type(v)(v * f)) != v}
-    if not step:
-        return _none(f"no untried executor for {skill!r} and no perturbable tunables on {ref!r}",
-                     node, needs=(f"tunables on {ref}", "evidence for another executor", "proposal"))
-    key = sorted(step)[round_no % len(step)]
-    return {"kind": "tunables", "node": node,
-            "detail": {"skill": skill, "executor": current, "ref": ref, "path": [*path, key],
-                       "from": tun[key], "to": step[key]}}
+    params = mount_params(ref)
+    tun, path = _tunables(params)
+    hinted = [k for k in (params.get("tunable_hints") or {}).get(mode) or () if k in tun]
+    done = set()   # (knob, went up?) steps already tried on this node (a proposal's row has no numeric from)
+    for r in history or ():
+        d = r["tried"]["detail"]
+        if r["tried"]["kind"] == "tunables" and r["tried"]["node"] == node \
+                and isinstance(d.get("from"), (int, float)) and isinstance(d.get("to"), (int, float)):
+            done.add((d["path"][-1], d["to"] > d["from"]))
+    for key in [*hinted, *sorted(set(tun) - set(hinted))]:
+        for f in (0.7, 1.3):
+            # the card re-types the overlay (int stays int): a knob the step leaves
+            # where it is (0, a small int) is no trial -- skip it rather than burn a suite
+            to = type(tun[key])(tun[key] * f)
+            if to == tun[key] or (key, to > tun[key]) in done:
+                continue
+            return {"kind": "tunables", "node": node,
+                    "detail": {"skill": skill, "executor": current, "ref": ref, "path": [*path, key],
+                               "from": tun[key], "to": to, "hint": mode if key in hinted else None}}
+    return _none(f"no untried executor for {skill!r} and no untried tunables step on {ref!r}",
+                 node, needs=(f"tunables on {ref}", "evidence for another executor", "proposal"))
 
 
 def apply(tried: dict, applied: dict) -> dict:
@@ -459,6 +477,7 @@ def main(argv=None) -> int:
         before = base or run_suite(args.task, binding, seeds, arm, args.skills_root, applied,
                                      media_dir=args.session / "media", budgets=budgets, progress=tick)
         tick(phase="propose")
+        os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])  # mount_params: the accepted overlay, not the last trial's
         prop = take_proposal(args.session, args.task, r)
         tried = (from_proposal(prop, before) if prop
                  else propose(before, records, emb, arm, binding, r, applied, doc["rounds"]))
@@ -486,7 +505,7 @@ def main(argv=None) -> int:
         doc["rounds"].append({
             "round": r, "tried": tried, "before": before["count"], "after": after["count"],
             "best": doc["best"], "suite_sha": after["sha"], "published": published,
-            "per_seed": per_seed(kept),
+            "per_seed": per_seed(kept), "after_seeds": per_seed(after),
             "needs": tried["detail"].get("needs", []) if tried["kind"] == "none" else [],
             "media": _media(args.session, args.task, seeds),
             "media_dropped": _dropped(args.session, args.task, seeds), "ts": time.time(),

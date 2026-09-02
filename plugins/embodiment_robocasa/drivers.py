@@ -821,6 +821,10 @@ class PlaceDriver:
             self._target = pts.mean(0)
         return self._target
 
+    #: the recovery seam's live target (RobocasaRecoveryActor.for_stage): a place
+    #: stage's repair aims at the cavity, not at the object riding in the gripper
+    _drop_point = _interior
+
     def act(self, env, obs):
         c = self._interior(env)
         eef = _eef(env)

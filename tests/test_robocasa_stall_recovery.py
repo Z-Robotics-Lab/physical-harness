@@ -60,6 +60,38 @@ def test_mounted_tunables_refuse_unknown_keys():
         D.mount_tunables(None)
 
 
+def test_card_tunable_hints_reach_the_proposer_through_mount_params():
+    hints = tomllib.loads(
+        (REPO / "plugins/embodiment_robocasa/manifest.toml").read_text())["tunable_hints"]
+    params = mount_params("plugins.embodiment_robocasa.recycle_driver:provider")
+    assert params["tunable_hints"] == hints
+    assert hints["reach_stall"][:2] == ["drop_edge_margin", "drop_over_dz"]
+    assert set(sum(hints.values(), [])) <= set(MANIFEST_TUNABLES)
+    for k in ("drop_over_dz", "drop_edge_margin", "drop_spread", "drop_dz"):
+        assert isinstance(MANIFEST_TUNABLES[k], float), k
+
+
+@pytest.mark.parametrize("task, node, mode, strategy", [
+    ("recycle_cans", "drop-can1", "reach_stall", "base_nudge"),
+    ("recycle_cans", "drop-can1", None, "reapproach"),
+    ("recycle_cans", "carry-can1", "reach_stall", "redock_retry"),
+    ("pack_lunch", "pack-hot0", "reach_stall", "base_nudge"),
+    ("kitchen_thaw", "place", "reach_stall", "base_nudge"),
+])
+def test_planner_overrides_the_recovery_by_failure_mode(task, node, mode, strategy):
+    planner = load_provider(discover().task_bindings[task]["planner"])
+    plan = planner.plan({"task": task, "fault": {
+        "kind": "no_progress", "node": node, "failure_mode": mode}})
+    rec = next(n for n in plan["nodes"] if n["id"] == f"recover-{node}")
+    assert rec["skill"] == strategy and rec["kind"] == "recovery"
+    # a later fault re-inserts the repair that RAN (fault.recoveries_done), not
+    # the table's default -- replan_monotone keeps the done node byte-identical
+    again = planner.plan({"task": task, "fault": {
+        "kind": "node_failure", "node": "report", "nodes_done": [f"recover-{node}"],
+        "recoveries_done": {node: strategy}}})
+    assert next(n for n in again["nodes"] if n["id"] == f"recover-{node}") == rec
+
+
 def test_mount_params_leaves_other_cards_untouched():
     assert "tunables" not in mount_params("plugins.embodiment_robosuite:provider")
     assert mount_params("nowhere:provider") == {}

@@ -245,8 +245,8 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
     assert [(s["round"], s["before"], s["after"], s["published"]) for s in steps] == \
         [(1, 0, 2, True), (2, 2, 2, False)]
     # per-seed detail of the kept suite rides both the round and its rsi_step row
-    kept = [{"seed": 1, "success": True, "first_death": None, "failure_mode": None},
-            {"seed": 2, "success": True, "first_death": None, "failure_mode": None}]
+    kept = [{"seed": s, "success": True, "first_death": None, "failure_mode": None,
+             "tunables_sha": None} for s in (1, 2)]
     assert [s["per_seed"] for s in steps] == [r1["per_seed"], r2["per_seed"]] == [kept, kept]
     assert (r1["needs"], r2["needs"]) == ([], []) and steps[1]["needs"] == []   # all seeds pass
     assert all(s["brief"] == name and s["task"] == TASK and s["suite_sha"] for s in steps)
@@ -316,20 +316,52 @@ def test_proposer_tries_an_unproven_executor_once_then_says_what_it_needs(monkey
                       "grab-0": {"skill": "grab", "success": False, "executor": "scripted"}}}
     before = {"count": 0, "seeds": {"1": dead, "2": dead}, "sha": "x"}
     assert evolve.per_seed(before) == [
-        {"seed": s, "success": False, "first_death": "grab-0", "failure_mode": "reach_stall"} for s in (1, 2)]
+        {"seed": s, "success": False, "first_death": "grab-0", "failure_mode": "reach_stall",
+         "tunables_sha": None} for s in (1, 2)]
     first = evolve.propose(before, recs, EMB, "auto", binding, 1, {"executors": {}, "tunables": {}}, [])
     assert (first["kind"], first["node"], first["detail"]["to"]) == ("executor", "grab-0", "alt")
     again = evolve.propose(before, recs, EMB, "auto", binding, 2, {"executors": {}, "tunables": {}},
                            [{"round": 1, "tried": first}])
     assert again["kind"] == "none" and again["detail"]["needs"] == [
         "tunables on test_evolve_e2e:policy_provider", "evidence for another executor", "proposal"]
-    # a tunable a +-20% step leaves where it is (segment_cap 0 -> 0) is no trial:
+    # a tunable a +-30% step leaves where it is (segment_cap 0 -> 0) is no trial:
     # the next knob is proposed; when none moves, the same honest none
     hist = [{"round": 1, "tried": first}]
     monkeypatch.setattr(evolve, "mount_params",
                         lambda ref: {"tunables": {"segment_cap": 0, "stall_k": 40}})
     knob = evolve.propose(before, recs, EMB, "auto", binding, 2, {"executors": {}, "tunables": {}}, hist)
-    assert (knob["kind"], knob["detail"]["path"], knob["detail"]["to"]) == ("tunables", ["tunables", "stall_k"], 32)
+    assert (knob["kind"], knob["detail"]["path"], knob["detail"]["to"], knob["detail"]["hint"]) == (
+        "tunables", ["tunables", "stall_k"], 28, None)
     monkeypatch.setattr(evolve, "mount_params", lambda ref: {"tunables": {"segment_cap": 0}})
     none = evolve.propose(before, recs, EMB, "auto", binding, 2, {"executors": {}, "tunables": {}}, hist)
     assert none["kind"] == "none" and none["detail"]["needs"] == again["detail"]["needs"]
+
+
+def test_proposer_follows_the_card_hints_for_the_failure_mode_in_both_directions(monkeypatch):
+    """A reach_stall first death: the card's [tunable_hints] order wins over name
+    order, each knob goes -30% then +30% (a (knob, direction) in history is not
+    retried), then the next hinted knob; ``detail.hint`` names the mode."""
+    from scripts import evolve
+    recs = {k: protocol.SkillRecordV0.from_dict({**v, "evidence": {}}) for k, v in RECORDS.items()}
+    binding = {"policy": "test_evolve_e2e:policy_provider"}
+    dead = {"success": False, "first_death": "grab-0", "failure_mode": "reach_stall",
+            "nodes": {"grab-0": {"skill": "grab", "success": False, "executor": "scripted"}}}
+    before = {"count": 0, "seeds": {"1": dead}, "sha": "x"}
+    monkeypatch.setattr(evolve, "mount_params", lambda ref: {
+        "tunables": {"drop_edge_margin": 0.10, "drop_over_dz": 0.12, "reach_tol": 0.03, "stall_k": 40},
+        "tunable_hints": {"reach_stall": ["drop_edge_margin", "drop_over_dz", "reach_tol"]}})
+    hist = [{"round": 1, "tried": {"kind": "executor", "node": "grab-0", "detail": {"to": "alt"}}}]
+    steps = []
+    for r in (2, 3, 4, 5):
+        t = evolve.propose(before, recs, EMB, "auto", binding, r, {"executors": {}, "tunables": {}}, hist)
+        assert t["kind"] == "tunables" and t["node"] == "grab-0"
+        steps.append((t["detail"]["path"][-1], t["detail"]["from"], round(t["detail"]["to"], 3), t["detail"]["hint"]))
+        hist.append({"round": r, "tried": t})
+    assert steps == [("drop_edge_margin", 0.10, 0.07, "reach_stall"),
+                     ("drop_edge_margin", 0.10, 0.13, "reach_stall"),
+                     ("drop_over_dz", 0.12, 0.084, "reach_stall"),
+                     ("drop_over_dz", 0.12, 0.156, "reach_stall")]
+    # no hint for the mode: name order, unhinted
+    monkeypatch.setattr(evolve, "mount_params", lambda ref: {"tunables": {"stall_k": 40, "hover_dz": 0.08}})
+    t = evolve.propose(before, recs, EMB, "auto", binding, 6, {"executors": {}, "tunables": {}}, hist[:1])
+    assert (t["detail"]["path"][-1], round(t["detail"]["to"], 3), t["detail"]["hint"]) == ("hover_dz", 0.056, None)

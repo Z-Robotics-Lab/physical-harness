@@ -78,3 +78,41 @@ def test_one_evolve_round_on_the_real_kitchen(tmp_path):
         assert any(kept.values()), kept
     assert all(f"media/{TASK}/{s}/{v['file']}" in frames
                for s, idx in kept.items() for v in idx.values())
+
+
+@pytest.mark.robocasa
+def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
+    """Two rounds on the seed that dies at drop-can1 with reach_stall: round 1
+    tries the card's first hinted knob (drop_edge_margin, -30%), round 2 the other
+    direction, and the trial's suite ran under a different tunables_sha than the
+    baseline. Success is not required -- the per-seed rows are the finding."""
+    task = "recycle_cans"
+    runs = tmp_path / "runs"
+    session = runs / "session-main"
+    name = bs.submit_brief(runs, json.dumps(
+        {"kind": "evolve", "task": task, "seeds": [4243, 4243], "rounds": 2, "arm": "scripted"}))["submitted"]
+    proc = subprocess.run(
+        [sys.executable, str(RUNTIME), "--session-dir", str(session), "--drain", "--mode", "evolution"],
+        cwd=str(REPO), capture_output=True, text=True, timeout=5400, check=False,
+        env={**os.environ, "MUJOCO_GL": "egl", "PYTHONPATH": str(REPO)})
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert (session / "done" / name).exists(), proc.stderr[-4000:]
+    assert not [r for r in bs.chain_rows(session) if r["kind"] == "runtime.task_error"], proc.stderr[-4000:]
+    doc = json.loads((session / "campaigns" / f"evolve-{task}" / "campaign.json").read_text())
+    r1, r2 = doc["rounds"]
+    print("per_seed", [(r["round"], r["tried"]["kind"], r["tried"]["detail"].get("path"),
+                        r["tried"]["detail"].get("to"), r["before"], r["after"], r["per_seed"],
+                        r["after_seeds"]) for r in doc["rounds"]])
+    base = r1["per_seed"][0] if not r1["published"] else None
+    if base and base["failure_mode"] == "reach_stall":   # the acceptance fact this round answers
+        assert r1["tried"]["kind"] == "tunables", r1["tried"]
+        d = r1["tried"]["detail"]
+        assert d["path"][-1] == "drop_edge_margin" and d["hint"] == "reach_stall"
+        assert d["to"] == pytest.approx(0.07) and d["from"] == pytest.approx(0.10)
+        assert r2["tried"]["detail"]["path"][-1] == "drop_edge_margin"
+        assert r2["tried"]["detail"]["to"] == pytest.approx(0.13)
+        # the overlay reached the driver: the trial's dying node sealed another tunables_sha
+        trial = r1["after_seeds"][0]
+        assert len(trial["tunables_sha"] or "") == 16 and trial["tunables_sha"] != base["tunables_sha"]
+    elif r1["tried"]["kind"] == "tunables":
+        assert r1["tried"]["detail"]["hint"] in (None, base and base["failure_mode"])

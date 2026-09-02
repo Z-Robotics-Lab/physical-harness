@@ -140,6 +140,9 @@ def mount_params(ref: str, root: Path = PLUGINS_ROOT) -> dict:
     tun = next((data.get("tunables") for name, data in cards if name == card), None)
     if tun and "tunables" not in params:
         params["tunables"] = dict(tun)
+    hints = next((data.get("tunable_hints") for name, data in cards if name == card), None)
+    if hints and "tunable_hints" not in params:   # failure_mode -> knobs to perturb first
+        params["tunable_hints"] = {k: list(v) for k, v in hints.items()}
     # PH_MOUNT_PARAMS_OVERRIDE: {ref: {param: value}} -- an evolve trial's tunables
     # perturbation reaching the driver (scripts/evolve.py); one level of nesting
     # merges ([tunables] tables), anything else replaces.

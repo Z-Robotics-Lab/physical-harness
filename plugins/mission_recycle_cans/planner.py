@@ -140,15 +140,14 @@ def _emit_plan() -> Mapping:
 
 
 #: Stage word of a node id -> the embodiment_robocasa recovery a no_progress
-#: replan inserts before it (keyed by node id, not failure_mode, so a done
-#: recover-<id> re-inserts byte-identically under replan_monotone).
+#: replan inserts before it (a done recover-<id> re-inserts byte-identically from
+#: the fault's recoveries_done -- protocol.recover_plan).
 _RECOVERY: dict[str, str] = {"nav": "redock_retry", "carry": "redock_retry",
                             "grasp": "regrasp_kitchen", "drop": "reapproach"}
-
-
-def _recover(plan: Mapping, node_id: str) -> Mapping:
-    strategy = _RECOVERY.get(node_id.split("-")[0])
-    return protocol.insert_recovery(plan, node_id, strategy) if strategy else plan
+#: failure_mode -> stage word -> the repair that overrides _RECOVERY: an arm that
+#: stalled reaching a drop point is at its envelope edge, so the base moves
+#: (base_nudge) instead of re-approaching from where it stood.
+_RECOVERY_BY_MODE: dict[str, dict[str, str]] = {"reach_stall": {"drop": "base_nudge"}}
 
 
 class RecycleCansPlanner:
@@ -160,20 +159,10 @@ class RecycleCansPlanner:
         if task != "recycle_cans":
             raise ValueError(
                 f"RecycleCansPlanner only plans 'recycle_cans', got {task!r}")
-        plan = _emit_plan()
-        fault = brief.get("fault") or {}
-        # Stateless emitter: a recovery node that already RAN sits in done_specs,
-        # and replan_monotone refuses any later graph without it -- re-insert
-        # every done recover-<id> before answering this fault.
-        for nid in fault.get("nodes_done") or ():
-            if nid.startswith("recover-"):
-                plan = _recover(plan, nid[len("recover-"):])
-        if fault.get("kind") == "no_progress":
-            # The loop refused this graph twice at that node: answer with the
-            # card's repair for that stage before it instead of a third copy,
-            # which would end the task.
-            plan = _recover(plan, fault["node"])
-        return plan
+        # Stateless emitter: done recover-<id> nodes re-insert byte-identically;
+        # a no_progress refusal (the graph was tried twice at that node) gets the
+        # card's repair for that stage before it instead of a third copy.
+        return protocol.recover_plan(_emit_plan(), brief.get("fault"), _RECOVERY, _RECOVERY_BY_MODE)
 
     @property
     def identity(self) -> str:

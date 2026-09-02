@@ -34,16 +34,17 @@ class ClusterDropDriver(X.PointPlaceDriver):
     point sits just past the stove's bbox toward the stove-side counter
     (RecycleSodaCans wants every can within 0.25 of the stove AND on a counter),
     with a small per-can lateral spread so four cans neither stack nor scatter
-    (neighbour gap ~0.07 m << the 0.25 cluster threshold)."""
-
-    EDGE_MARGIN = 0.10   # past the stove bbox edge, toward the counter
-    SPREAD = 0.07        # per-can lateral pitch along the stove edge
-    DROP_DZ = 0.05       # release height above the stove-top plane
+    (neighbour gap ~0.07 m << the 0.25 cluster threshold). The three geometry
+    knobs are the card's [tunables] drop_edge_margin / drop_spread / drop_dz."""
 
     def __init__(self, obj_name: str, slot: int):
         super().__init__(obj_name)
+        t = D.tunables()
         self.slot = slot           # 0..3, deterministic per can
         self._point = None
+        self._edge_margin = t["drop_edge_margin"]   # past the stove bbox edge, toward the counter
+        self._spread = t["drop_spread"]             # per-can lateral pitch along the stove edge
+        self._drop_dz = t["drop_dz"]                # release height above the stove-top plane
 
     def _drop_point(self, env) -> np.ndarray:
         if self._point is None:
@@ -59,9 +60,9 @@ class ClusterDropDriver(X.PointPlaceDriver):
             # stove half-extent along u (bbox corners projected on u)
             half = float(np.max(np.abs((sites[:, :2] - center[:2]) @ u)))
             v = np.array([-u[1], u[0]])          # along the stove edge
-            xy = (center[:2] + u * (half + self.EDGE_MARGIN)
-                  + v * self.SPREAD * (self.slot - 1.5))
-            self._point = np.array([xy[0], xy[1], top_z + self.DROP_DZ])
+            xy = (center[:2] + u * (half + self._edge_margin)
+                  + v * self._spread * (self.slot - 1.5))
+            self._point = np.array([xy[0], xy[1], top_z + self._drop_dz])
         return self._point
 
     def done(self, env) -> bool:

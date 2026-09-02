@@ -615,6 +615,30 @@ def insert_recovery(plan: Mapping, node_id: str, strategy: str) -> dict:
         raise KeyError(f"insert_recovery: node {node_id!r} is not in the plan")
     return {**plan, "nodes": nodes}
 
+
+def recover_plan(plan: Mapping, fault: Mapping | None, by_stage: Mapping[str, str],
+                 by_mode: Mapping[str, Mapping[str, str]] | None = None) -> Mapping:
+    """A stateless mission planner's answer to ``fault``: re-insert every done
+    ``recover-<id>`` byte-identically (``fault.recoveries_done`` names the strategy
+    it ran; a bare ``nodes_done`` id falls back to the table -- replan_monotone),
+    then answer a ``no_progress`` fault with the card repair for the failed node's
+    stage word (its id up to the first "-"): ``by_mode[fault.failure_mode][stage]``
+    when the fault names a mode the table overrides, else ``by_stage[stage]``; a
+    stage with no entry is left as-is (nothing to work with)."""
+    fault = fault or {}
+    ran = fault.get("recoveries_done") or {}
+    for nid in fault.get("nodes_done") or ():
+        if nid.startswith("recover-"):
+            node = nid[len("recover-"):]
+            strategy = ran.get(node) or by_stage.get(node.split("-")[0])
+            plan = insert_recovery(plan, node, strategy) if strategy else plan
+    if fault.get("kind") == "no_progress":
+        stage = fault["node"].split("-")[0]
+        strategy = ((by_mode or {}).get(fault.get("failure_mode")) or {}).get(stage) \
+            or by_stage.get(stage)
+        plan = insert_recovery(plan, fault["node"], strategy) if strategy else plan
+    return plan
+
 # ------------------------------------------------------------ VLM projection
 
 #: The exact reply shape a VLM planner must emit (the validate_plan dialect:

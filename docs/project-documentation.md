@@ -461,12 +461,12 @@ clone 合法地显示**更多跳过，绝不是失败**：
 
 一轮：
 1. **看**：同种子 suite（与 task brief 同一条 `_mount_plan → workload.run` 路径）→ 每种子首死节点、fault `{kind,node,msg}`、每节点 executor。
-2. **试**（内置 proposer，按序取第一个可行的）：① 首死节点换 executor —— 绑定 policy 的 record `evidence.by_executor` 成功率高于实测者优先，否则 record 上任一本轮之前没试过的其它绑定 executor（无证据也诚实试一次）；② 该节点驱动 mount 参数一维 ±20% 扰动（`[tunables]` 表或顶层数值；键按轮次轮转、符号交替，经 `PH_MOUNT_PARAMS_OVERRIDE` 并进 `manifest.mount_params`）；③ 都没有 → `kind:"none"` 并写明原因，`detail.needs` 列出能解锁的项（`tunables on <ref>` / `evidence for another executor` / `proposal`）。
+2. **试**（内置 proposer，按序取第一个可行的）：① 首死节点换 executor —— 绑定 policy 的 record `evidence.by_executor` 成功率高于实测者优先，否则 record 上任一本轮之前没试过的其它绑定 executor（无证据也诚实试一次）；② 该节点驱动 mount 参数一维 ±30% 扰动（`[tunables]` 表或顶层数值）：卡的 `[tunable_hints]` 把首死节点的 `failure_mode` 映到先试的键（其余按名序），每个键先 −30% 再 +30%（int 保持 int，原地不动的步跳过），history 里已试过的 (键, 方向) 不重试；经 `PH_MOUNT_PARAMS_OVERRIDE` 并进 `manifest.mount_params`（按已接受的 `applied` 算起点，不是上一轮未发布的试验）；`tried.detail` = `{skill,executor,ref,path,from,to,hint: failure_mode|null}`；③ 都没有 → `kind:"none"` 并写明原因，`detail.needs` 列出能解锁的项（`tunables on <ref>` / `evidence for another executor` / `proposal`）。
 3. **同种子再跑**，试验已应用（executor 经 `scripts.evolve:planner_provider` 盖进 `node.executor`）。
 4. **成功种子数变好才发布**：带实测 `by_executor` 行（tunables 还有新值）的 record 走 `InMemorySkillGraph.publish` —— 与 `publish_plans` 同一道进化态专用门；否则不发布。试验抛异常 → 记 `tried.detail.error`，after=before，不崩。
 
-每轮封存一行 `rsi_step {brief,task,round,tried,before,after,best,published,suite_sha,per_seed,needs}`（`per_seed` = 保留 suite 的 `[{seed,success,first_death,failure_mode}]`，`needs` 只在 `tried.kind:none` 时非空）（按 (task,round) 幂等，2 s 轮询时实时封存，退出时兜底），并 tmp+rename 写 `runs/<session>/campaigns/evolve-<task>/campaign.json`：
-`{task,session,seeds,arm,rounds:[{round,tried:{kind,node,detail},before,after,best,suite_sha,published,per_seed,needs,media:[路径],media_dropped:{"种子/节点":原因},ts}],best,cursor,status:running|cancelled|done,applied:{executors,tunables}}`。
+每轮封存一行 `rsi_step {brief,task,round,tried,before,after,best,published,suite_sha,per_seed,needs}`（`per_seed` = 保留 suite 的 `[{seed,success,first_death,failure_mode,tunables_sha}]`（首死节点跑在哪组 knob 下），`needs` 只在 `tried.kind:none` 时非空）（按 (task,round) 幂等，2 s 轮询时实时封存，退出时兜底），并 tmp+rename 写 `runs/<session>/campaigns/evolve-<task>/campaign.json`：
+`{task,session,seeds,arm,rounds:[{round,tried:{kind,node,detail},before,after,best,suite_sha,published,per_seed,after_seeds,needs,media:[路径],media_dropped:{"种子/节点":原因},ts}],best,cursor,status:running|cancelled|done,applied:{executors,tunables}}`（`after_seeds` = 本轮试验 suite 的同形 per_seed，未发布时也留着）。
 `applied` 是已接受的状态，后续每轮重新应用；下一轮的 before 直接沿用上一轮保留的结果，不重测。
 
 **进度（live）**：campaign.json 还带一个 `live` 块，每到阶段/种子/节点边界就随整个文件 tmp+rename 重写（单写者，无竞争）：`{phase: idle|baseline|propose|retest|publish|done|cancelled, round, seeds_total, seed_index, seed, node, started_at, round_started_at, phase_started_at, last_round_s, per_seed_partial:[本次 suite 已跑完的 {seed,success,first_death,failure_mode}], tried, message:"第 1 轮 基线评测：种子 4244 运行中 (nav-can1)，1/2"}`。`node` 是推断：`task.plan` 落地取首节点，每个成功的 `task.verify` 落地推进到计划序的下一节点（没有 node-start 行）。`rsi_run` 原样返回为 `live`（旧文件为 null）；它是活状态，`rsi_step` 只封轮行，永不封 live。
@@ -1062,7 +1062,8 @@ uses_feedback: bool  # property: any servo_* phase present
 
 robocasa 卡（`plugins/embodiment_robocasa/recoveries.py`，12 维 PandaOmron 词汇，`RobocasaRecoveryActor` 执行）除 `regrasp_kitchen`/`redock_retry` 外声明三条 reach 修复，
 供 §9.3 的 recovery 节点用：`reapproach`（升回 hover，按实时目标位姿再下降）、`base_nudge`（底盘向目标 xy 微移 ≤0.15 m 后重 hover）、`release_reset`（张开、抬升、回 hover）。
-目标取活跃 stage：place/drop 段是其 drop point，其余是其 obj_name 的实时位姿。
+目标取活跃 stage：place/drop 段是其 drop point（`_drop_point`，PlaceDriver 的是 cavity 质心，不是夹着的物体），其余是其 obj_name 的实时位姿。
+planner 选哪条：fault 带首死段的 `failure_mode` 和已跑过的 `recoveries_done {节点: 策略}`，三家 mission planner 走同一道 `protocol.recover_plan(plan, fault, _RECOVERY, _RECOVERY_BY_MODE)`——阶段表之上按 failure_mode 覆盖（卡数据：`reach_stall` 的 drop/pack/place → `base_nudge`，臂在包络边缘停住时移底盘而不是原地再够；其余 → 阶段表），已跑过的 recover-<id> 按它实际跑的策略原样重插（replan_monotone）。
 
 `plugins/rsi/repertoire.py` 在加载时解析每个 ref 并对 Protocol 做 isinstance 校验——
 形状不对或名字与键不一致会在那里失败，绝不会在修复中途。`steps` 的 phase 是你自己卡的
@@ -1529,10 +1530,10 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
 - pi0.5 服务：`scripts/cockpit --with-policy`（或 `.env` `PH_WITH_POLICY=1`，`PH_POLICY_CHECKPOINT` 换 checkpoint）经
   `board.store.policy_server` 起 :8000，`health().policy` 行只在该 flag 下计 problem。
   e2e：`tests/test_suite_e2e.py`（S1/S2）、`tests/test_suite_robocasa_e2e.py`（S3，robocasa）、`tests/test_suite_pi05_e2e.py`（S4，robocasa+vla，测试自起自停服务）。
-- tunables：robocasa 段驱动的常量（`hover_dz`、`reach_tol`、`standoff`、`segment_cap`、`stall_k`）是卡 manifest `[tunables]` 的数据，
+- tunables：robocasa 段驱动的常量（`hover_dz`、`reach_tol`、`standoff`、`segment_cap`、`stall_k`，以及 drop 段的 `drop_over_dz`/`drop_edge_margin`/`drop_spread`/`drop_dz`——PointPlaceDriver 的 over 高度和 ClusterDropDriver 的落点几何）是卡 manifest `[tunables]` 的数据，
   `drivers.tunables()` 读默认值并按进程用 `PH_TUNABLES='{"stall_k":20}'` 覆盖（未知键拒绝）；`drivers.tunables_sha()` 随每个 robocasa 段的
   `diagnostics.tunables_sha` 封入节点/`task.plan_complete.nodes`/`actuation_end`，同处 `diagnostics.failure_mode`（`"reach_stall"` = eef 到目标距离 K=stall_k 步不降，段提前失败）。
-  `[tunables]` 经 `manifest.mount_params` 到达该卡每个 driver provider（`params["tunables"]`，evolve 的 `PH_MOUNT_PARAMS_OVERRIDE` 同路并入，`drivers.mount_tunables` 一处共享读）；任一 nav 段（载物/空载，含 NavToObjectDriver）底盘到 dock 距离 K 步不降且离 dock > 到达带（载物 CARRY_NEAR，空载 NAV_POS_TOL）→ `failure_mode "nav_stall"`。pack_lunch / kitchen_thaw planner 同 recycle_cans：对 `no_progress` 按首死节点的阶段词插入本体声明的修复（nav/carry → `redock_retry`，grasp → `regrasp_kitchen`，pack/place → `reapproach`；载物段修复保持夹持）。
+  `[tunables]` 经 `manifest.mount_params` 到达该卡每个 driver provider（`params["tunables"]`，evolve 的 `PH_MOUNT_PARAMS_OVERRIDE` 同路并入，`drivers.mount_tunables` 一处共享读）；同卡 `[tunable_hints]`（`failure_mode → [先试的 knob…]`：`reach_stall` → drop_edge_margin, drop_over_dz, standoff, hover_dz, reach_tol；`nav_stall` → stall_k）同路到 `params["tunable_hints"]`，只有 evolve 的 proposer 读（§4.0 ②）；任一 nav 段（载物/空载，含 NavToObjectDriver）底盘到 dock 距离 K 步不降且离 dock > 到达带（载物 CARRY_NEAR，空载 NAV_POS_TOL）→ `failure_mode "nav_stall"`。pack_lunch / kitchen_thaw planner 同 recycle_cans：对 `no_progress` 按首死节点的阶段词插入本体声明的修复（nav/carry → `redock_retry`，grasp → `regrasp_kitchen`，pack/place → `reapproach`；载物段修复保持夹持）。
 
 ### 9.7 Plan library and mission briefs
 
