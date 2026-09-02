@@ -269,7 +269,7 @@ def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
         out = capsys.readouterr().out.rstrip("\n")
         assert code == 0 and out == json.dumps(lib) == json.dumps(mcp), argv
     doc = _doc(runtime)
-    assert bs.rsi_run(sd, TASK) == {**doc, "latest": doc["rounds"][-1]}
+    assert bs.rsi_run(sd, TASK) == {**doc, "latest": doc["rounds"][-1], "open_brief": None}
     assert [s["after"] for s in bs.rsi_series(sd, TASK)] == [2, 2]
     assert [(s["per_seed"], s["needs"]) for s in bs.rsi_series(sd, TASK)] == \
         [(r["per_seed"], r["needs"]) for r in doc["rounds"]]

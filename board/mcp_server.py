@@ -157,10 +157,20 @@ def suite_result(name: str = _DEFAULT_SESSION, sha: str | None = None) -> dict |
 def rsi_run(task: str, name: str = _DEFAULT_SESSION) -> dict | None:
     """One evolve campaign's state (campaigns/evolve-<task>/campaign.json: task,
     session, seeds, arm, rounds[] each with per_seed + needs, best, cursor,
-    status) plus ``latest`` round.
+    status) plus ``latest`` round, ``live`` and ``open_brief`` (the intake
+    evolve brief id for this task, cancel_brief-able; null when none).
     null when the session runs no campaign for that task."""
     path = bs.safe_child(_Cfg.runs, name, bs.is_session)
     return bs.rsi_run(path, task) if path else {"error": "unknown session"}
+
+
+@mcp.tool()
+def rsi_campaigns(session: str = _DEFAULT_SESSION) -> list[dict]:
+    """Every evolve campaign one session holds on disk (survives a restart):
+    [{task, status, cursor, rounds (count), best, seeds, arm, updated, live:
+    {phase, message}|null, open_brief}], running first then newest first."""
+    path = bs.safe_child(_Cfg.runs, session, bs.is_session)
+    return bs.rsi_campaigns(path) if path else {"error": "unknown session"}
 
 
 @mcp.tool()

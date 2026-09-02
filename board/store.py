@@ -1364,15 +1364,59 @@ def rsi_run(session_dir: str | Path, task: str) -> dict | None:
     """One evolve campaign's state: the campaign.json fields (task, session,
     seeds, arm, best, cursor, status, rounds -- each round carrying ``per_seed``
     and ``needs``) plus ``latest`` (the newest round row, or None before the
-    first lands) and ``live`` (scripts/evolve.py's in-flight block: phase, round,
+    first lands), ``live`` (scripts/evolve.py's in-flight block: phase, round,
     seed/seed_index/seeds_total, node, per_seed_partial, tried, message, timings --
-    live state, never sealed; null when the file predates it). None when no
-    campaign exists."""
+    live state, never sealed; null when the file predates it) and ``open_brief``
+    (the inbox/processing evolve brief id for this task, so the page can stop it
+    after a restart; null when none). None when no campaign exists."""
     doc = _campaign(session_dir, task)
     if doc is None:
         return None
     rounds = doc.get("rounds") or []
-    return {**doc, "latest": rounds[-1] if rounds else None, "live": doc.get("live")}
+    return {**doc, "latest": rounds[-1] if rounds else None, "live": doc.get("live"),
+            "open_brief": _open_brief(Path(session_dir), task)}
+
+
+def _open_brief(session_dir: Path, task: str) -> str | None:
+    """The brief id (intake filename) of the evolve brief still driving ``task``
+    -- ``processing/`` first, then ``inbox/`` -- or None. Read from the intake
+    dirs, not the per-boot feed, so a console restart can still cancel it."""
+    for sub in ("processing", "inbox"):
+        d = session_dir / sub
+        for p in sorted(d.glob("*.json")) if d.is_dir() else ():
+            try:
+                b = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(b, dict) and b.get("kind") == "evolve" and b.get("task") == task:
+                return p.name
+    return None
+
+
+def rsi_campaigns(session_dir: str | Path) -> list[dict]:
+    """Every evolve campaign the session holds on disk (``campaigns/evolve-*/
+    campaign.json``, so it survives a restart -- the per-boot feed does not):
+    ``{task, status, cursor, rounds (count), best, seeds, arm, updated
+    (campaign.json mtime), live: {phase, message} | null, open_brief}``,
+    running first, then newest ``updated`` first."""
+    session_dir = Path(session_dir)
+    out = []
+    for d in (session_dir / "campaigns").glob("evolve-*"):
+        task = d.name[len("evolve-"):]
+        doc = _campaign(session_dir, task)
+        if doc is None:
+            continue
+        live = doc.get("live")
+        out.append({
+            "task": doc.get("task", task), "status": doc.get("status"),
+            "cursor": doc.get("cursor"), "rounds": len(doc.get("rounds") or []),
+            "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
+            "updated": (d / "campaign.json").stat().st_mtime,
+            "live": ({"phase": live.get("phase"), "message": live.get("message")}
+                     if isinstance(live, dict) else None),
+            "open_brief": _open_brief(session_dir, task)})
+    out.sort(key=lambda c: (c["status"] != "running", -c["updated"]))
+    return out
 
 
 def rsi_series(session_dir: str | Path, task: str) -> list[dict]:

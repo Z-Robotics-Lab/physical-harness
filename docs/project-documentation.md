@@ -486,7 +486,7 @@ clone 合法地显示**更多跳过，绝不是失败**：
 候选卡 `plugins/candidates/<name>/` 与普通卡同一 manifest 形状，不被 base fold 扫到；`[executors.<键>] skill=, embodiment=, ref=, transport?` 由 `discover` 折进 `Registry.executors`，`skill_library.bind_executors` 在加载时把它盖到 `bindings.<本体>.policies.<键>`（只在挂载时可见，record 文件不动）。首张代码候选 `grasp_geometric_robocasa`：executor 键 `geometric`，code-as-policy `hover→descend→close→lift`，自带 `[tunables]`，provider 参数 `{tunables:{...}}` 覆盖（`mount_params` 只扫 `plugins/*/`，不扫 PH_PLUGINS_EXTRA）；`KitchenThawDriver` 对有 `bind(env, target=)` 的 executor 走原生路径（raw obs 进，12 维 env action 出）。`scripts/plugin_doctor.py plugins/candidates/<name>` 可直接体检（今天报 claim-only SKIP）。
 提案人：ph-station 的 `skill-author` preset 只读 `rsi_run/rsi_series/rsi_frames` 与链，唯一写口是 `submit_proposal`。
 
-**三面**（store / storecli / mcp 逐字节等价，只读 campaign.json）：`rsi_run(task, session)` = campaign.json + `latest`；`rsi_series(task, session)` = 每轮 `{round,before,after,best,per_seed,needs}`；`rsi_frames(task, round, session)` = 那一轮的 `media` 路径列表。没有 campaign → `None` / `[]`。
+**三面**（store / storecli / mcp 逐字节等价，只读 campaign.json）：`rsi_run(task, session)` = campaign.json + `latest`；`rsi_series(task, session)` = 每轮 `{round,before,after,best,per_seed,needs}`；`rsi_frames(task, round, session)` = 那一轮的 `media` 路径列表。没有 campaign → `None` / `[]`。`rsi_campaigns(session)` = 该 session 磁盘上全部 evolve campaign 的摘要列表 `{task,status,cursor,rounds,best,seeds,arm,updated,live:{phase,message}|null,open_brief}`（running 在前，再按 updated 倒序）；`open_brief` / `rsi_run.open_brief` = inbox/processing 里驱动该 task 的 evolve brief id（可 `cancel_brief`），控制台重启后靠它们而不是每次启动截断的 `runtime_events` 找回进行中的 rsi。
 
 ### 4.1 brief 形状
 
@@ -1412,6 +1412,7 @@ runtime 的机器上会替错的 session 作保。这与 `store._model_identity`
 | 18 | **模型服务停了** | llama.cpp :30001 | ✅ `health().model.running: false`，`--status` 的 STOPPED 行带启动命令；只有 `PH_WITH_MODEL=1`（`scripts/cockpit --with-model` 会导出）时才计为 problem，免得为省显存停模型的机器常年红 |
 | 19 | **campaign 子进程在 stop / boot 时残留** | `_run_watched` / `_requeue` | ✅ 任何退出（cancel、SIGTERM、Ctrl-C、崩溃）都按 `processing/<brief>.pgid` 杀整个进程组（TERM，宽限后 KILL）并落 `CANCELLED`；`cockpit --stop` 中途的 brief 进 `cancelled/`（stage `runtime_stopped`），boot 时发现活着的孤儿组先杀再重排队，写 `runtime.orphan_killed {brief,pgid}` |
 | 20 | **evolve 中途停/死** | `_run_evolve` / `evolve.py` | ✅ cancel 标记在轮边界生效（`campaign.json.status: cancelled`，exit 3；轮中走第 19 行的 killpg）→ `runtime.task_cancelled`；已封存轮次的 `rsi_step` 行不重复；同 task 再投 `evolve` 从 `cursor` 续跑。执行态投 evolve → 同第 5 行 |
+| 21 | **控制台重启后看不到进行中/历史的 rsi**（列表来自每次启动截断的 `runtime_events` `task_claimed`） | 控制台 campaign 列表 | ✅ `rsi_campaigns(session)` 从 `campaigns/evolve-*/campaign.json` 读，`open_brief` 从 `processing/`/`inbox/` 找回可停的 brief |
 
 ### 8.4 仍然开着的口子
 

@@ -152,6 +152,7 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     run = bs.rsi_run(sd, "kitchen_thaw")
     assert run["status"] == "running" and run["cursor"] == 2 and run["latest"]["round"] == 2
     assert run["live"] == _CAMPAIGN["live"] and run["live"]["message"]
+    assert run["open_brief"] is None
     (camp / "campaign.json").write_text(json.dumps({k: v for k, v in _CAMPAIGN.items() if k != "live"}))
     assert bs.rsi_run(sd, "kitchen_thaw")["live"] is None   # pre-live campaign reads as null
     (camp / "campaign.json").write_text(json.dumps(_CAMPAIGN))
@@ -214,3 +215,40 @@ def test_skills_face_is_byte_identical(tmp_path, capsys):
     assert row["limits"] == {"reach_m": 0.6} and row["failure_modes"] == ["reach_stall"]
     assert len(direct) == len(lib)  # overlay, not a duplicate; the capability row is skipped
     assert ms.skills("../x") == {"error": "unknown session"}
+
+
+def test_rsi_campaigns_faces_are_byte_identical(tmp_path, capsys):
+    """rsi_campaigns: the on-disk campaign list (what survives a restart) is the
+    same object on the CLI, MCP and library faces; running first, then newest;
+    open_brief resolves the intake evolve brief per task from the intake dirs."""
+    runs, status, progress = _fixture(tmp_path)
+    sd = runs / "session-main"
+    done = {**_CAMPAIGN, "task": "stack", "status": "done", "best": 2, "cursor": 3, "live": None}
+    for doc in (done, _CAMPAIGN):
+        d = sd / "campaigns" / f"evolve-{doc['task']}"
+        d.mkdir(parents=True)
+        (d / "campaign.json").write_text(json.dumps(doc))
+    (sd / "processing").mkdir()
+    (sd / "processing" / "brief-aaaa.json").write_text(
+        json.dumps({"kind": "evolve", "task": "kitchen_thaw", "rounds": 3}))
+    (sd / "processing" / "brief-bbbb.json").write_text(json.dumps({"kind": "task", "task": "stack"}))
+    # the done campaign was touched last: status must still sort running first
+    import os
+    os.utime(sd / "campaigns" / "evolve-stack" / "campaign.json", (9e9, 9e9))
+    ms.configure(runs)
+    lib = bs.rsi_campaigns(sd)
+    code, out = _run(capsys, "rsi_campaigns", "session-main", "--runs", str(runs))
+    assert code == 0 and out == json.dumps(lib) == json.dumps(ms.rsi_campaigns("session-main"))
+    assert [c["task"] for c in lib] == ["kitchen_thaw", "stack"]
+    running, finished = lib
+    assert running == {"task": "kitchen_thaw", "status": "running", "cursor": 2, "rounds": 2,
+                       "best": 1, "seeds": [1, 2], "arm": "auto", "updated": running["updated"],
+                       "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"]},
+                       "open_brief": "brief-aaaa.json"}
+    assert finished["status"] == "done" and finished["live"] is None \
+        and finished["open_brief"] is None and finished["updated"] == 9e9
+    assert bs.rsi_run(sd, "kitchen_thaw")["open_brief"] == "brief-aaaa.json"
+    assert bs.rsi_campaigns(runs / "session-b") == []
+    assert ms.rsi_campaigns("../x") == {"error": "unknown session"}
+    code, out = _run(capsys, "rsi_campaigns", "../x", "--runs", str(runs))
+    assert code == 3 and json.loads(out) == {"error": "unknown session"}

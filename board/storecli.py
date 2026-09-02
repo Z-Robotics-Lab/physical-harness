@@ -118,6 +118,11 @@ def dispatch(fn: str, name: str | None, runs: Path, status: Path, progress: Path
         if fn == "rsi_series":
             return bs.rsi_series(path, name)
         return bs.rsi_frames(path, name, round)
+    if fn == "rsi_campaigns":
+        path = bs.safe_child(runs, name or session or "session-main", bs.is_session)
+        if path is None:
+            raise ValueError("unknown session")
+        return bs.rsi_campaigns(path)
     if fn == "list_stores":
         return bs.list_stores(runs)
     if fn == "cards":
@@ -268,8 +273,8 @@ def serve(stdin, stdout, runs: Path, status: Path, progress: Path) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("fn", help="serve|health|submit_brief|brief_status|cancel_brief|submit_proposal|proposals|rsi_run|rsi_series|rsi_frames|list_stores|store|heldout|campaign_progress|sessions|session|session_progress|suite_result|trajectories|plan_index|skill_evidence|skills|runtime_status|runtime_frame|runtime_rollout|runtime_keyframes|runtime_keyframe|runtime_events|host_vitals|model_server|policy_server|restart_services|ledger|rounds|cards|vault|vault_node|vault_neighbors")
-    parser.add_argument("name", nargs="?", default=None, help="store/session name, vault node id for vault_node/vault_neighbors, the brief id for brief_status/cancel_brief, the task for rsi_run/rsi_series/rsi_frames, the model_server/policy_server action (status|start|stop, default status), 'build' to make restart_services rebuild ph-station first, or the console port for health")
+    parser.add_argument("fn", help="serve|health|submit_brief|brief_status|cancel_brief|submit_proposal|proposals|rsi_run|rsi_series|rsi_frames|rsi_campaigns|list_stores|store|heldout|campaign_progress|sessions|session|session_progress|suite_result|trajectories|plan_index|skill_evidence|skills|runtime_status|runtime_frame|runtime_rollout|runtime_keyframes|runtime_keyframe|runtime_events|host_vitals|model_server|policy_server|restart_services|ledger|rounds|cards|vault|vault_node|vault_neighbors")
+    parser.add_argument("name", nargs="?", default=None, help="store/session name, vault node id for vault_node/vault_neighbors, the brief id for brief_status/cancel_brief, the task for rsi_run/rsi_series/rsi_frames, the session for rsi_campaigns, the model_server/policy_server action (status|start|stop, default status), 'build' to make restart_services rebuild ph-station first, or the console port for health")
     parser.add_argument("--brief", default=None, help="submit_brief: the raw brief JSON string, dropped verbatim (zero validation; the runtime is the sole authority); submit_proposal: the raw proposal JSON {task, kind, payload, note}")
     parser.add_argument("--session", default="session-main", help="the runtime session addressed: whose inbox submit_brief routes into, whose brief brief_status/cancel_brief names, and whose evolve campaign rsi_run/rsi_series/rsi_frames reads (default: session-main)")
     parser.add_argument("--relation", default=None, help="vault_neighbors: restrict adjacency to one rel")
