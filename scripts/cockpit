@@ -65,7 +65,11 @@ DO_STATUS=0
 DO_RESTART=0
 DO_BUILD=0
 NO_RUNTIME=0
-NO_RENDER=0
+# PH_NO_RENDER=1 (.env) keeps session-main headless even when DISPLAY is set:
+# the local MuJoCo window plus --frames (browser viewport) segfaults inside
+# robosuite's offscreen render (2026-09-03), and a LAN operator never sees the
+# window anyway. --no-render on the command line does the same for one run.
+NO_RENDER=0  # resolved from .env below, after _env_get exists
 SESSION_DIR="runs/session-main"          # cockpit's canonical resident session
 STACK_EVOLUTION_SESSION_DIR="runs/session-main-rsi"
 ROBOCASA_SESSION_DIR="runs/session-robocasa"
@@ -183,6 +187,7 @@ PORT="$(_env_get PH_CONSOLE_PORT)"; PORT="${PORT:-3080}"
 TRUSTED_HOST="$(_env_get PH_TRUSTED_HOST)"
 WITH_MODEL="$(_env_get PH_WITH_MODEL)"; WITH_MODEL="${WITH_MODEL:-0}"
 WITH_POLICY="$(_env_get PH_WITH_POLICY)"; WITH_POLICY="${WITH_POLICY:-0}"
+NO_RENDER_ENV="$(_env_get PH_NO_RENDER)"; [ "${NO_RENDER_ENV:-0}" = "1" ] && NO_RENDER=1
 POLICY_CHECKPOINT="$(_env_get PH_POLICY_CHECKPOINT)"
 ORIG_ARGS=("$@")
 
