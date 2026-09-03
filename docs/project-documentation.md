@@ -457,7 +457,7 @@ clone 合法地显示**更多跳过，绝不是失败**：
 {"kind":"evolve","task":"kitchen_thaw","seeds":[lo,hi],"rounds":N,"arm":"auto"}
 ```
 
-只在进化态被接受（与 campaign/rsi 同一道拒绝）；runtime `_run_evolve` 起 `scripts/evolve.py` 子进程（走 `_run_watched`，取消/killpg 复用）。`rounds` 是**有真实试验的轮数目标**（`tried.kind:none` 的轮不计；连续 2 轮 none、或 none 的 `needs` 为空（无事可解）→ `status:done`，最后一轮的 `needs` 写明原因），`seeds`/`arm` 续投时可省（取 campaign.json 里的）。
+只在进化态被接受（与 campaign/rsi 同一道拒绝）；runtime `_run_evolve` 起 `scripts/evolve.py` 子进程（走 `_run_watched`，取消/killpg 复用）。`rounds` 是**有真实试验的轮数目标**（`tried.kind:none` 的轮不计）；**缺省 0 = 无上限**（控制台的开始/继续就是这样投的），只有停止按钮（cancel 标记，落在轮边界，等待期间也立即生效）能结束：模型一轮拿不出方案时不停，节流后继续（`NONE_BACKOFF_S`：60 s 起逐轮翻倍到 600 s 封顶，`live.phase:"waiting"`，下一次真实试验归零）；显式 `rounds>0` 的有界投递保留旧规则（连续 `MAX_NONE`=2 轮 none → `status:done`）；none 的 `needs` 为空（每颗种子都成功，无事可解）两种模式都立即完成，`seeds`/`arm` 续投时可省（取 campaign.json 里的）。
 
 一轮：
 1. **看**：同种子 suite（与 task brief 同一条 `_mount_plan → workload.run` 路径）→ 每种子首死节点、fault `{kind,node,msg}`、每节点 executor。

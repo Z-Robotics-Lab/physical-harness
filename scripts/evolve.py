@@ -74,8 +74,13 @@ OVERRIDE_ENV = "PH_MOUNT_PARAMS_OVERRIDE"
 EXTRA_ENV = "PH_PLUGINS_EXTRA"
 _BASE_EXTRA = os.environ.get(EXTRA_ENV, "")
 PLANNER_REF = "scripts.evolve:planner_provider"
-#: Consecutive rounds with nothing tried that end the loop (status done, needs on the row).
+#: Consecutive rounds with nothing tried that end a BOUNDED loop (--rounds > 0: status
+#: done, needs on the row). An unbounded loop (--rounds 0, the console's 开始/继续)
+#: never stops on its own -- the operator's 停止 is the only end -- so a model that has
+#: nothing to try is throttled instead: wait NONE_BACKOFF_S[0] after the first empty
+#: round, doubling up to NONE_BACKOFF_S[1], reset by the next real try.
 MAX_NONE = 2
+NONE_BACKOFF_S = (float(os.environ.get("PH_NONE_BACKOFF_S", "60")), 600.0)
 
 
 class EvolveStore:
@@ -471,6 +476,9 @@ def _message(live: dict) -> str:
         head = f"LLM 分析第 {live['round']} 轮…"
     if live["phase"] == "done":
         return f"已完成 {live['round']} 轮"
+    if live["phase"] == "waiting":
+        return (f"第 {live['round']} 轮没有可试方案，{live.get('wait_s', 0)} 秒后继续"
+                f"（连续第 {live.get('nones', 1)} 次，按停止结束）")
     if live["phase"] == "cancelled":
         return f"第 {live['round']} 轮边界取消"
     t = live.get("tried")
@@ -526,7 +534,8 @@ def main(argv=None) -> int:
     # (the console's 开始/继续 sends a task-only brief, so rounds is the default):
     # otherwise the round loop is empty and the brief "finishes" in a blink.
     tries = sum(r["tried"]["kind"] != "none" for r in doc["rounds"])
-    target = args.rounds if args.rounds > tries else tries + args.rounds
+    unbounded = args.rounds <= 0
+    target = float("inf") if unbounded else (args.rounds if args.rounds > tries else tries + args.rounds)
     doc["status"] = "running"
     # live = where the loop is RIGHT NOW (rsi_run's ``live``): rewritten with the
     # doc at every phase/seed/node boundary. One writer, tmp+rename -> no race.
@@ -569,11 +578,25 @@ def main(argv=None) -> int:
     # stop: the target reached, or MAX_NONE rounds in a row with nothing tried (a stuck
     # model cannot loop forever); a none whose ``needs`` is empty (nothing could unblock
     # it: every seed succeeded) ends the loop at once.
-    while tries < target and nones < MAX_NONE:
-        if args.cancel_marker is not None and args.cancel_marker.exists():
+    def cancelled() -> bool:
+        return args.cancel_marker is not None and args.cancel_marker.exists()
+
+    while tries < target and (unbounded or nones < MAX_NONE):
+        if cancelled():
             doc["status"] = "cancelled"
             tick(phase="cancelled")
             return 3
+        if unbounded and nones:
+            # Throttle, never stop: an empty round costs one model call and no sim.
+            wait = min(NONE_BACKOFF_S[0] * 2 ** (nones - 1), NONE_BACKOFF_S[1])
+            tick(phase="waiting", wait_s=int(wait), nones=nones)
+            t_wait = time.time()
+            while time.time() - t_wait < wait:
+                if cancelled():
+                    doc["status"] = "cancelled"
+                    tick(phase="cancelled")
+                    return 3
+                time.sleep(min(2.0, wait))
         r += 1
         t_round = time.time()
         tick(phase="baseline" if base is None else "propose", round=r, round_started_at=t_round, tried=None)
@@ -661,8 +684,10 @@ def main(argv=None) -> int:
         base = kept
         if tried["kind"] != "none":
             tries, nones = tries + 1, 0
+        elif not tried["detail"].get("needs"):
+            break   # nothing could unblock it: every seed succeeded -- genuinely done
         else:
-            nones = MAX_NONE if not tried["detail"].get("needs") else nones + 1
+            nones += 1
     doc["status"] = "done"
     tick(phase="done")
     return 0

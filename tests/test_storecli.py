@@ -172,7 +172,9 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
         assert out == json.dumps(lib) == json.dumps(mcp), argv
     # non-trivial: the fixture rounds actually flow through each face
     run = bs.rsi_run(sd, "kitchen_thaw")
-    assert run["status"] == "running" and run["cursor"] == 2 and run["latest"]["round"] == 2
+    # campaign.json says running, but no evolve brief is left to drive it: the READ
+    # says stopped (a killed loop must not look alive on the page forever).
+    assert run["status"] == "stopped" and run["cursor"] == 2 and run["latest"]["round"] == 2
     assert run["live"] == _CAMPAIGN["live"] and run["live"]["message"]
     assert run["open_brief"] is None
     (camp / "campaign.json").write_text(json.dumps({k: v for k, v in _CAMPAIGN.items() if k != "live"}))

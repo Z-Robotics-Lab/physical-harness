@@ -1081,7 +1081,7 @@ def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
     cmd = [sys.executable, str(REPO_ROOT / "scripts/evolve.py"), "--mode", "evolution",
            "--task", task, "--session", str(rt.inbox.parent),
            "--skills-root", str(rt.skills_root),
-           "--rounds", str(int(brief.get("rounds", 3))),
+           "--rounds", str(int(brief.get("rounds", 0))),   # 0 = until 停止
            "--arm", str(brief.get("arm", "auto")),
            "--cancel-marker", str(_cancel_marker(rt, brief_id))]
     if brief.get("seeds"):

@@ -1360,6 +1360,15 @@ def _campaign(session_dir: str | Path, task: str) -> dict | None:
     return doc if isinstance(doc, dict) else None
 
 
+def _live_status(doc: dict, open_brief: str | None) -> str | None:
+    """``running`` in campaign.json means "the loop was alive when it last wrote".
+    With no evolve brief left in inbox/processing nobody is driving it any more
+    (cancelled mid-round, killed, or the box rebooted), so the READ says
+    ``stopped`` -- the file is never rewritten, evolve.py stays the one writer."""
+    st = doc.get("status")
+    return "stopped" if st == "running" and open_brief is None else st
+
+
 def rsi_run(session_dir: str | Path, task: str) -> dict | None:
     """One evolve campaign's state: the campaign.json fields (task, session,
     seeds, arm, best, cursor, status, rounds -- each round carrying ``per_seed``
@@ -1374,8 +1383,10 @@ def rsi_run(session_dir: str | Path, task: str) -> dict | None:
     if doc is None:
         return None
     rounds = doc.get("rounds") or []
-    return {**doc, "latest": rounds[-1] if rounds else None, "live": doc.get("live"),
-            "open_brief": _open_brief(Path(session_dir), task)}
+    open_brief = _open_brief(Path(session_dir), task)
+    return {**doc, "status": _live_status(doc, open_brief),
+            "latest": rounds[-1] if rounds else None, "live": doc.get("live"),
+            "open_brief": open_brief}
 
 
 def _open_brief(session_dir: Path, task: str) -> str | None:
@@ -1397,7 +1408,8 @@ def _open_brief(session_dir: Path, task: str) -> str | None:
 def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     """Every evolve campaign the session holds on disk (``campaigns/evolve-*/
     campaign.json``, so it survives a restart -- the per-boot feed does not):
-    ``{task, status, cursor, rounds (count), best, seeds, arm, node_rate_best (the
+    ``{task, status (``stopped`` when campaign.json still says running but no evolve
+    brief is left to drive it), cursor, rounds (count), best, seeds, arm, node_rate_best (the
     series' running-max node pass rate | null), published_rounds: [round numbers],
     usage: {llm_tokens: {prompt, completion} | null, sim_s} (summed over rounds), updated
     (campaign.json mtime), live: {phase, message, nodes_done "k/n" | null} | null, open_brief}``,
@@ -1411,8 +1423,9 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
             continue
         live, rounds = doc.get("live"), doc.get("rounds") or []
         tok = [u["llm_tokens"] for r in rounds if (u := r.get("usage")) and u.get("llm_tokens")]
+        open_brief = _open_brief(session_dir, task)
         out.append({
-            "task": doc.get("task", task), "status": doc.get("status"),
+            "task": doc.get("task", task), "status": _live_status(doc, open_brief),
             "cursor": doc.get("cursor"), "rounds": len(rounds),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
             "published_rounds": [r["round"] for r in rounds if r.get("published")],
@@ -1425,7 +1438,7 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
                       "nodes_done": (f"{sum(n.get('ok') is True for n in live['nodes'])}/{len(live['nodes'])}"
                                      if live.get("nodes") else None)}
                      if isinstance(live, dict) else None),
-            "open_brief": _open_brief(session_dir, task)})
+            "open_brief": open_brief})
     out.sort(key=lambda c: (c["status"] != "running", -c["updated"]))
     return out
 

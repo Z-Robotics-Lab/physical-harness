@@ -316,3 +316,40 @@ def test_three_nones_are_taken_honestly_on_the_third_attempt(tmp_path):
     audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
     assert len(audit["attempts"]) == 2 and audit["calls"] == 3
     assert tried["kind"] == "none" and tried["detail"]["reason"] == "llm: 坚持 none"
+
+
+def test_an_unbounded_run_waits_instead_of_stopping_and_only_cancel_ends_it(tmp_path):
+    """The console's 开始/继续 sends no ``rounds``: the loop must never end itself.
+
+    Two model answers, then nothing but ``none`` -- a bounded run would stop after
+    MAX_NONE; unbounded it enters ``waiting`` (backoff, live phase + message) and
+    keeps the campaign ``running`` until the operator's cancel marker lands.
+    """
+    from test_mission_e2e import SESSION, _wait
+
+    canned = [CANNED[0]] + [{"kind": "none", "payload": {},
+                             "summary": "没有可试的。", "rationale": "都试过了"}] * 12
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    rt = _Runtime(runs, card=_CARD, canned=canned, mode="evolution",
+                  env={"PH_CANDIDATES_ROOT": str(runs / "candidates"),
+                       "PH_NONE_BACKOFF_S": "3"})   # 3 s, 6 s, ... instead of 60 s
+    campaign = rt.session / "campaigns" / f"evolve-{TASK}" / "campaign.json"
+    try:
+        bs.submit_brief(runs, json.dumps({"kind": "evolve", "task": TASK,
+                                          "seeds": [1, 2], "arm": "auto"}), session=SESSION)
+        doc = lambda: json.loads(campaign.read_text()) if campaign.exists() else {}
+        _wait(lambda: (doc().get("live") or {}).get("phase") == "waiting", 120,
+              "the loop to throttle instead of stopping")
+        d = doc()
+        assert d["status"] == "running", d["status"]          # never done on its own
+        assert "按停止结束" in d["live"]["message"], d["live"]["message"]
+        assert d["live"]["wait_s"] >= 3 and d["live"]["nones"] >= 1
+        brief = sorted(p.name for p in (rt.session / "processing").iterdir())[0]
+        assert bs.cancel_brief(rt.session, brief).get("error") is None
+        _wait(lambda: (rt.session / "cancelled" / brief).exists(), 60, "cancel to land")
+        # the read says stopped even if the loop was killed before it could write
+        assert bs.rsi_run(rt.session, TASK)["status"] in ("cancelled", "stopped")
+        assert bs.rsi_run(rt.session, TASK)["open_brief"] is None
+    finally:
+        rt.stop()
