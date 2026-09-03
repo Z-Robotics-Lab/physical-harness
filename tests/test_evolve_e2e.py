@@ -212,6 +212,15 @@ def test_live_block_shows_progress_during_the_run_and_done_at_the_end(runtime, t
     assert all(l["seeds_total"] == 2 and l["message"] and l["started_at"] for l in _LIVE)
     assert any(l["phase"] == "retest" and l["tried"]["kind"] == "executor" for l in _LIVE)
     assert "种子 1 运行中" in next(l["message"] for l in base if l["seed"] == 1)
+    # the node trail of seed 1 (a plain list in plan order): ok flips None -> True in
+    # plan order as verify rows land, and the rolling message log accumulates
+    trails = [tuple(n["ok"] for n in l["nodes"]) for l in _LIVE if l["nodes"]]
+    assert trails[0] == (None, None) and any(t[0] is True for t in trails), trails
+    assert all(t in ((None, None), (True, None), (True, True), (True, False)) for t in trails), trails
+    assert all(l["nodes"][0]["id"] == "reach-0" and l["nodes"][1]["skill"] == "grab" for l in _LIVE if l["nodes"])
+    assert all(l["seed_started_at"] for l in base if l["seed"] is not None)
+    assert [m["text"] for m in _LIVE[-1]["messages"]][-1] == "已完成 2 轮"
+    assert len(_LIVE[-1]["messages"]) == 20 and all(m["ts"] for m in _LIVE[-1]["messages"])
     live = _doc(runtime)["live"]
     assert live["phase"] == "done" and live["round"] == 2 and live["last_round_s"] is not None
     assert live["message"] == "已完成 2 轮" and bs.rsi_run(runtime.session, TASK)["live"] == live
@@ -245,9 +254,17 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
     assert [(s["round"], s["before"], s["after"], s["published"]) for s in steps] == \
         [(1, 0, 2, True), (2, 2, 2, False)]
     # per-seed detail of the kept suite rides both the round and its rsi_step row
+    n_steps = r1["per_seed"][0]["nodes"][0]["steps"]
+    assert isinstance(n_steps, int) and n_steps > 0
     kept = [{"seed": s, "success": True, "first_death": None, "failure_mode": None,
-             "tunables_sha": None} for s in (1, 2)]
+             "tunables_sha": None, "elapsed_s": pytest.approx(1, abs=30),
+             "nodes": [{"id": n, "ok": True, "steps": n_steps, "failure_mode": None}
+                       for n in ("reach-0", "grab-0")]} for s in (1, 2)]
     assert [s["per_seed"] for s in steps] == [r1["per_seed"], r2["per_seed"]] == [kept, kept]
+    # the baseline (0/2) rows carry the trail with the first-death node ok=False
+    base_rows = [p for l in _LIVE for p in l["per_seed_partial"] if l["phase"] == "baseline"]
+    assert base_rows and all(r["first_death"] == "grab-0" and r["elapsed_s"] > 0 and
+                             [n["ok"] for n in r["nodes"]] == [True, False] for r in base_rows), base_rows
     assert (r1["needs"], r2["needs"]) == ([], []) and steps[1]["needs"] == []   # all seeds pass
     assert all(s["brief"] == name and s["task"] == TASK and s["suite_sha"] for s in steps)
     assert not _kinds(rows, "runtime.task_error")
@@ -317,7 +334,7 @@ def test_proposer_tries_an_unproven_executor_once_then_says_what_it_needs(monkey
     before = {"count": 0, "seeds": {"1": dead, "2": dead}, "sha": "x"}
     assert evolve.per_seed(before) == [
         {"seed": s, "success": False, "first_death": "grab-0", "failure_mode": "reach_stall",
-         "tunables_sha": None} for s in (1, 2)]
+         "tunables_sha": None, "elapsed_s": None, "nodes": []} for s in (1, 2)]
     first = evolve.propose(before, recs, EMB, "auto", binding, 1, {"executors": {}, "tunables": {}}, [])
     assert (first["kind"], first["node"], first["detail"]["to"]) == ("executor", "grab-0", "alt")
     again = evolve.propose(before, recs, EMB, "auto", binding, 2, {"executors": {}, "tunables": {}},

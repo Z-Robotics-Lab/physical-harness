@@ -1365,7 +1365,8 @@ def rsi_run(session_dir: str | Path, task: str) -> dict | None:
     seeds, arm, best, cursor, status, rounds -- each round carrying ``per_seed``
     and ``needs``) plus ``latest`` (the newest round row, or None before the
     first lands), ``live`` (scripts/evolve.py's in-flight block: phase, round,
-    seed/seed_index/seeds_total, node, per_seed_partial, tried, message, timings --
+    seed/seed_index/seeds_total, node, nodes (the seed's node trail), seed_started_at,
+    per_seed_partial, tried, message, messages (last 20), timings --
     live state, never sealed; null when the file predates it) and ``open_brief``
     (the inbox/processing evolve brief id for this task, so the page can stop it
     after a restart; null when none). None when no campaign exists."""
@@ -1397,7 +1398,7 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     """Every evolve campaign the session holds on disk (``campaigns/evolve-*/
     campaign.json``, so it survives a restart -- the per-boot feed does not):
     ``{task, status, cursor, rounds (count), best, seeds, arm, updated
-    (campaign.json mtime), live: {phase, message} | null, open_brief}``,
+    (campaign.json mtime), live: {phase, message, nodes_done "k/n" | null} | null, open_brief}``,
     running first, then newest ``updated`` first."""
     session_dir = Path(session_dir)
     out = []
@@ -1412,7 +1413,9 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
             "cursor": doc.get("cursor"), "rounds": len(doc.get("rounds") or []),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
             "updated": (d / "campaign.json").stat().st_mtime,
-            "live": ({"phase": live.get("phase"), "message": live.get("message")}
+            "live": ({"phase": live.get("phase"), "message": live.get("message"),
+                      "nodes_done": (f"{sum(n.get('ok') is True for n in live['nodes'])}/{len(live['nodes'])}"
+                                     if live.get("nodes") else None)}
                      if isinstance(live, dict) else None),
             "open_brief": _open_brief(session_dir, task)})
     out.sort(key=lambda c: (c["status"] != "running", -c["updated"]))

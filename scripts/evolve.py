@@ -110,24 +110,29 @@ def planner_provider(inner: str, inner_params=None, executors=None) -> _Forced:
 
 
 class _Tap(SessionLog):
-    """The per-seed ledger, reporting the node in flight as rows land: the plan's
-    first node once ``task.plan`` lands, then the next in plan order after each
-    successful ``task.verify`` (a failed one keeps the node: a retry or replan
-    follows). No node-start row exists, so this is an inference, not a reading."""
+    """The per-seed ledger as a node trail: ``task.plan`` sets ``nodes`` (plan order,
+    ``ok`` None; a replan resets all but the verified-ok nodes), each ``task.verify`` fills that node's ``ok`` (+
+    ``steps`` / ``failure_mode`` when the row carries them). The node in flight is
+    the first not yet verified ok -- an inference (no node-start row exists), not
+    a reading. ``on_change(nodes)`` fires at every change."""
 
-    def __init__(self, on_node) -> None:
+    def __init__(self, on_change) -> None:
         super().__init__()
-        self._on, self._order = on_node, []
+        self._on, self.nodes = on_change, []
 
     def append(self, kind: str, data: dict) -> int:
         seq = super().append(kind, data)
         if kind == "task.plan" and data.get("graph"):
-            self._order = [n["id"] for n in data["graph"].get("nodes") or []]
-            self._on(self._order[0] if self._order else None)
-        elif (kind == "task.verify" and data.get("node") in self._order
-              and all((data.get("results") or {}).values())):
-            i = self._order.index(data["node"]) + 1
-            self._on(self._order[i] if i < len(self._order) else None)
+            done = {n["id"]: n for n in self.nodes if n["ok"] is True}   # a replan keeps verified nodes
+            self.nodes = [done.get(n["id"]) or {"id": n["id"], "skill": n.get("skill"), "ok": None,
+                                                "steps": None, "failure_mode": None}
+                          for n in data["graph"].get("nodes") or []]
+        elif kind == "task.verify" and (hit := [n for n in self.nodes if n["id"] == data.get("node")]):
+            hit[0].update(ok=all((data.get("results") or {}).values()), steps=data.get("steps"),
+                          failure_mode=(data.get("diagnostics") or {}).get("failure_mode"))
+        else:
+            return seq
+        self._on(copy.deepcopy(self.nodes))
         return seq
 
 
@@ -176,8 +181,10 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
         brief["media_dir"] = str(media_dir)
     tick = progress or (lambda **kw: None)
     for i, seed in enumerate(range(int(seeds[0]), int(seeds[1]) + 1)):
-        tick(seed_index=i, seed=seed, node=None)
-        log = _Tap(lambda node: tick(node=node))
+        t_seed = time.time()
+        tick(seed_index=i, seed=seed, node=None, nodes=[], seed_started_at=t_seed)
+        log = _Tap(lambda nodes: tick(nodes=nodes, node=next(
+            (n["id"] for n in nodes if n["ok"] is not True), None)))
         kernel = Kernel(CAPABILITIES, log=log)
         kernel.mount(_mount(binding, skills_root, applied["executors"]))
         out = workload.run(dict(brief), kernel, seed=seed,
@@ -192,6 +199,8 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
         dead = next((nid for nid, n in nodes.items() if not n["success"]), None)
         per[str(seed)] = {
             "success": bool(out["success"]),
+            "elapsed_s": round(time.time() - t_seed, 1),
+            "trail": [{k: n[k] for k in ("id", "ok", "steps", "failure_mode")} for n in log.nodes],
             "first_death": dead,
             "failure_mode": (nodes[dead].get("diagnostics") or {}).get("failure_mode") if dead else None,
             "fault": {k: faults[0].get(k) for k in ("kind", "node", "msg")} if faults else None,
@@ -199,16 +208,23 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                             "executor": n.get("executor") or "scripted",
                             "tunables_sha": (n.get("diagnostics") or {}).get("tunables_sha")}
                       for nid, n in nodes.items()}}
+        for n in per[str(seed)]["trail"]:   # final state from the result: a replan reset the live
+            r = nodes.get(n["id"]) or {}      # trail, and the verify row carries no steps/diagnostics
+            if n["ok"] is None and "success" in r:
+                n["ok"] = bool(r["success"])
+            n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
+            n["failure_mode"] = n["failure_mode"] or (r.get("diagnostics") or {}).get("failure_mode")
         tick(per_seed_partial=per_seed({"seeds": per}))
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per)}
 
 
 def per_seed(suite: dict) -> list[dict]:
     """The operator-facing per-seed summary sealed with every round (rsi_step /
-    campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha}]``
-    (the knobs the dying node ran under) -- the seed detail that otherwise lives
-    only in this process."""
+    campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha, elapsed_s,
+    nodes: [{id, ok, steps, failure_mode}]}]`` (the knobs the dying node ran under; the
+    node trail's final state) -- the seed detail that otherwise lives only in this process."""
     return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
+             "elapsed_s": s.get("elapsed_s"), "nodes": s.get("trail") or [],
              "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")
              if s.get("first_death") else None}
             for seed, s in suite["seeds"].items()]
@@ -414,7 +430,9 @@ def _message(live: dict) -> str:
     if t and live["phase"] in ("retest", "publish"):
         head += f"（{t['kind']} @ {t['node']}）"
     if live["seed"] is not None:
+        done = sum(n["ok"] is True for n in live.get("nodes") or [])
         head += (f"：种子 {live['seed']} 运行中" + (f" ({live['node']})" if live["node"] else "")
+                 + (f" 节点 {done}/{len(live['nodes'])}" if live.get("nodes") else "")
                  + f"，{live['seed_index'] + 1}/{live['seeds_total']}")
     return head
 
@@ -455,14 +473,18 @@ def main(argv=None) -> int:
     live = doc["live"] = {"phase": "idle", "round": doc["cursor"], "seeds_total": int(seeds[1]) - int(seeds[0]) + 1,
                           "seed_index": None, "seed": None, "node": None, "started_at": now,
                           "round_started_at": None, "phase_started_at": now, "last_round_s": None,
-                          "per_seed_partial": [], "tried": None, "message": ""}
+                          "per_seed_partial": [], "tried": None, "message": "", "messages": [],
+                          "nodes": [], "seed_started_at": None}
 
     def tick(**kw) -> None:
         if kw.get("phase", live["phase"]) != live["phase"]:
             kw = {"phase_started_at": time.time(), "seed": None, "seed_index": None, "node": None,
-                  "per_seed_partial": [], **kw}
+                  "nodes": [], "seed_started_at": None, "per_seed_partial": [], **kw}
         live.update(kw)
-        live["message"] = _message(live)
+        msg = _message(live)
+        if msg != live["message"]:   # rolling operator log: the last 20 distinct messages
+            live["message"] = msg
+            live["messages"] = (live["messages"] + [{"ts": time.time(), "text": msg}])[-20:]
         store.save(doc)
 
     tick()

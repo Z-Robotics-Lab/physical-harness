@@ -91,10 +91,22 @@ def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
     session = runs / "session-main"
     name = bs.submit_brief(runs, json.dumps(
         {"kind": "evolve", "task": task, "seeds": [4243, 4243], "rounds": 2, "arm": "scripted"}))["submitted"]
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, str(RUNTIME), "--session-dir", str(session), "--drain", "--mode", "evolution"],
-        cwd=str(REPO), capture_output=True, text=True, timeout=5400, check=False,
+        cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={**os.environ, "MUJOCO_GL": "egl", "PYTHONPATH": str(REPO)})
+    campaign = session / "campaigns" / f"evolve-{task}" / "campaign.json"
+    trails, deadline = [], time.monotonic() + 5400   # every distinct live node trail the page would show
+    while proc.poll() is None and time.monotonic() < deadline:
+        try:
+            nodes = json.loads(campaign.read_text())["live"]["nodes"]
+            if nodes and nodes != (trails[-1] if trails else None):
+                trails.append(nodes)
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+        time.sleep(0.2)
+    _, err = proc.communicate(timeout=60)
+    proc.stderr = err
     assert proc.returncode == 0, proc.stderr[-4000:]
     assert (session / "done" / name).exists(), proc.stderr[-4000:]
     assert not [r for r in bs.chain_rows(session) if r["kind"] == "runtime.task_error"], proc.stderr[-4000:]
@@ -104,7 +116,16 @@ def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
                         r["tried"]["detail"].get("to"), r["before"], r["after"], r["per_seed"],
                         r["after_seeds"]) for r in doc["rounds"]])
     base = r1["per_seed"][0] if not r1["published"] else None
+    if base:   # the trail carries steps on the actuated nodes (perceive/decide nodes have none)
+        dead = next(n for n in base["nodes"] if n["id"] == base["first_death"])
+        assert dead["ok"] is False and isinstance(dead["steps"], int) and base["elapsed_s"] > 0, base
+        assert sum(isinstance(n["steps"], int) for n in base["nodes"] if n["ok"] is True) >= 1, base
     if base and base["failure_mode"] == "reach_stall":   # the acceptance fact this round answers
+        # while it ran, the live trail showed nodes verified ok before the drop node died
+        # (the drop node's ok=False is transient: the replan resets it, so only ok=True is asserted)
+        seen = [t for t in trails if base["first_death"] in [n["id"] for n in t]]
+        assert seen and any(any(n["ok"] is True for n in t[:[n["id"] for n in t].index(base["first_death"])])
+                            for t in seen), trails[-1:]
         assert r1["tried"]["kind"] == "tunables", r1["tried"]
         d = r1["tried"]["detail"]
         assert d["path"][-1] == "drop_edge_margin" and d["hint"] == "reach_stall"

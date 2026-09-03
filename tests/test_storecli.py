@@ -115,9 +115,14 @@ _CAMPAIGN = {
     "best": 1, "cursor": 2, "status": "running",
     "live": {"phase": "baseline", "round": 3, "seeds_total": 2, "seed_index": 1, "seed": 2,
              "node": "grasp", "started_at": 0.5, "round_started_at": 2.5, "phase_started_at": 2.5,
-             "last_round_s": 1.0, "per_seed_partial": [
-                 {"seed": 1, "success": True, "first_death": None, "failure_mode": None}],
-             "tried": None, "message": "第 3 轮 基线评测：种子 2 运行中 (grasp)，2/2"},
+             "last_round_s": 1.0, "seed_started_at": 3.0, "per_seed_partial": [
+                 {"seed": 1, "success": True, "first_death": None, "failure_mode": None,
+                  "elapsed_s": 0.4, "nodes": [{"id": "reach", "ok": True, "steps": 9, "failure_mode": None},
+                                              {"id": "grasp", "ok": True, "steps": 12, "failure_mode": None}]}],
+             "nodes": [{"id": "reach", "skill": "reach", "ok": True, "steps": None, "failure_mode": None},
+                       {"id": "grasp", "skill": "grasp", "ok": None, "steps": None, "failure_mode": None}],
+             "tried": None, "message": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2",
+             "messages": [{"ts": 3.0, "text": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2"}]},
 }
 
 
@@ -243,7 +248,8 @@ def test_rsi_campaigns_faces_are_byte_identical(tmp_path, capsys):
     running, finished = lib
     assert running == {"task": "kitchen_thaw", "status": "running", "cursor": 2, "rounds": 2,
                        "best": 1, "seeds": [1, 2], "arm": "auto", "updated": running["updated"],
-                       "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"]},
+                       "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"],
+                                "nodes_done": "1/2"},
                        "open_brief": "brief-aaaa.json"}
     assert finished["status"] == "done" and finished["live"] is None \
         and finished["open_brief"] is None and finished["updated"] == 9e9
