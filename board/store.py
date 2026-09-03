@@ -1450,7 +1450,8 @@ def _series(doc: dict) -> list[dict]:
         na, ta = _rates(r.get("after_seeds"))
         cur = na if na is not None else nb
         best = cur if best is None or (cur is not None and cur > best) else best
-        out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs")},
+        out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs",
+                                             "proposer", "llm")},
                     "node_rate": {"before": nb, "after": na, "best": best},
                     "by_task": {t: {"before": tb.get(t), "after": ta.get(t)} for t in sorted(set(tb) | set(ta))}})
     return out

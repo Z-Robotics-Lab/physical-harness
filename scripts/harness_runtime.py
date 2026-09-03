@@ -1061,7 +1061,7 @@ def _seal_rounds(rt: Runtime, brief_id: str, task: str, path: Path) -> None:
             rt.log.append("rsi_step", {"brief": brief_id, "task": task,
                                        **{k: rd.get(k) for k in ("round", "tried", "before", "after",
                                                                  "best", "published", "suite_sha",
-                                                                 "per_seed", "needs")}})
+                                                                 "per_seed", "needs", "proposer", "llm")}})
 
 
 def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
@@ -1085,6 +1085,8 @@ def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
            "--cancel-marker", str(_cancel_marker(rt, brief_id))]
     if brief.get("seeds"):
         cmd += ["--seeds", str(int(brief["seeds"][0])), str(int(brief["seeds"][1]))]
+    if brief.get("proposer"):   # llm (default) | rules
+        cmd += ["--proposer", str(brief["proposer"])]
     for k in ("max_replans", "max_actuations"):   # budgets: brief > binding > workload default
         if brief.get(k) is not None:
             cmd += [f"--{k.replace('_', '-')}", str(int(brief[k]))]
@@ -1205,7 +1207,7 @@ _BRIEF_KEYS = {
     "suite": {"kind", "suite", "arm", "seeds", "max_replans", "max_actuations"},
     "rsi": {"kind", "task", "node", "cal", "dev", "heldout", "workers", "floor"},
     "mission": {"kind", "mission", "seed", "arm", "max_replans", "max_actuations"},
-    "evolve": {"kind", "task", "seeds", "rounds", "arm", "max_replans", "max_actuations"},
+    "evolve": {"kind", "task", "seeds", "rounds", "arm", "max_replans", "max_actuations", "proposer"},
 }
 _MAX_INSTRUCTION_CHARS = 4000
 

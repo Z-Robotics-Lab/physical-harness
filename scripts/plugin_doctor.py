@@ -294,9 +294,18 @@ def check(plugin_dir: str | Path) -> Report:
             continue
         rep.add("A", f"task:{task}", "PASS", binding["planner"])
 
+    # Tier A for a candidate card's ``[executors.<key>]``: the ref the suite would
+    # mount must load HERE (an LLM-written card reddens at the doctor, never mid-suite).
+    for key, spec in data.get("executors", {}).items():
+        try:
+            load_provider(spec["ref"])
+            rep.add("A", f"executor:{key}", "PASS", spec["ref"])
+        except Exception as exc:  # noqa: BLE001 -- a dead ref / bad code is a red
+            rep.add("A", f"executor:{key}", "FAIL", f"{type(exc).__name__}: {exc}")
+
     mounts = card_mounts(data)
     if not mounts:
-        if not data.get("task_bindings"):
+        if not data.get("task_bindings") and not data.get("executors"):
             rep.add("A", "mounts", "SKIP", "claim-only card: nothing executable to check")
         return rep
 

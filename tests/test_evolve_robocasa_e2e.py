@@ -34,7 +34,7 @@ def test_one_evolve_round_on_the_real_kitchen(tmp_path):
     seeds = [429002, 429003]
     name = bs.submit_brief(runs, json.dumps(
         {"kind": "evolve", "task": TASK, "seeds": seeds, "rounds": 1, "arm": "scripted",
-         "max_actuations": 24, "max_replans": 1}))["submitted"]
+         "max_actuations": 24, "max_replans": 1, "proposer": "rules"}))["submitted"]
     proc = subprocess.Popen(
         [sys.executable, str(RUNTIME), "--session-dir", str(session), "--drain",
          "--mode", "evolution"],
@@ -90,7 +90,8 @@ def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
     runs = tmp_path / "runs"
     session = runs / "session-main"
     name = bs.submit_brief(runs, json.dumps(
-        {"kind": "evolve", "task": task, "seeds": [4243, 4243], "rounds": 2, "arm": "scripted"}))["submitted"]
+        {"kind": "evolve", "task": task, "seeds": [4243, 4243], "rounds": 2, "arm": "scripted",
+         "proposer": "rules"}))["submitted"]
     proc = subprocess.Popen(
         [sys.executable, str(RUNTIME), "--session-dir", str(session), "--drain", "--mode", "evolution"],
         cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

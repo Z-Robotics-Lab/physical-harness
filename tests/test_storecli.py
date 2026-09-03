@@ -184,10 +184,11 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     # best carries the running max
     assert bs.rsi_series(sd, "kitchen_thaw") == [   # pre-per_seed rounds read as null
         {"round": 1, "before": 0, "after": 1, "best": 1, "per_seed": r1["per_seed"], "needs": [],
+         "proposer": None, "llm": None,   # pre-LLM rounds read as null
          "node_rate": {"before": 0.75, "after": None, "best": 0.75},
          "by_task": {"grasp": {"before": 0.5, "after": None}, "reach": {"before": 1.0, "after": None}}},
         {"round": 2, "before": 1, "after": 1, "best": 1, "per_seed": None, "needs": None,
-         "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
+         "proposer": None, "llm": None, "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
     assert bs.rsi_series(sd, "kitchen_thaw") == ms.rsi_series("kitchen_thaw")
     assert bs.rsi_frames(sd, "kitchen_thaw", 1) == ["media/kitchen_thaw/1/grasp.gif"]
     assert bs.rsi_frames(sd, "kitchen_thaw", 9) == [] and bs.rsi_run(sd, "nope") is None

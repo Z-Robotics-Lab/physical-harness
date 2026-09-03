@@ -3,8 +3,10 @@
 Spawned by ``scripts/harness_runtime._run_evolve`` (an ``evolve`` brief, evolution
 mode only) as its own process group. One round: run the task's seed suite in-process
 (the SAME ``_mount_plan``/``task_brief``/``workload.run`` a task brief uses), read
-each seed's first-death node + fault signature + per-node executor, let the built-in
-proposer pick ONE change -- the first-death node's executor (a bound policy whose
+each seed's first-death node + fault signature + per-node executor, let the LLM
+proposer (scripts/evolve_llm: the model reads the round's trails + log excerpt and
+answers a tunables / executor / code-as-policy card proposal; ``--proposer rules``
+or an invalid / unreachable answer falls back to) the built-in rules proposer pick ONE change -- the first-death node's executor (a bound policy whose
 ``evidence.by_executor`` beats the measured rate) else a one-dimensional +/-20%
 tunables perturbation of that node's driver (its card's mount params, applied via
 ``PH_MOUNT_PARAMS_OVERRIDE``) else nothing, with the honest reason -- re-run the
@@ -58,6 +60,7 @@ from plugins.graphs import InMemorySkillGraph
 from plugins.task import workload
 from scripts import harness_runtime as hr
 from scripts.brief_drop import drop
+from scripts import evolve_llm
 from scripts.rsi_campaign import _maybe_arm_frames
 from board import store as bs
 
@@ -176,7 +179,7 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
     os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
     cards = applied.get("cards") or {}
     os.environ[EXTRA_ENV] = ":".join(r for r in (_BASE_EXTRA, *(c["path"] for c in cards.values())) if r)
-    per = {}
+    per, logs = {}, []
     brief = {**hr.task_brief(task, binding), "arm": arm}
     if cards:   # a candidate card's executor: bind it into this suite's records (the plan
         # validator's view) and segment specs (rearm's route) -- in memory, never on disk
@@ -226,8 +229,11 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                 n["ok"] = bool(r["success"])
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
             n["failure_mode"] = n["failure_mode"] or (r.get("diagnostics") or {}).get("failure_mode")
+        logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
+                                        evolve_llm.MAX_LOG_LINES // (int(seeds[1]) - int(seeds[0]) + 1))
         tick(per_seed_partial=per_seed({"seeds": per}))
-    return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per)}
+    return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
+            "logs": logs}   # the dying nodes' fault/verify rows: the LLM proposer's log excerpt
 
 
 def per_seed(suite: dict) -> list[dict]:
@@ -434,6 +440,8 @@ _ZH = {"idle": "等待", "baseline": "基线评测", "propose": "选试验", "re
 def _message(live: dict) -> str:
     """One short operator sentence for the live block (the page shows it verbatim)."""
     head = f"第 {live['round']} 轮 {_ZH.get(live['phase'], live['phase'])}"
+    if live["phase"] == "propose" and live.get("proposer") == "llm":
+        head = f"LLM 分析第 {live['round']} 轮…"
     if live["phase"] == "done":
         return f"已完成 {live['round']} 轮"
     if live["phase"] == "cancelled":
@@ -460,6 +468,9 @@ def main(argv=None) -> int:
     ap.add_argument("--cancel-marker", type=Path, default=None)
     ap.add_argument("--max-replans", type=int, default=None)
     ap.add_argument("--max-actuations", type=int, default=None)
+    ap.add_argument("--proposer", choices=("llm", "rules"), default="llm",
+                    help="llm: the model_endpoint card reads the round and answers the try "
+                         "(rules fallback when unreachable/invalid); rules: the built-in proposer only")
     args = ap.parse_args(argv)
     budgets = {"max_replans": args.max_replans, "max_actuations": args.max_actuations}
     if args.mode != "evolution":
@@ -490,7 +501,7 @@ def main(argv=None) -> int:
                           "seed_index": None, "seed": None, "node": None, "started_at": now,
                           "round_started_at": None, "phase_started_at": now, "last_round_s": None,
                           "per_seed_partial": [], "tried": None, "message": "", "messages": [],
-                          "nodes": [], "seed_started_at": None}
+                          "nodes": [], "seed_started_at": None, "proposer": args.proposer}
 
     def tick(**kw) -> None:
         if kw.get("phase", live["phase"]) != live["phase"]:
@@ -517,8 +528,22 @@ def main(argv=None) -> int:
         tick(phase="propose")
         os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])  # mount_params: the accepted overlay, not the last trial's
         prop = take_proposal(args.session, args.task, r)
-        tried = (from_proposal(prop, before) if prop
-                 else propose(before, records, emb, arm, binding, r, applied, doc["rounds"]))
+        proposer, llm, tried = "inbox", None, None
+        if prop:
+            tried = from_proposal(prop, before)
+        elif args.proposer == "llm":
+            proposer = "llm"
+            try:
+                ep = evolve_llm.endpoint()
+                tried, llm = evolve_llm.llm_propose(
+                    ep, evolve_llm.rsi_projection(doc, before, records, emb, arm, binding, before.get("logs") or []),
+                    before, r, store.path.parent / "llm")
+            except Exception as exc:  # noqa: BLE001 -- no endpoint card / mount error: the rules take over
+                llm = {"model": None, "prompt_sha": None, "raw_sha": None, "summary": None,
+                       "rationale": None, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        if tried is None:
+            proposer = "rules"
+            tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
         tick(tried=tried)
         after, published = before, False
         if tried["kind"] != "none":
@@ -547,7 +572,8 @@ def main(argv=None) -> int:
             "needs": tried["detail"].get("needs", []) if tried["kind"] == "none" else [],
             "media": _media(args.session, args.task, seeds),
             "media_dropped": _dropped(args.session, args.task, seeds), "ts": time.time(),
-            "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None})
+            "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
+            "proposer": proposer, "llm": llm})
         doc["cursor"], doc["applied"] = r, applied
         tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
         base = kept
