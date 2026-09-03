@@ -37,3 +37,9 @@ docs-dev
 # stray numba cache from a launch that predates cockpit setting NUMBA_CACHE_DIR
 # (spawns now cache under runs/<session>/numba-cache, already ignored above).
 .numba-cache/
+
+# model-written candidate cards are run artefacts: they land under plugins/candidates/
+# from an evolve round and are published as a record binding, never as source in git
+plugins/candidates/*
+!plugins/candidates/grasp_geometric_robocasa/
+MUJOCO_LOG.TXT
