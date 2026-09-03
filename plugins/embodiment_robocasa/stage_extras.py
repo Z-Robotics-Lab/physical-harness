@@ -71,7 +71,7 @@ class NavToObjectDriver(D.NavigateDriver):
         self._hist.append(xy.copy())
         vec = np.asarray(gxy) - xy
         d = float(np.linalg.norm(vec))
-        self._watch(d)
+        self._watch(env, d)
         if self._rev > 0:
             self._rev -= 1
         elif (len(self._hist) > self.STALL_WIN and d > 0.45
@@ -106,6 +106,7 @@ class PointPlaceDriver:
         self._over_dz = t["drop_over_dz"]
         self._stall = D.StallDetector(t["stall_k"])
         self.failure_mode = None  # "reach_stall": over/lower made no progress
+        self._trace = D.Trace()   # over/lower geometry (diagnostics only)
 
     # -- subclass surface ------------------------------------------------------
     def _drop_point(self, env) -> np.ndarray:
@@ -116,23 +117,29 @@ class PointPlaceDriver:
 
     def diagnostics(self, env) -> dict[str, Any]:
         """Live terminal details used to explain a bounded place failure."""
-        return {"phase": self.phase, "failure_mode": self.failure_mode}
+        return {"phase": self.phase, "failure_mode": self.failure_mode,
+                "trace": self._trace.dump(env)}
 
     # -- the shared phase chain ------------------------------------------------
     def act(self, env, obs):
         c = np.asarray(self._drop_point(env), float)
         eef = D._eef(env)
+        self._trace.step += 1
         if self.phase == "over":
             goal = np.array([c[0], c[1], c[2] + self._over_dz])
+            self._trace.at("start", env, goal)
             if np.linalg.norm((eef - goal)[:2]) < self._reach_tol:
                 self.phase = "lower"
             elif self._stall.update(float(np.linalg.norm(goal - eef))):
+                self._trace.at("stall", env)
                 self.failure_mode = "reach_stall"
             return D._arm_action(env, goal, D.GRIP_CLOSE)
         if self.phase == "lower":
+            self._trace.at("start", env, c)
             if eef[2] - c[2] < 0.04:
                 self.phase = "release"
             elif self._stall.update(float(np.linalg.norm(c - eef))):
+                self._trace.at("stall", env)
                 self.failure_mode = "reach_stall"
             return D._arm_action(env, c, D.GRIP_CLOSE)
         if self.phase == "release":
@@ -174,8 +181,7 @@ class ReceptaclePlaceDriver(PointPlaceDriver):
         import robocasa.utils.object_utils as OU
 
         return {
-            "phase": self.phase,
-            "failure_mode": self.failure_mode,
+            **super().diagnostics(env),
             "inside": bool(OU.check_obj_in_receptacle(
                 env, self.obj_name, self.receptacle)),
             "released": bool(OU.gripper_obj_far(env, obj_name=self.obj_name)),
@@ -273,11 +279,7 @@ class CompositeStageDriver:
         """Stage-owned terminal details (never used for control) plus the two
         keys every robocasa segment seals: ``failure_mode`` ("reach_stall" or
         None) and ``tunables_sha`` (the knobs this segment ran under)."""
-        diagnose = getattr(self._stage, "diagnostics", None)
-        out = dict(diagnose(env)) if diagnose is not None else {}
-        out.setdefault("failure_mode", getattr(self._stage, "failure_mode", None))
-        out["tunables_sha"] = D.tunables_sha()
-        return out
+        return D.stage_diagnostics(self._stage, env)
 
 
 class CompositePolicies:

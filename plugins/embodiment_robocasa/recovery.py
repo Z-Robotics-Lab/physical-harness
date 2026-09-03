@@ -38,9 +38,9 @@ from plugins.embodiment_robocasa import drivers as D
 #: collide with the tabletop vocab (see module docstring).
 _ARM_PHASES = frozenset({"unclench", "raise", "reseat", "clench", "rehover", "redescend"})
 _BASE_PHASES = frozenset({"backout", "redock", "nudge"})
-#: base_nudge's travel bound: the arm stalled at its envelope edge, a hand-span of
-#: base travel re-opens it; more re-parks the whole approach (that is redock's job).
-_NUDGE_MAX = 0.15
+# base_nudge's travel bound is the card's tunable ``nudge_max`` (0.15): the arm
+# stalled at its envelope edge, a hand-span of base travel re-opens it; more
+# re-parks the whole approach (that is redock's job).
 
 #: How far the ``raise`` phase lifts the eef before re-seating, and the small
 #: below-object aim the ``reseat`` phase descends to -- mirrors GraspDriver's
@@ -82,6 +82,7 @@ class RobocasaRecoveryActor:
         self._i = 0
         self._raise_z: float | None = None
         self._nav = None
+        self._base0 = None  # base xy at the first act: diagnostics()["base_travel"]
 
     @classmethod
     def for_stage(cls, env, stage, recovery):
@@ -104,9 +105,16 @@ class RobocasaRecoveryActor:
     def act(self, obs) -> np.ndarray:
         phase, dx, dy = self.queue[self._i]
         self._i += 1
+        if self._base0 is None:
+            self._base0 = D._base_pose(self.env)[0].copy()
         if phase in _BASE_PHASES:
             return self._base_phase(phase, obs)
         return self._arm_phase(phase, dx, dy)
+
+    def diagnostics(self) -> dict:
+        """Sealed with the recovery node: how far the base travelled under this repair."""
+        moved = 0.0 if self._base0 is None else np.linalg.norm(D._base_pose(self.env)[0] - self._base0)
+        return {"base_travel": round(float(moved), 3)}
 
     # -- arm-mode phases (regrasp_kitchen) -------------------------------------
     def _arm_phase(self, phase: str, dx: float, dy: float) -> np.ndarray:
@@ -172,7 +180,7 @@ class RobocasaRecoveryActor:
                 self._nudge_from = xy.copy()
             vec = self._obj_xyz()[:2] - xy
             n = float(np.linalg.norm(vec))
-            left = _NUDGE_MAX - float(np.linalg.norm(xy - self._nudge_from))
+            left = D.tunables()["nudge_max"] - float(np.linalg.norm(xy - self._nudge_from))
             if n < 1e-6 or left <= 0.0:  # travelled the bound: hold still, base mode
                 return D._base_action(env, xy, psi, grip=self._grip())
             goal = xy + vec / n * min(n, left)

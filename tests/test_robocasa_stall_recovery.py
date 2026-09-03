@@ -65,7 +65,9 @@ def test_card_tunable_hints_reach_the_proposer_through_mount_params():
         (REPO / "plugins/embodiment_robocasa/manifest.toml").read_text())["tunable_hints"]
     params = mount_params("plugins.embodiment_robocasa.recycle_driver:provider")
     assert params["tunable_hints"] == hints
-    assert hints["reach_stall"][:2] == ["drop_edge_margin", "drop_over_dz"]
+    # the base-reach knobs lead: an out-of-reach drop point is fixed by parking closer
+    assert hints["reach_stall"][:4] == ["carry_stop", "nudge_max", "drop_edge_margin", "drop_over_dz"]
+    assert hints["nav_stall"][0] == "carry_stop"
     assert set(sum(hints.values(), [])) <= set(MANIFEST_TUNABLES)
     for k in ("drop_over_dz", "drop_edge_margin", "drop_spread", "drop_dz"):
         assert isinstance(MANIFEST_TUNABLES[k], float), k
@@ -135,6 +137,7 @@ def test_unloaded_leg_that_stops_approaching_fails_with_nav_stall(monkeypatch):
     for make in (lambda: D.NavigateDriver("stove"), lambda: X.NavToObjectDriver("stove", "can1")):
         base = [3.0, 0.0]
         monkeypatch.setattr(D, "_base_pose", lambda env: (np.asarray(base, float), 0.0))
+        monkeypatch.setattr(D, "_eef", lambda env: np.array([base[0] + 0.4, base[1], 1.0]))
         monkeypatch.setattr(D, "_base_action", lambda env, gxy, yaw, grip: np.zeros(D.ADIM))
         nav = make()
         nav._goal = (np.zeros(2), 0.0)
@@ -144,12 +147,25 @@ def test_unloaded_leg_that_stops_approaching_fails_with_nav_stall(monkeypatch):
         for _ in range(k + 1):       # wedged far out (the local reverse included)
             nav.act(None, None)
         assert nav.failure_mode == "nav_stall" and not nav.done(None)
+        tr = nav.diagnostics(None)["trace"]   # the leg's geometry, dock as the target
+        assert tr["start"]["d_base_target"] == 3.0 and tr["stall"]["d_base_target"] == 2.85
+        assert tr["stall"]["step"] > tr["start"]["step"] and tr["end"]["target"] == [0.0, 0.0, 0.0]
         base[:] = [0.15, 0.0]        # inside NAV_POS_TOL, only the yaw settling
         nav = make()
         nav._goal = (np.zeros(2), 0.0)
         for _ in range(k + 1):
             nav.act(None, None)
         assert nav.failure_mode is None and nav.done(None)
+
+
+def test_carry_stop_tunable_moves_the_loaded_arrival_gate(monkeypatch):
+    """carry_stop is the loaded leg's standoff from the dock: 0.55 m out arrives at
+    the default 0.65, not under PH_TUNABLES carry_stop 0.45."""
+    nav = _fake_kitchen(monkeypatch, [0.55, 0.0])
+    assert nav.CARRY_STOP == 0.65 and nav.done(None)
+    monkeypatch.setenv("PH_TUNABLES", json.dumps({"carry_stop": 0.45}))
+    nav = _fake_kitchen(monkeypatch, [0.55, 0.0])
+    assert nav.CARRY_STOP == 0.45 and not nav.done(None)
 
 
 def test_redock_retry_keeps_the_grip_on_a_loaded_leg(monkeypatch):

@@ -5,7 +5,7 @@ mode only) as its own process group. One round: run the task's seed suite in-pro
 (the SAME ``_mount_plan``/``task_brief``/``workload.run`` a task brief uses), read
 each seed's first-death node + fault signature + per-node executor, let the LLM
 proposer (scripts/evolve_llm: the model reads the round's trails + log excerpt and
-answers a tunables / executor / code-as-policy card proposal, repairing a rejected one
+answers a tunables / executor / code-as-policy card / driver-patch proposal, repairing a rejected one
 up to 3 times from the exact error -- a card is preflighted on the first seed alone;
 ``--proposer rules`` or an unreachable endpoint falls back to) the built-in rules proposer pick ONE change -- the first-death node's executor (a bound policy whose
 ``evidence.by_executor`` beats the measured rate) else a one-dimensional +/-20%
@@ -237,6 +237,8 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                 n["ok"] = bool(r["success"])
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
             n["failure_mode"] = n["failure_mode"] or (r.get("diagnostics") or {}).get("failure_mode")
+            if n["id"] == dead and (r.get("diagnostics") or {}).get("trace"):   # the stall geometry,
+                n["trace"] = r["diagnostics"]["trace"]                          # first death only
         logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
                                         evolve_llm.MAX_LOG_LINES // (int(seeds[1]) - int(seeds[0]) + 1))
         tick(per_seed_partial=per_seed({"seeds": per}))
@@ -255,8 +257,10 @@ def _merge(a: dict, b: dict) -> dict:
 def per_seed(suite: dict) -> list[dict]:
     """The operator-facing per-seed summary sealed with every round (rsi_step /
     campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha, elapsed_s,
-    nodes: [{id, ok, steps, failure_mode, after, kind, task}]}]`` (the knobs the dying node ran under; the
-    node trail's final state) -- the seed detail that otherwise lives only in this process."""
+    nodes: [{id, ok, steps, failure_mode, after, kind, task, trace?}]}]`` (the knobs the dying node ran
+    under; the node trail's final state; ``trace`` = the first-death node's stall geometry
+    {start, stall, end} x {eef, target, base, d_eef_target, d_base_target, step}, when its
+    driver traced) -- the seed detail that otherwise lives only in this process."""
     return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
              "elapsed_s": s.get("elapsed_s"), "nodes": s.get("trail") or [],
              "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")

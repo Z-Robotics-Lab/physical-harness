@@ -66,9 +66,6 @@ def runtime(tmp_path_factory):
         rt.stop()
 
 
-def _round_input(audit: dict) -> dict:
-    text = audit["messages"][1]["content"]
-    return json.loads(text[text.index("{"):text.rindex("}") + 1])
 
 
 def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_honestly(runtime):
@@ -84,8 +81,12 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     assert (r1["before"], r1["after"], r1["published"]) == (0, 0, False)
     audits = {p.name: json.loads(p.read_text()) for p in (runtime.campaign.parent / "llm").glob("round-*.json")}
     assert set(audits) == {f"round-{r}.json" for r in (1, 2, 3, 4)}
-    # the brief carries what a coder needs: the concrete card template, the contract, the reference card
-    proj = _round_input(audits["round-1.json"])
+    # call 1 carries the brief alone (one call: the decision came with its payload); the code
+    # material a coder needs sits in the audit's ``materials`` (call 2's static message)
+    a1 = audits["round-1.json"]
+    assert a1["calls"] == 1 and [m["role"] for m in a1["messages"]] == ["system", "user"]
+    proj = {**a1["brief"], **a1["materials"]}
+    assert a1["messages"][1]["content"].startswith("Round input:\n" + json.dumps(a1["brief"], sort_keys=True)[:200])
     assert proj["first_death"]["node"] == "grab-0" and proj["first_death"]["embodiment"] == EMB
     assert proj["card_template"]["ref"] == "<name>:provider"   # a tmp candidates root: no package prefix
     assert f'skill = "grab"\nembodiment = "{EMB}"\nref = "<name>:provider"\ntransport = "inproc"' \
@@ -94,6 +95,7 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     assert "class GeometricGraspExecutor(InprocExecutor)" in proj["reference_card"]["__init__.py"]
     assert "[executors.geometric]" in proj["reference_card"]["manifest.toml"]
     assert proj["scripted_driver_source"] is None and "primitives" not in proj   # the fake embodiment has neither
+    assert proj["first_death"]["modules"] == []   # ... nor a _STAGES table: nothing to patch
     # round 2: the bad ref is rejected by the doctor, the text goes back verbatim, the repair wins
     assert (r2["proposer"], r2["tried"]["kind"], r2["tried"]["detail"]["to"]) == ("llm", "card", "llm")
     assert r2["tried"]["detail"]["path"] == str(runtime.runs / "candidates" / "grab_llm")
@@ -101,7 +103,7 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     a2 = audits["round-2.json"]
     assert len(a2["attempts"]) == 1 and a2["attempts"][0]["reason"].startswith("doctor:ref 'grab_other:provider'")
     assert "must name a provider inside grab_llm" in a2["attempts"][0]["reason"]
-    assert a2["messages"][2]["role"] == "assistant" and a2["messages"][3]["role"] == "user"
+    assert a2["calls"] == 2 and a2["messages"][2]["role"] == "assistant" and a2["messages"][3]["role"] == "user"
     assert a2["attempts"][0]["reason"] in a2["messages"][3]["content"] and a2["raw"] == json.dumps(CANNED[2])
     assert doc["applied"]["cards"]["llm"]["ref"] == "grab_llm:provider"
     rec = json.loads((runtime.session / "skills" / f"{r2['tried']['detail']['digest']}.json").read_text())
@@ -134,7 +136,8 @@ def test_parse_unwraps_a_payload_nested_under_its_kind():
     from scripts.evolve_llm import _parse
     ans = _parse(json.dumps({"kind": "executor", "payload": {"executor": {"to": "alt"}}, "summary": "换"}))
     assert ans["payload"] == {"to": "alt"} and ans["rationale"] == ""
-    with pytest.raises(ValueError, match="kind must be"):
+    assert _parse(json.dumps({"decision": "patch", "summary": "改"}))["payload"] == {}   # call 1's bare decision
+    with pytest.raises(ValueError, match="decision must be"):
         _parse(json.dumps({"goal": "a planner reply", "nodes": []}))
 
 
@@ -178,6 +181,7 @@ def test_recycle_cans_brief_carries_the_drop_driver_source_and_stays_bounded(tmp
     assert 'skill = "drop_can1"\nembodiment = "robocasa"' in proj["card_template"]["manifest.toml"]
     src = proj["scripted_driver_source"]
     assert src.index("class PointPlaceDriver") < src.index("class ClusterDropDriver(X.PointPlaceDriver)")
+    assert proj["first_death"]["modules"] == ["plugins.embodiment_robocasa.recycle_driver", "plugins.embodiment_robocasa.stage_extras"]
     assert proj["primitives"]["ref"] == "plugins.embodiment_robocasa.drivers"
     assert proj["primitives"]["constants"]["ADIM"] == 12 and proj["primitives"]["constants"]["GRIP"] == 6
     assert any(k.startswith("_arm_action(env, goal_world, grip") for k in proj["primitives"]["functions"])

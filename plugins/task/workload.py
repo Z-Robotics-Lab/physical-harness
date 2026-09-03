@@ -554,7 +554,8 @@ def _recovery(node: Mapping, ctx: NodeCtx) -> dict:
         ep.cursor += 1
     ep.driver.on_handback()
     return {"success": bool(actor.done), "steps": ep.cursor - entered, "stages": [],
-            "diagnostics": {"strategy": strategy.name},
+            "diagnostics": {"strategy": strategy.name,
+                            **(actor.diagnostics() if hasattr(actor, "diagnostics") else {})},
             "governance": _segment_governance(None, [], entered, ep.cursor)}
 
 

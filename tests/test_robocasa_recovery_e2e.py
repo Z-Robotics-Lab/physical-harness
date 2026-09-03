@@ -26,6 +26,7 @@ import pytest
 
 from board import store as bs
 from harness.manifest import discover
+from plugins.embodiment_robocasa import drivers as D
 from plugins.rsi.repertoire import strategies_for
 
 REPO = Path(__file__).resolve().parent.parent
@@ -94,6 +95,18 @@ def test_recycle_cans_4243_never_retries_as_is_twice_stalls_early_and_recovers(t
     assert stalled, [e for e in events if e.get("kind") == "actuation_end"][-3:]
     assert all(0 < e["steps"] < 300 for e in stalled), [(e["node"], e["steps"]) for e in stalled]
     assert all(len((e.get("diagnostics") or {}).get("tunables_sha", "")) == 16 for e in stalled)
+    # 2b. the stall geometry is sealed with it: where the eef, the target and the
+    #     base were at start / stall / end (the drop point was never reached)
+    for e in stalled:
+        tr = e["diagnostics"]["trace"]
+        print("trace", e["node"], tr)
+        assert set(tr) == {"start", "stall", "end"}, (e["node"], tr)
+        assert tr["stall"]["d_eef_target"] > D.tunables()["reach_tol"], (e["node"], tr["stall"])
+        assert 0 < tr["stall"]["step"] <= tr["end"]["step"], (e["node"], tr)
+    nudged = [e for e in events if e.get("kind") == "actuation_end"
+              and (e.get("diagnostics") or {}).get("strategy") == "base_nudge"]
+    for e in nudged:   # a base_nudge repair seals how far the base actually went
+        assert 0 < e["diagnostics"]["base_travel"] <= D.tunables()["nudge_max"] + 0.05, e["diagnostics"]
     # 3. at least one recovery node was executed on the live world
     executed = [v["node"] for v in _kinds(rows, "task.verify")]
     plans = _kinds(rows, "task.plan")

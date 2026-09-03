@@ -36,7 +36,7 @@ ref = "plugins.embodiment_robocasa.recoveries:REGRASP_KITCHEN"
 ref = "plugins.embodiment_robocasa.recoveries:REDOCK_RETRY"
 
 # Reach repairs a planner may insert as a recovery node after a reach_stall:
-# lift to hover and re-descend on the live target / nudge the base <=0.15 m
+# lift to hover and re-descend on the live target / nudge the base <= nudge_max
 # toward it / open, lift, hover (see recoveries.py).
 [recoveries.reapproach]
 ref = "plugins.embodiment_robocasa.recoveries:REAPPROACH"
@@ -61,13 +61,16 @@ drop_over_dz = 0.12  # PointPlaceDriver: "over" height above the drop point (m)
 drop_edge_margin = 0.10  # ClusterDropDriver: past the stove bbox edge, toward the counter (m)
 drop_spread = 0.07   # ClusterDropDriver: per-can lateral pitch along the stove edge (m)
 drop_dz = 0.05       # ClusterDropDriver: release height above the stove-top plane (m)
+carry_stop = 0.65    # NavigateDriver loaded leg: stop this far from the dock; the place
+                     # stage's arm covers the rest (m) -- the base-reach knob
+nudge_max = 0.15     # base_nudge recovery: base travel bound toward the target (m)
 
 # failure_mode -> the tunables evolve's proposer perturbs FIRST for a first death
 # in that mode (manifest.mount_params hands it to the proposer as
 # params["tunable_hints"]); knobs not listed follow, in name order.
 [tunable_hints]
-reach_stall = ["drop_edge_margin", "drop_over_dz", "standoff", "hover_dz", "reach_tol"]
-nav_stall = ["stall_k"]
+reach_stall = ["carry_stop", "nudge_max", "drop_edge_margin", "drop_over_dz", "standoff", "hover_dz", "reach_tol"]
+nav_stall = ["carry_stop", "stall_k"]
 
 # Predicates this card provides (the free-oracle factories in predicates.py;
 # harness.predicates folds them). reads = sigma keys, args = factory params.

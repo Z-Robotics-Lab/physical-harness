@@ -155,10 +155,10 @@ class KitchenThawDriver(InprocExecutor):
         return bool(self._stage.done(env))
 
     def segment_diagnostics(self, env) -> dict[str, Any]:
-        """``failure_mode`` ("reach_stall" or None) + ``tunables_sha``, the two
-        keys every robocasa segment seals (CompositeStageDriver seals the same)."""
-        return {"failure_mode": getattr(self._stage, "failure_mode", None),
-                "tunables_sha": D.tunables_sha()}
+        """``failure_mode`` ("reach_stall" or None) + ``tunables_sha`` + the stage's
+        own diagnostics (``trace``) -- what every robocasa segment seals
+        (CompositeStageDriver seals the same)."""
+        return D.stage_diagnostics(self._stage, env)
 
 
 class KitchenThawPolicies:

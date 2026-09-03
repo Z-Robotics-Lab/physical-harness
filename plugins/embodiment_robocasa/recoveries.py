@@ -77,7 +77,7 @@ REAPPROACH = Strategy(
 BASE_NUDGE = Strategy(
     "base_nudge",
     (("nudge", 20, 0.0, 0.0), ("rehover", 25, 0.0, 0.0)),
-    "Reach recovery: drive the base at most 0.15 m toward the target xy (the "
+    "Reach recovery: drive the base at most nudge_max (tunable, 0.15 m) toward the target xy (the "
     "arm stalled at the edge of its envelope), then re-hover. Base mode then arm.",
 )
 

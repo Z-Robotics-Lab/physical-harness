@@ -114,6 +114,49 @@ class StallDetector:
         return self.since >= self.k
 
 
+class Trace:
+    """Numeric geometry of a stall-able phase -- {start, stall, end}, each
+    {eef:[x,y,z], target:[x,y,z] (hover/drop point, or a dock with z 0), base:[x,y,yaw],
+    d_eef_target, d_base_target, step} -- sealed as the segment's diagnostics["trace"]
+    so a proposer SEES the reach gap (drop point vs eef vs base) instead of guessing
+    it. Diagnostics only, never control."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+        self.step = 0
+        self.target = None
+
+    def at(self, key: str, env, target=None) -> None:
+        """Snapshot ``key`` at the live pose; ``start`` keeps its first snapshot,
+        ``target`` (when given) becomes the one later snapshots measure to."""
+        if target is not None:
+            self.target = np.asarray(target, float)
+        if self.target is None or (key == "start" and "start" in self.rows):
+            return
+        eef, (xy, psi) = _eef(env), _base_pose(env)
+        t, k = self.target, len(self.target)
+        r3 = lambda v: [round(float(x), 3) for x in v]
+        self.rows[key] = {"eef": r3(eef), "target": r3([*t, *[0.0] * (3 - k)]),
+                          "base": r3([*xy, psi]),
+                          "d_eef_target": round(float(np.linalg.norm(eef[:k] - t)), 3),
+                          "d_base_target": round(float(np.linalg.norm(xy - t[:2])), 3),
+                          "step": int(self.step)}
+
+    def dump(self, env) -> dict:
+        self.at("end", env)
+        return dict(self.rows)
+
+
+def stage_diagnostics(stage, env) -> dict:
+    """What every robocasa segment seals: the stage's own ``diagnostics(env)`` (phase,
+    ``trace``...) + ``failure_mode`` ("reach_stall"/"nav_stall"/None) + ``tunables_sha``."""
+    diagnose = getattr(stage, "diagnostics", None)
+    out = dict(diagnose(env)) if diagnose is not None else {}
+    out.setdefault("failure_mode", getattr(stage, "failure_mode", None))
+    out["tunables_sha"] = tunables_sha()
+    return out
+
+
 # ---- live-state readers (privileged; scripted-oracle side) -------------------
 
 def _base_pose(env):
@@ -293,13 +336,12 @@ class NavigateDriver:
                        # meat from held-at-hand-off 9/13 down to 5/13 while
                        # buying nothing the higher VCAP had not already bought.
                        # Yaw is the lever that sweeps the eef; translation is not.
-    CARRY_STOP = 0.65  # loaded standoff from the dock: driving the last ~0.4 m
-                       # rams the carried object into the target appliance's
-                       # face (measured drop at dist~0.39); the place stage's
-                       # ARM covers that final reach, the base need not.
-                       # 0.50 measured too tight across random kitchens: loaded
-                       # runs plateau 0.6-0.8 from the dock (counter/furniture
-                       # edge), burning the cap just short of the old gate
+    # CARRY_STOP (tunables carry_stop, 0.65): loaded standoff from the dock.
+    # Driving the last ~0.4 m rams the carried object into the target
+    # appliance's face (measured drop at dist~0.39); the place stage's ARM
+    # covers that final reach, the base need not. 0.50 measured too tight
+    # across random kitchens: loaded runs plateau 0.6-0.8 from the dock
+    # (counter/furniture edge), burning the cap just short of the old gate.
     CARRY_NEAR = 0.85  # stall-arrival band: when progress has physically
                        # converged (blocked by the counter edge) within this of
                        # the dock, the leg is DONE -- grinding on strips the
@@ -316,8 +358,10 @@ class NavigateDriver:
         # stall-ARRIVAL; farther out it is a "nav_stall" -- the segment fails
         # early for a redock_retry instead of burning its cap wedged on furniture.
         self._stall = StallDetector(tunables()["stall_k"], eps=0.02)
+        self.CARRY_STOP = tunables()["carry_stop"]
         self._blocked = False
         self.failure_mode = None
+        self._trace = Trace()
 
     def _target(self, env):
         if self._goal is None:
@@ -360,13 +404,17 @@ class NavigateDriver:
         a[TORSO] = _torso_cmd(env, 0.0) if retracted else 0.0
         return a
 
-    def _watch(self, d: float) -> None:
+    def _watch(self, env, d: float) -> None:
         """The one plateau rule every nav leg (loaded or not, subclassed or not)
         feeds its base-to-dock distance: a stall inside the arrival band is
         ``_blocked`` (the loaded done() accepts it; unloaded that band is the
         NAV_POS_TOL gate itself, only the yaw still settling), a stall farther
-        out seals failure_mode "nav_stall" so the planner can redock."""
+        out seals failure_mode "nav_stall" so the planner can redock. Also the
+        leg's geometry trace (start / stall; the dock is the target)."""
+        self._trace.step += 1
+        self._trace.at("start", env, self._target(env)[0])
         if self._stall.update(d):
+            self._trace.at("stall", env)
             if d <= (self.CARRY_NEAR if self.carry else NAV_POS_TOL):
                 self._blocked = True
             else:
@@ -375,7 +423,7 @@ class NavigateDriver:
     def act(self, env, obs):
         gxy, gyaw = self._target(env)
         if not self.carry:
-            self._watch(float(np.linalg.norm(np.asarray(gxy, float) - _base_pose(env)[0])))
+            self._watch(env, float(np.linalg.norm(np.asarray(gxy, float) - _base_pose(env)[0])))
             return _base_action(env, gxy, gyaw, grip=GRIP_OPEN)
 
         # Loaded transport. Measured (carry-probe traces): in base mode the
@@ -403,7 +451,7 @@ class NavigateDriver:
         a = _base_action(env, gxy, heading, grip=GRIP_CLOSE)
         a[7:9] = np.clip(a[7:9], -self.VCAP, self.VCAP)
         a[9] = float(np.clip(a[9], -self.WARC, self.WARC))
-        self._watch(float(np.linalg.norm(vec)))
+        self._watch(env, float(np.linalg.norm(vec)))
         # NO z easing while moving: all height changes happen in the
         # stationary stow -- easing the eef down mid-drive was measured to
         # strip the cargo (drops at steps 144-332 on seeds that survived
@@ -427,6 +475,9 @@ class NavigateDriver:
             return bool(d <= self.CARRY_STOP
                         or (self._blocked and d <= self.CARRY_NEAR))
         return bool(d <= NAV_POS_TOL and np.cos(gyaw - psi) >= NAV_ORI_COS)
+
+    def diagnostics(self, env) -> dict:
+        return {"failure_mode": self.failure_mode, "trace": self._trace.dump(env)}
 
 
 class GraspDriver:
@@ -533,6 +584,7 @@ class GraspDriver:
         self._obj_z0 = None    # object z at entry: the secure-lift reference
         self._z_hist: list = []  # descent stall detector window
         self._stall = StallDetector(self._stall_k)  # hover/descend reach watchdog
+        self._trace = Trace()    # hover/descend geometry (diagnostics only)
 
     # -- per-attempt geometry --------------------------------------------------
     def _tweak(self):
@@ -563,10 +615,12 @@ class GraspDriver:
         c, s = np.cos(self._apsi()), np.sin(self._apsi())
         return m[:2] - np.array([c * fwd - s * lat, s * fwd + c * lat])
 
-    def _next_attempt(self, stalled=False):
+    def _next_attempt(self, env=None, stalled=False):
         # a stall with no fresh geometry left to try is the segment's honest end
-        if stalled and self.attempt + 1 >= len(self.RETRY):
-            self.failure_mode = "reach_stall"
+        if stalled:
+            self._trace.at("stall", env)
+            if self.attempt + 1 >= len(self.RETRY):
+                self.failure_mode = "reach_stall"
         self.attempt += 1
         self.phase = "align"
         self._ticks = 0
@@ -642,6 +696,7 @@ class GraspDriver:
         torso = _torso_cmd(env, self._torso_target(env))
         mode, d_fwd, d_lat, d_aim, d_torso, style, d_psi = self._tweak()
         gxy = self._grasp_xy(env)
+        self._trace.step += 1
 
         if self.phase == "align":
             tgt = self._base_target(env)
@@ -675,6 +730,7 @@ class GraspDriver:
             # over-then-down: centre above the grasp point and get the fingers
             # across the thin side, per this attempt's yaw STYLE (see RETRY)
             wp = np.array([gxy[0], gxy[1], m[2] + self.HOVER])
+            self._trace.at("start", env, wp)
             err_xy = wp[:2] - eef[:2]
             yerr = self._yaw_err(env, self._minor_axis(env))
             self._ticks += 1
@@ -685,7 +741,7 @@ class GraspDriver:
                 self._ticks = 0
                 self._stall = StallDetector(self._stall_k)
             elif self._ticks > self.PHASE_CAP or self._stall.update(np.linalg.norm(wp - eef)):
-                self._next_attempt(stalled=True)
+                self._next_attempt(env, stalled=True)
                 return _arm_action(env, eef, GRIP_OPEN, kp=0.0)
             if self.phase == "hover":
                 full = np.clip(yerr * self.KYAW, -self.YAW_CAP, self.YAW_CAP)
@@ -704,6 +760,7 @@ class GraspDriver:
         # the press (truly wedged) closes early: deepest reachable pinch.
         aim = np.array([gxy[0], gxy[1], m[2] + d_aim - 0.005])
         if self.phase == "descend":
+            self._trace.at("start", env, aim)
             yerr = self._yaw_err(env, self._minor_axis(env))
             self._ticks += 1
             self._z_hist.append(float(eef[2]))
@@ -717,7 +774,7 @@ class GraspDriver:
                 self.phase = "close"
                 self._ticks = 0
             elif self._ticks > self.PHASE_CAP or self._stall.update(np.linalg.norm(err)):
-                self._next_attempt(stalled=True)
+                self._next_attempt(env, stalled=True)
                 return _arm_action(env, eef, GRIP_OPEN, kp=0.0)
             else:
                 # descend yaw per style: "full" keeps the hard servo; the
@@ -792,6 +849,10 @@ class GraspDriver:
                     and float(_obj_pos(env, self.obj_name)[2])
                     > self._obj_z0 + self.SECURE_DZ)
 
+    def diagnostics(self, env) -> dict:
+        return {"phase": self.phase, "attempt": self.attempt,
+                "failure_mode": self.failure_mode, "trace": self._trace.dump(env)}
+
 
 class PlaceDriver:
     """Carry the held object over a fixture's interior and release it inside.
@@ -812,6 +873,7 @@ class PlaceDriver:
         self._target = None
         self._stall = StallDetector(tunables()["stall_k"])
         self.failure_mode = None
+        self._trace = Trace()
 
     def _interior(self, env):
         if self._target is None:
@@ -828,18 +890,23 @@ class PlaceDriver:
     def act(self, env, obs):
         c = self._interior(env)
         eef = _eef(env)
+        self._trace.step += 1
         if self.phase == "over":
             goal = np.array([c[0], c[1], c[2] + self.OVER_DZ])
+            self._trace.at("start", env, goal)
             if np.linalg.norm((eef - goal)[:2]) < 0.03:
                 self.phase = "lower"
             elif self._stall.update(np.linalg.norm(goal - eef)):
+                self._trace.at("stall", env)
                 self.failure_mode = "reach_stall"
             return _arm_action(env, goal, GRIP_CLOSE)
         if self.phase == "lower":
             goal = np.array([c[0], c[1], c[2]])
+            self._trace.at("start", env, goal)
             if eef[2] - c[2] < 0.03:
                 self.phase = "release"
             elif self._stall.update(np.linalg.norm(goal - eef)):
+                self._trace.at("stall", env)
                 self.failure_mode = "reach_stall"
             return _arm_action(env, goal, GRIP_CLOSE)
         if self.phase == "release":
@@ -856,6 +923,10 @@ class PlaceDriver:
 
         return bool(OU.obj_inside_of(env, self.obj_name, _fixture(env, self.fixture_name))
                     and OU.gripper_obj_far(env, obj_name=self.obj_name))
+
+    def diagnostics(self, env) -> dict:
+        return {"phase": self.phase, "failure_mode": self.failure_mode,
+                "trace": self._trace.dump(env)}
 
 
 class CloseDoorDriver:

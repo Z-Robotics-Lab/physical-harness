@@ -83,9 +83,10 @@ def test_one_evolve_round_on_the_real_kitchen(tmp_path):
 @pytest.mark.robocasa
 def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
     """Two rounds on the seed that dies at drop-can1 with reach_stall: round 1
-    tries the card's first hinted knob (drop_edge_margin, -30%), round 2 the other
-    direction, and the trial's suite ran under a different tunables_sha than the
-    baseline. Success is not required -- the per-seed rows are the finding."""
+    tries the card's first hinted knob (carry_stop, -30%: park the loaded base
+    closer to the dock), round 2 the other direction, and the trial's suite ran
+    under a different tunables_sha than the baseline. Success is not required --
+    the per-seed rows (with the dying node's stall geometry) are the finding."""
     task = "recycle_cans"
     runs = tmp_path / "runs"
     session = runs / "session-main"
@@ -129,10 +130,14 @@ def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
                             for t in seen), trails[-1:]
         assert r1["tried"]["kind"] == "tunables", r1["tried"]
         d = r1["tried"]["detail"]
-        assert d["path"][-1] == "drop_edge_margin" and d["hint"] == "reach_stall"
-        assert d["to"] == pytest.approx(0.07) and d["from"] == pytest.approx(0.10)
-        assert r2["tried"]["detail"]["path"][-1] == "drop_edge_margin"
-        assert r2["tried"]["detail"]["to"] == pytest.approx(0.13)
+        assert d["path"][-1] == "carry_stop" and d["hint"] == "reach_stall"
+        assert d["to"] == pytest.approx(0.455) and d["from"] == pytest.approx(0.65)
+        assert r2["tried"]["detail"]["path"][-1] == "carry_stop"
+        assert r2["tried"]["detail"]["to"] == pytest.approx(0.845)
+        # the dying node carries its stall geometry (the LLM brief's nodes[].trace)
+        tr = dead["trace"]
+        assert set(tr) == {"start", "stall", "end"} and tr["stall"]["d_eef_target"] > 0.03, tr
+        assert all("trace" not in n for n in base["nodes"] if n["id"] != dead["id"])
         # the overlay reached the driver: the trial's dying node sealed another tunables_sha
         trial = r1["after_seeds"][0]
         assert len(trial["tunables_sha"] or "") == 16 and trial["tunables_sha"] != base["tunables_sha"]

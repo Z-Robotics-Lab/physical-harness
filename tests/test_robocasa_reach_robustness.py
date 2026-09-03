@@ -76,6 +76,15 @@ def test_reach_recoveries_execute_in_the_right_modes(monkeypatch):
     state["base"] = np.array([0.2, 0.0])          # "moved" past the bound
     a = act.act({})
     assert abs(a[7]) < 1e-9 and abs(a[8]) < 1e-9  # holds still: bound spent
+    assert act.diagnostics() == {"base_travel": 0.2}
+    # the bound is the card's tunable nudge_max: 0.4 keeps driving from 0.2 out
+    monkeypatch.setenv("PH_TUNABLES", json.dumps({"nudge_max": 0.4}))
+    state["base"] = np.array([0.0, 0.0])
+    act = RobocasaRecoveryActor(object(), "base_nudge", (("nudge", 3, 0.0, 0.0),),
+                                obj_name="can1")
+    act.act({})
+    state["base"] = np.array([0.2, 0.0])
+    assert act.act({})[7] > 0
     # release_reset opens first
     act = RobocasaRecoveryActor(object(), "release_reset",
                                 repertoire.strategy("release_reset").steps, obj_name="can1")
@@ -119,6 +128,14 @@ def test_stalled_place_stage_fails_segment_early_with_reach_stall(monkeypatch):
     diag = drv.segment_diagnostics(object())
     assert diag["failure_mode"] == "reach_stall" and diag["tunables_sha"] == D.tunables_sha()
     assert drv.segment_success(object()) is False
+    # the stall geometry rides the diagnostics: eef / drop point / base + distances
+    tr = diag["trace"]
+    assert set(tr) == {"start", "stall", "end"} and tr["start"]["step"] == 1
+    assert tr["stall"]["step"] == steps == tr["end"]["step"]
+    assert tr["stall"]["eef"] == [1.0, 2.0, 1.0] and tr["stall"]["base"] == [0.0, 0.0, 0.0]
+    assert tr["stall"]["target"] == [3.0, 3.0, 1.0 + D.tunables()["drop_over_dz"]]
+    assert tr["stall"]["d_eef_target"] > D.tunables()["reach_tol"]
+    assert tr["stall"]["d_base_target"] == pytest.approx(np.hypot(3.0, 3.0), abs=1e-3)
 
 
 def test_segment_cap_tunable_overrides_the_stage_table(monkeypatch):
