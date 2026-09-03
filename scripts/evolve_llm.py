@@ -19,6 +19,7 @@ in the chain, and the api key never leaves the endpoint's Authorization header.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -73,7 +74,10 @@ dir (files: manifest.toml + __init__.py, plain file names only) following card_t
 ref names the provider inside that dir; to is the new executor key. It is checked by the \
 plugin doctor before it is mounted; a red is recorded, not tried.
 - none: nothing worth trying (say why in rationale).
-summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try."""
+summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try.
+Each seed's keyframes are the failure keyframes of its first-death node (first frame, \
+stall / last-progress frame, last frame; 128px); when attached as images they are labelled \
+"seed <n> keyframe <i>" in the same order."""
 
 
 def _log_excerpt(seed: int, rows, dead: str | None, budget: int) -> list[str]:
@@ -130,7 +134,7 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
                                   for s in r.get("after_seeds") or r.get("per_seed") or []]}
                     for r in rounds],
         "this_round": {"count": before["count"], "seeds_total": len(before["seeds"]),
-                       "per_seed": [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode", "fault")},
+                       "per_seed": [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode", "fault", "keyframes")},
                                      "trail": [{k: n.get(k) for k in ("id", "ok", "steps", "failure_mode")}
                                                for n in s.get("trail") or []]}
                                     for seed, s in before["seeds"].items()]},
@@ -221,21 +225,49 @@ def write_card(pay: dict, root: Path = CANDIDATES_ROOT) -> str | None:
     return None
 
 
+def _image_parts(proj: dict, session: Path | None) -> tuple[list[dict], list[dict]]:
+    """The per-seed first-death keyframes as OpenAI content parts (a label text part
+    then the image as a base64 data URL read from ``session/<path>``), and the same
+    list for the audit with each image replaced by its path. ([], []) without a session."""
+    parts, audit = [], []
+    for s in proj.get("this_round", {}).get("per_seed") or []:
+        for i, rel in enumerate(s.get("keyframes") or []):
+            try:
+                b = (session / rel).read_bytes() if session else None
+            except OSError:
+                b = None
+            if b:
+                label = {"type": "text", "text": f"seed {s['seed']} keyframe {i}: {rel}"}
+                parts += [label, {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + base64.b64encode(b).decode()}}]
+                audit += [label, {"type": "image", "path": rel}]
+    return parts, audit
+
+
 def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
-                max_tokens: int = 4096) -> tuple[dict | None, dict]:
+                max_tokens: int = 4096, session: Path | None = None) -> tuple[dict | None, dict]:
     """One model call -> (tried | None, llm row). ``tried`` is None when the answer is
-    unusable (the row's ``reason`` says why; the caller falls back to the rules)."""
+    unusable (the row's ``reason`` says why; the caller falls back to the rules). When the
+    endpoint accepts images (``ep.images``) the seeds' failure keyframes ride along as
+    image parts; the audit / prompt_sha keep their paths only, never the bytes."""
     from scripts.evolve import _none, from_proposal   # noqa: PLC0415 -- evolve imports this module
+    text = ("Round input:\n" + json.dumps(proj, sort_keys=True, default=str)
+            + "\n\nOutput ONLY the proposal JSON object now.")
+    images, audit_images = _image_parts(proj, session) if getattr(ep, "images", False) else ([], [])
     messages = [{"role": "system", "content": _RULES},
-                {"role": "user", "content": "Round input:\n" + json.dumps(proj, sort_keys=True, default=str)
-                                            + "\n\nOutput ONLY the proposal JSON object now."}]
-    row = {"model": getattr(ep, "identity", repr(ep)), "prompt_sha": content_id(messages),
-           "raw_sha": None, "summary": None, "rationale": None, "reason": None}
-    audit = {"round": round_no, **row, "messages": messages, "raw": None}
+                {"role": "user", "content": [{"type": "text", "text": text}, *images] if images else text}]
+    audit_msgs = ([messages[0], {"role": "user", "content": [{"type": "text", "text": text}, *audit_images]}]
+                  if images else messages)
+    row = {"model": getattr(ep, "identity", repr(ep)), "prompt_sha": content_id(audit_msgs),
+           "raw_sha": None, "summary": None, "rationale": None, "reason": None, "usage": None}
+    audit = {"round": round_no, **row, "messages": audit_msgs, "raw": None}
     tried = None
     try:
+        # ponytail: DeepSeek reasoning tokens count against max_tokens and left content
+        # empty (3/3 production rounds); the proposer wants the answer, not the preamble
         raw = ep.chat(messages, temperature=0.0, max_tokens=max_tokens,
-                      response_format={"type": "json_object"})
+                      response_format={"type": "json_object"}, thinking={"type": "disabled"})
+        row["usage"] = getattr(ep, "last_usage", None)
         audit["raw"] = raw
         row["raw_sha"] = audit["raw_sha"] = sha_json(raw)
         ans = _parse(raw)
@@ -267,7 +299,7 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
         row["reason"] = f"{type(exc).__name__}: {exc}"[:300]
         tried = None
     audit.update(raw_sha=row["raw_sha"], summary=row["summary"], rationale=row["rationale"],
-                 reason=row["reason"], tried=tried)
+                 reason=row["reason"], usage=row["usage"], tried=tried)
     audit_dir.mkdir(parents=True, exist_ok=True)
     (audit_dir / f"round-{round_no}.json").write_text(json.dumps(audit, indent=1, sort_keys=True, default=str))
     return tried, row

@@ -184,14 +184,15 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     # best carries the running max
     assert bs.rsi_series(sd, "kitchen_thaw") == [   # pre-per_seed rounds read as null
         {"round": 1, "before": 0, "after": 1, "best": 1, "per_seed": r1["per_seed"], "needs": [],
-         "proposer": None, "llm": None,   # pre-LLM rounds read as null
+         "proposer": None, "llm": None,   # pre-LLM / pre-tree rounds read as null
+         "parent": None, "outcome": None, "confirm": None, "usage": None,
          "node_rate": {"before": 0.75, "after": None, "best": 0.75},
          "by_task": {"grasp": {"before": 0.5, "after": None}, "reach": {"before": 1.0, "after": None}}},
         {"round": 2, "before": 1, "after": 1, "best": 1, "per_seed": None, "needs": None,
-         "proposer": None, "llm": None, "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
+         "proposer": None, "llm": None, "parent": None, "outcome": None, "confirm": None, "usage": None, "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
     assert bs.rsi_series(sd, "kitchen_thaw") == ms.rsi_series("kitchen_thaw")
-    assert bs.rsi_frames(sd, "kitchen_thaw", 1) == ["media/kitchen_thaw/1/grasp.gif"]
-    assert bs.rsi_frames(sd, "kitchen_thaw", 9) == [] and bs.rsi_run(sd, "nope") is None
+    assert bs.rsi_frames(sd, "kitchen_thaw", 1) == {"media": ["media/kitchen_thaw/1/grasp.gif"], "dropped": {}}
+    assert bs.rsi_frames(sd, "kitchen_thaw", 9) == {"media": [], "dropped": {}} and bs.rsi_run(sd, "nope") is None
     # traversal: a ../ task never leaves the session; a ../ session is refused
     assert bs.rsi_run(sd, "../../session-main") is None
     assert ms.rsi_run("kitchen_thaw", "../session-main") == {"error": "unknown session"}
@@ -274,6 +275,7 @@ def test_rsi_campaigns_faces_are_byte_identical(tmp_path, capsys):
     running, finished = lib
     assert running == {"task": "kitchen_thaw", "status": "running", "cursor": 2, "rounds": 2,
                        "best": 1, "seeds": [1, 2], "arm": "auto", "node_rate_best": 0.75,
+                       "published_rounds": [1], "usage": {"llm_tokens": None, "sim_s": 0},
                        "updated": running["updated"],
                        "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"],
                                 "nodes_done": "1/2"},

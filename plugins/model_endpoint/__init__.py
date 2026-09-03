@@ -91,7 +91,7 @@ class OpenAICompatEndpoint:
 
     def __init__(self, *, preset: str | None = None, base_url: str | None = None,
                  api_key_env: str | None = None, model: str | None = None,
-                 timeout: float = 60.0) -> None:
+                 timeout: float = 60.0, images: bool | None = None) -> None:
         cfg: dict[str, str | None] = dict(PRESETS[preset]) if preset else {}
         if base_url is not None:
             cfg["base_url"] = base_url
@@ -105,6 +105,10 @@ class OpenAICompatEndpoint:
         self._key_env = cfg.get("api_key_env")
         self._model = cfg.get("model")
         self._timeout = timeout
+        # ponytail: images inferred from the model name; set images=true|false in params to override
+        self.images = (bool(images) if images is not None
+                       else any(t in (self._model or "").lower() for t in ("vision", "vl")))
+        self.last_usage: dict | None = None   # {prompt, completion} tokens of the last chat()
 
     @property
     def identity(self) -> str:
@@ -140,7 +144,9 @@ class OpenAICompatEndpoint:
     def chat(self, messages: Sequence[Mapping], **opts: Any) -> str:
         """POST /chat/completions, OpenAI shape; ``opts`` pass through to the
         body untouched (temperature, max_tokens, seed, response_format, ...) --
-        decode discipline belongs to the consumer, this is a transport."""
+        decode discipline belongs to the consumer, this is a transport. A message
+        ``content`` may be a list of OpenAI content parts (text / image_url data
+        URLs) when ``images`` is on; ``last_usage`` holds the reply's token counts."""
         if self._model is None:
             self._model = self._get_json(
                 f"{self._base}/models", self._timeout)["data"][0]["id"]
@@ -150,6 +156,9 @@ class OpenAICompatEndpoint:
                                      data=body, headers=self._headers())
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             reply = json.load(resp)
+        u = reply.get("usage") or {}
+        self.last_usage = ({"prompt": u.get("prompt_tokens"), "completion": u.get("completion_tokens")}
+                           if u else None)
         return reply["choices"][0]["message"]["content"]
 
 
@@ -170,8 +179,9 @@ class FakeEndpoint:
     by the same registry-ref seam (``plugins.model_endpoint:fake_provider``) so a
     GPU-less e2e drives the real planner_vlm prompt path with fixed graphs."""
 
-    def __init__(self, *, path: str | None = None, **_: Any) -> None:
+    def __init__(self, *, path: str | None = None, images: bool = False, **_: Any) -> None:
         self._path = path or os.environ.get("PH_MODEL_ENDPOINT_FAKE")
+        self.images, self.last_usage = bool(images), None
         if not self._path:
             raise ValueError("fake endpoint needs path= or PH_MODEL_ENDPOINT_FAKE")
 

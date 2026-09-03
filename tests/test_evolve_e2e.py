@@ -300,7 +300,7 @@ def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
         ({"before": 1.0, "after": 1.0, "best": 1.0},
          {"grab": {"before": 1.0, "after": 1.0}, "reach": {"before": 1.0, "after": 1.0}})] * 2
     assert bs.rsi_campaigns(runtime.runs / SESSION)[0]["node_rate_best"] == 1.0
-    assert bs.rsi_frames(sd, TASK, 1) == doc["rounds"][0]["media"]
+    assert bs.rsi_frames(sd, TASK, 1) == {"media": doc["rounds"][0]["media"], "dropped": doc["rounds"][0]["media_dropped"]}
 
 
 def test_cancel_lands_and_resubmit_resumes_from_cursor(runtime, two_rounds):

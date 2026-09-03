@@ -13,7 +13,8 @@ are live state like scripts/frame_dump: they never enter the session-log chain
 fails a task, but it is never silent either: ``finish`` returns
 ``{kept, reason|file}`` for the node's diagnostics and writes the reason under
 ``index.json["dropped"]`` (no_frame_source / no_frames / verify_failed /
-encode_failed).
+encode_failed) with up to 3 failure keyframes (``<node>.fail-{0,1,2}.jpg``: first,
+stall/last-progress (``driver.last_progress_step`` when exposed, else middle), last).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ FPS = 10
 #: capture every Nth driver step; a 300-step robocasa segment -> ~75 frames
 EVERY = 4
 MAX_BYTES = 1_000_000
+KEYFRAME_QUALITY = 60   # 128px JPEG at q60: a few KB, well under the ~25 KB budget
 
 
 class SegmentRecorder:
@@ -40,6 +42,7 @@ class SegmentRecorder:
         self.every = max(1, int(every))
         self.frames: list[Any] = []   # PIL RGB images, SIZE x SIZE
         self._src = None
+        self._driver = None
         self._untap = None
         self._n = 0
         self.error: str | None = None   # last capture/encode failure, for the reason
@@ -47,7 +50,7 @@ class SegmentRecorder:
     # -- recording -------------------------------------------------------------
     def start(self, env: Any, driver: Any, embodiment: Any = None) -> None:
         self.stop()
-        self.frames, self._n, self.error = [], 0, None
+        self.frames, self._n, self.error, self._driver = [], 0, None, driver
         emb = getattr(embodiment, "frame", None)
         src = getattr(driver, "frame", None) or getattr(env, "frame", None)
         # one callable(obs): the embodiment reads the obs, the legacy sources ignore it
@@ -81,9 +84,26 @@ class SegmentRecorder:
         self._src = None
 
     # -- outcome ---------------------------------------------------------------
-    def drop(self) -> None:
+    def drop(self, node: str | None = None) -> list[str]:
+        """Discard the clip; with ``node``, first save up to 3 failure keyframes
+        (``<node>.fail-<i>.jpg``, SIZE px JPEG) and return their file names."""
         self.stop()
-        self.frames = []
+        frames, self.frames = self.frames, []
+        if node is None or not frames:
+            return []
+        stall = getattr(self._driver, "last_progress_step", None)
+        mid = (len(frames) - 1) // 2 if stall is None else min(len(frames) - 1, max(0, int(stall) // self.every - 1))
+        picks = sorted({0, mid, len(frames) - 1})
+        names = []
+        try:
+            self.seed_dir.mkdir(parents=True, exist_ok=True)
+            for i, k in enumerate(picks):
+                name = f"{node}.fail-{i}.jpg"
+                frames[k].save(self.seed_dir / name, "JPEG", quality=KEYFRAME_QUALITY)
+                names.append(name)
+        except Exception as exc:  # noqa: BLE001 -- a lost keyframe never touches the task
+            self.error = repr(exc)
+        return names
 
     def keep(self, node: str) -> Path | None:
         """Encode the segment's frames to ``<root>/<task>/<seed>/<node>.(mp4|gif)``
@@ -116,7 +136,7 @@ class SegmentRecorder:
         path = self.keep(node) if ok else None
         if path is not None:
             return {"kept": True, "file": str(path.relative_to(self.root))}
-        self.drop()
+        keyframes = self.drop(node)
         reason = ("verify_failed" if not ok else "no_frame_source" if not had_src
                   else "no_frames" if not had_frames else "encode_failed")
         out = {"kept": False, "reason": reason}
@@ -124,7 +144,7 @@ class SegmentRecorder:
             out["error"] = self.error
         try:
             self.seed_dir.mkdir(parents=True, exist_ok=True)
-            _index(self.seed_dir, node, None, reason)
+            _index(self.seed_dir, node, None, {"reason": reason, "keyframes": keyframes})
         except OSError:
             pass
         return out
@@ -200,9 +220,9 @@ def _encode(frames: list, stem: Path) -> tuple[Path, int, int]:
     return path, fps, len(sub)
 
 
-def _index(seed_dir: Path, node: str, entry: dict | None, reason: str | None = None) -> None:
+def _index(seed_dir: Path, node: str, entry: dict | None, reason: dict | None = None) -> None:
     """Atomically move ``node`` to ``files`` (kept, ``entry``) or ``dropped``
-    (``reason``) in the seed's index.json -- a node is in exactly one of them."""
+    (``{reason, keyframes}``) in the seed's index.json -- a node is in exactly one of them."""
     idx = seed_dir / "index.json"
     try:
         data = json.loads(idx.read_text())
@@ -227,9 +247,11 @@ def index_of(root: str | os.PathLike, task: str, seed: int) -> dict:
 
 
 def dropped_of(root: str | os.PathLike, task: str, seed: int) -> dict:
-    """``{node: reason}`` of the segments that left no clip (verify_failed /
-    no_frame_source / no_frames / encode_failed). Empty when nothing was dropped."""
-    return _read_index(root, task, seed, "dropped")
+    """``{node: {reason, keyframes: [file names]}}`` of the segments that left no clip
+    (verify_failed / no_frame_source / no_frames / encode_failed; an index older than
+    keyframes reads ``keyframes: []``). Empty when nothing was dropped."""
+    return {n: v if isinstance(v, dict) else {"reason": v, "keyframes": []}
+            for n, v in _read_index(root, task, seed, "dropped").items()}
 
 
 def _read_index(root, task, seed, key: str) -> dict:

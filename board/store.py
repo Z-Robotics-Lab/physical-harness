@@ -1398,7 +1398,8 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     """Every evolve campaign the session holds on disk (``campaigns/evolve-*/
     campaign.json``, so it survives a restart -- the per-boot feed does not):
     ``{task, status, cursor, rounds (count), best, seeds, arm, node_rate_best (the
-    series' running-max node pass rate | null), updated
+    series' running-max node pass rate | null), published_rounds: [round numbers],
+    usage: {llm_tokens: {prompt, completion} | null, sim_s} (summed over rounds), updated
     (campaign.json mtime), live: {phase, message, nodes_done "k/n" | null} | null, open_brief}``,
     running first, then newest ``updated`` first."""
     session_dir = Path(session_dir)
@@ -1408,11 +1409,16 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
         doc = _campaign(session_dir, task)
         if doc is None:
             continue
-        live = doc.get("live")
+        live, rounds = doc.get("live"), doc.get("rounds") or []
+        tok = [u["llm_tokens"] for r in rounds if (u := r.get("usage")) and u.get("llm_tokens")]
         out.append({
             "task": doc.get("task", task), "status": doc.get("status"),
-            "cursor": doc.get("cursor"), "rounds": len(doc.get("rounds") or []),
+            "cursor": doc.get("cursor"), "rounds": len(rounds),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
+            "published_rounds": [r["round"] for r in rounds if r.get("published")],
+            "usage": {"llm_tokens": {"prompt": sum(t.get("prompt") or 0 for t in tok),
+                                     "completion": sum(t.get("completion") or 0 for t in tok)} if tok else None,
+                      "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in rounds), 3)},
             "node_rate_best": (_series(doc) or [{}])[-1].get("node_rate", {}).get("best"),
             "updated": (d / "campaign.json").stat().st_mtime,
             "live": ({"phase": live.get("phase"), "message": live.get("message"),
@@ -1451,15 +1457,18 @@ def _series(doc: dict) -> list[dict]:
         cur = na if na is not None else nb
         best = cur if best is None or (cur is not None and cur > best) else best
         out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs",
-                                             "proposer", "llm")},
+                                             "proposer", "llm", "parent", "outcome", "confirm", "usage")},
                     "node_rate": {"before": nb, "after": na, "best": best},
                     "by_task": {t: {"before": tb.get(t), "after": ta.get(t)} for t in sorted(set(tb) | set(ta))}})
     return out
 
 
 def rsi_series(session_dir: str | Path, task: str) -> list[dict]:
-    """Per-round {round, before, after, best, per_seed, needs, node_rate, by_task} of
-    one evolve campaign, in order (the line-chart feed; ``per_seed`` = the kept suite's
+    """Per-round {round, before, after, best, per_seed, needs, proposer, llm, parent, outcome,
+    confirm, usage, node_rate, by_task} of one evolve campaign, in order (the line-chart feed;
+    ``parent`` = the last published round this try grew from (0 = baseline), ``outcome`` =
+    improved|same|worse|none on the debug seeds, ``confirm`` = {seeds, before, after} of the
+    scratch-seed check | null, ``usage`` = {llm_tokens, sim_s}; ``per_seed`` = the kept suite's
     [{seed, success, first_death, failure_mode, nodes}], ``needs`` = what would unblock a
     round that tried nothing; ``node_rate`` = {before, after, best}: mean over seeds of
     ok-nodes/nodes (before from per_seed, after from after_seeds, best = running max of
@@ -1469,14 +1478,17 @@ def rsi_series(session_dir: str | Path, task: str) -> list[dict]:
     return _series(_campaign(session_dir, task) or {})
 
 
-def rsi_frames(session_dir: str | Path, task: str, round: int) -> list[str]:
-    """The kept keyframe/video paths one evolve round recorded (``media`` of that
-    round row, session-relative). [] when the campaign or round is absent."""
+def rsi_frames(session_dir: str | Path, task: str, round: int) -> dict:
+    """``{media: [kept clip paths], dropped: {"<seed>/<node>": {reason, keyframes: [paths]}}}``
+    of one evolve round (session-relative; ``keyframes`` = the dropped segment's failure
+    keyframes). Empty media / dropped when the campaign or round is absent."""
     doc = _campaign(session_dir, task) or {}
     for r in doc.get("rounds") or []:
         if r.get("round") == round:
-            return [m for m in r.get("media") or [] if isinstance(m, str)]
-    return []
+            dropped = {k: v if isinstance(v, dict) else {"reason": v, "keyframes": []}
+                       for k, v in (r.get("media_dropped") or {}).items()}
+            return {"media": [m for m in r.get("media") or [] if isinstance(m, str)], "dropped": dropped}
+    return {"media": [], "dropped": {}}
 
 
 # --- proposals inbox --------------------------------------------------------

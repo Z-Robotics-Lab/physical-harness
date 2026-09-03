@@ -194,6 +194,7 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
     if media_dir is not None:
         brief["media_dir"] = str(media_dir)
     tick = progress or (lambda **kw: None)
+    t_suite = time.time()
     for i, seed in enumerate(range(int(seeds[0]), int(seeds[1]) + 1)):
         t_seed = time.time()
         tick(seed_index=i, seed=seed, node=None, nodes=[], seed_started_at=t_seed)
@@ -219,6 +220,10 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
             "first_death": dead,
             "failure_mode": (nodes[dead].get("diagnostics") or {}).get("failure_mode") if dead else None,
             "fault": {k: faults[0].get(k) for k in ("kind", "node", "msg")} if faults else None,
+            # the first-death node's failure keyframes (session-relative paths; the LLM brief's images)
+            "keyframes": [f"media/{task}/{seed}/{f}" for f in (media.dropped_of(media_dir, task, seed)
+                                                                .get(dead) or {}).get("keyframes", [])]
+            if media_dir is not None and dead else [],
             "nodes": {nid: {"skill": skills.get(nid), "success": bool(n["success"]),
                             "executor": n.get("executor") or "scripted",
                             "tunables_sha": (n.get("diagnostics") or {}).get("tunables_sha")}
@@ -233,6 +238,7 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                                         evolve_llm.MAX_LOG_LINES // (int(seeds[1]) - int(seeds[0]) + 1))
         tick(per_seed_partial=per_seed({"seeds": per}))
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
+            "elapsed_s": round(time.time() - t_suite, 3),
             "logs": logs}   # the dying nodes' fault/verify rows: the LLM proposer's log excerpt
 
 
@@ -294,9 +300,15 @@ def from_proposal(p: dict, before: dict) -> dict:
     if missing := [k for k in need if k not in pay]:
         return {"kind": "none", "node": node,
                 "detail": {**tag, "reason": f"{p['kind']} proposal lacks {missing}"}}
+    frm = runs[0]["executor"]
+    if p["kind"] == "tunables":   # the knob's current value (None when the ref/path is unknown)
+        frm = mount_params(pay["ref"])
+        for k in pay["path"]:
+            frm = frm.get(k) if isinstance(frm, dict) else None
+        frm = frm if isinstance(frm, (int, float)) and not isinstance(frm, bool) else None
     return {"kind": p["kind"], "node": node,
             "detail": {"skill": runs[0]["skill"], "executor": runs[0]["executor"],
-                       "from": runs[0]["executor"], **tag, **pay}}
+                       "from": frm, **tag, **pay}}
 
 
 def _tunables(params: dict) -> tuple[dict, list]:
@@ -423,18 +435,19 @@ def _media(session: Path, task: str, seeds: list) -> list[str]:
             for ent in media.index_of(session / "media", task, seed).values()]
 
 
-def _dropped(session: Path, task: str, seeds: list) -> dict[str, str]:
-    """``{"<seed>/<node>": reason}`` of the segments that left no clip -- the
-    honest side of ``media`` (read via rsi_run's latest round)."""
-    return {f"{seed}/{node}": why
+def _dropped(session: Path, task: str, seeds: list) -> dict[str, dict]:
+    """``{"<seed>/<node>": {reason, keyframes: [session-relative paths]}}`` of the
+    segments that left no clip -- the honest side of ``media`` (rsi_frames' ``dropped``)."""
+    return {f"{seed}/{node}": {"reason": d["reason"],
+                               "keyframes": [f"media/{task}/{seed}/{f}" for f in d["keyframes"]]}
             for seed in range(int(seeds[0]), int(seeds[1]) + 1)
-            for node, why in media.dropped_of(session / "media", task, seed).items()}
+            for node, d in media.dropped_of(session / "media", task, seed).items()}
 
 
 # ── the round loop ────────────────────────────────────────────────────────────────
 
 _ZH = {"idle": "等待", "baseline": "基线评测", "propose": "选试验", "retest": "同种子复测",
-       "publish": "发布", "done": "完成", "cancelled": "已取消"}
+       "confirm": "新种子确认", "publish": "发布", "done": "完成", "cancelled": "已取消"}
 
 
 def _message(live: dict) -> str:
@@ -447,7 +460,7 @@ def _message(live: dict) -> str:
     if live["phase"] == "cancelled":
         return f"第 {live['round']} 轮边界取消"
     t = live.get("tried")
-    if t and live["phase"] in ("retest", "publish"):
+    if t and live["phase"] in ("retest", "confirm", "publish"):
         head += f"（{t['kind']} @ {t['node']}）"
     if live["seed"] is not None:
         done = sum(n["ok"] is True for n in live.get("nodes") or [])
@@ -468,6 +481,9 @@ def main(argv=None) -> int:
     ap.add_argument("--cancel-marker", type=Path, default=None)
     ap.add_argument("--max-replans", type=int, default=None)
     ap.add_argument("--max-actuations", type=int, default=None)
+    ap.add_argument("--confirm-seeds", type=int, default=2,
+                    help="fresh scratch seeds (above the block) a debug-seed win must hold on "
+                         "before publish; 0 disables")
     ap.add_argument("--proposer", choices=("llm", "rules"), default="llm",
                     help="llm: the model_endpoint card reads the round and answers the try "
                          "(rules fallback when unreachable/invalid); rules: the built-in proposer only")
@@ -501,7 +517,14 @@ def main(argv=None) -> int:
                           "seed_index": None, "seed": None, "node": None, "started_at": now,
                           "round_started_at": None, "phase_started_at": now, "last_round_s": None,
                           "per_seed_partial": [], "tried": None, "message": "", "messages": [],
-                          "nodes": [], "seed_started_at": None, "proposer": args.proposer}
+                          "nodes": [], "seed_started_at": None, "proposer": args.proposer,
+                          "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in doc["rounds"]), 3)}
+
+    def suite(seed_range, overlay, media=True):
+        out = run_suite(args.task, binding, seed_range, arm, args.skills_root, overlay,
+                        media_dir=args.session / "media" if media else None, budgets=budgets, progress=tick)
+        live["sim_s"] = round(live["sim_s"] + out["elapsed_s"], 3)
+        return out
 
     def tick(**kw) -> None:
         if kw.get("phase", live["phase"]) != live["phase"]:
@@ -523,8 +546,8 @@ def main(argv=None) -> int:
             return 3
         t_round = time.time()
         tick(phase="baseline" if base is None else "propose", round=r, round_started_at=t_round, tried=None)
-        before = base or run_suite(args.task, binding, seeds, arm, args.skills_root, applied,
-                                     media_dir=args.session / "media", budgets=budgets, progress=tick)
+        sim_s0 = live["sim_s"]
+        before = base or suite(seeds, applied)
         tick(phase="propose")
         os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])  # mount_params: the accepted overlay, not the last trial's
         prop = take_proposal(args.session, args.task, r)
@@ -537,7 +560,7 @@ def main(argv=None) -> int:
                 ep = evolve_llm.endpoint()
                 tried, llm = evolve_llm.llm_propose(
                     ep, evolve_llm.rsi_projection(doc, before, records, emb, arm, binding, before.get("logs") or []),
-                    before, r, store.path.parent / "llm")
+                    before, r, store.path.parent / "llm", session=args.session)
             except Exception as exc:  # noqa: BLE001 -- no endpoint card / mount error: the rules take over
                 llm = {"model": None, "prompt_sha": None, "raw_sha": None, "summary": None,
                        "rationale": None, "reason": f"{type(exc).__name__}: {exc}"[:300]}
@@ -545,17 +568,34 @@ def main(argv=None) -> int:
             proposer = "rules"
             tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
         tick(tried=tried)
-        after, published = before, False
+        after, published, confirm = before, False, None
         if tried["kind"] != "none":
             trial = apply(tried, applied)
             tick(phase="retest")
             try:
-                after = run_suite(args.task, binding, seeds, arm, args.skills_root, trial,
-                                  media_dir=args.session / "media", budgets=budgets, progress=tick)
+                after = suite(seeds, trial)
             except Exception as exc:  # noqa: BLE001 -- the trial's failure is the round's finding
                 tried["detail"]["error"] = repr(exc)
                 after = before
             published = after["count"] > before["count"]
+            if published and args.confirm_seeds > 0:
+                # ASPIRE's debug-vs-eval split, light: the win must hold on fresh scratch seeds
+                # right above the block (never the ledger), SAME overlay, against the accepted
+                # state's count on those seeds (measured once per accepted state)
+                cs = [int(seeds[1]) + 1, int(seeds[1]) + args.confirm_seeds]
+                tick(phase="confirm")
+                cb = doc.get("confirm_base")
+                if not cb or cb["seeds"] != cs:
+                    cb = doc["confirm_base"] = {"seeds": cs, "count": suite(cs, applied, media=False)["count"]}
+                try:
+                    ca = suite(cs, trial, media=False)["count"]
+                except Exception as exc:  # noqa: BLE001
+                    tried["detail"]["error"] = repr(exc)
+                    ca = -1
+                confirm = {"seeds": cs, "before": cb["count"], "after": ca}
+                published = ca >= cb["count"]
+                if published:
+                    cb["count"] = ca   # the trial is the next accepted state on these seeds too
             if published:
                 tick(phase="publish")
                 applied = trial
@@ -568,6 +608,13 @@ def main(argv=None) -> int:
         doc["rounds"].append({
             "round": r, "tried": tried, "before": before["count"], "after": after["count"],
             "best": doc["best"], "suite_sha": after["sha"], "published": published,
+            # the hypothesis tree: which accepted state this try grew from, and how it went
+            "parent": max((x["round"] for x in doc["rounds"] if x["published"]), default=0),
+            "outcome": ("none" if tried["kind"] == "none" else "improved" if after["count"] > before["count"]
+                        else "worse" if after["count"] < before["count"] else "same"),
+            "confirm": confirm,
+            "usage": {"llm_tokens": llm.pop("usage", None) if llm else None,
+                      "sim_s": round(live["sim_s"] - sim_s0, 3)},
             "per_seed": per_seed(kept), "after_seeds": per_seed(after),
             "needs": tried["detail"].get("needs", []) if tried["kind"] == "none" else [],
             "media": _media(args.session, args.task, seeds),

@@ -160,7 +160,7 @@ def test_finish_seals_no_frame_source_when_nothing_can_frame(tmp_path):
     _drive(_Blind(), driver, 8)
     out = rec.finish("n", True)
     assert out == {"kept": False, "reason": "no_frame_source"}
-    assert media.dropped_of(tmp_path, "t", 1) == {"n": "no_frame_source"}
+    assert media.dropped_of(tmp_path, "t", 1) == {"n": {"reason": "no_frame_source", "keyframes": []}}
     assert media.index_of(tmp_path, "t", 1) == {}
 
 
@@ -176,7 +176,7 @@ def test_finish_seals_no_frames_when_the_source_yields_none_and_names_the_error(
     out = rec.finish("n", True)
     assert out["kept"] is False and out["reason"] == "no_frames"
     assert "camera off" in out["error"]
-    assert media.dropped_of(tmp_path, "t", 2) == {"n": "no_frames"}
+    assert media.dropped_of(tmp_path, "t", 2) == {"n": {"reason": "no_frames", "keyframes": []}}
 
     class _Silent:
         def frame(self, obs):
@@ -201,7 +201,7 @@ def test_embodiment_frame_reads_the_obs_and_a_kept_node_leaves_dropped(tmp_path)
     _drive(env, driver, 6)
     assert len(seen) == 6 and all(isinstance(o, dict) for o in seen)
     assert rec.finish("n", False) == {"kept": False, "reason": "verify_failed"}
-    assert media.dropped_of(tmp_path, "t", 3) == {"n": "verify_failed"}
+    assert media.dropped_of(tmp_path, "t", 3)["n"]["reason"] == "verify_failed"
     rec.start(env, driver, _Emb())
     _drive(env, driver, 6)
     out = rec.finish("n", True)

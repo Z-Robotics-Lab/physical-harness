@@ -184,9 +184,10 @@ def rsi_series(task: str, name: str = _DEFAULT_SESSION) -> list[dict]:
 
 
 @mcp.tool()
-def rsi_frames(task: str, round: int, name: str = _DEFAULT_SESSION) -> list[str]:
-    """Kept keyframe/video paths (session-relative) one evolve round recorded;
-    [] when the campaign or round is absent. Paths only, never bytes."""
+def rsi_frames(task: str, round: int, name: str = _DEFAULT_SESSION) -> dict:
+    """``{media: [kept clip paths], dropped: {"seed/node": {reason, keyframes: [paths]}}}``
+    (session-relative) one evolve round recorded; empty lists when the campaign or
+    round is absent. Paths only, never bytes."""
     path = bs.safe_child(_Cfg.runs, name, bs.is_session)
     return bs.rsi_frames(path, task, round) if path else {"error": "unknown session"}
 
