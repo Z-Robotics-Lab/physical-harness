@@ -320,6 +320,11 @@ def test_cancel_lands_and_resubmit_resumes_from_cursor(runtime, two_rounds):
     assert doc["status"] == "done" and doc["cursor"] == 3
     assert [r["round"] for r in doc["rounds"]] == [1, 2, 3]
     assert doc["rounds"][2]["tried"]["kind"] == "none" and doc["rounds"][2]["best"] == 2
+    # 开始/继续 on a finished campaign sends a task-only brief (rounds = default):
+    # that means "N more rounds", never an empty loop that finishes in a blink.
+    runtime.run({"kind": "evolve", "task": TASK, "rounds": 1})
+    doc = json.loads((runtime.runs / SESSION / "campaigns" / f"evolve-{TASK}" / "campaign.json").read_text())
+    assert doc["status"] == "done" and doc["cursor"] == 4 and [r["round"] for r in doc["rounds"]] == [1, 2, 3, 4]
     assert [s["round"] for s in _kinds(rows, "rsi_step")] == [3]
 
 

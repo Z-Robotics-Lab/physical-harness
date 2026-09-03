@@ -478,7 +478,11 @@ def main(argv=None) -> int:
                            "rounds": [], "best": 0, "cursor": 0, "status": "running",
                            "applied": {"executors": {}, "tunables": {}}}
     seeds, arm, applied = doc["seeds"], doc["arm"], doc["applied"]
-    doc["status"] = "running" if doc["cursor"] < args.rounds else "done"
+    # A resume whose --rounds does not reach past the cursor means "N more rounds"
+    # (the console's 开始/继续 sends a task-only brief, so rounds is the default):
+    # otherwise the round loop is empty and the brief "finishes" in a blink.
+    target = args.rounds if args.rounds > doc["cursor"] else doc["cursor"] + args.rounds
+    doc["status"] = "running"
     # live = where the loop is RIGHT NOW (rsi_run's ``live``): rewritten with the
     # doc at every phase/seed/node boundary. One writer, tmp+rename -> no race.
     now = time.time()
@@ -501,7 +505,7 @@ def main(argv=None) -> int:
 
     tick()
     base = None
-    for r in range(doc["cursor"] + 1, args.rounds + 1):
+    for r in range(doc["cursor"] + 1, target + 1):
         if args.cancel_marker is not None and args.cancel_marker.exists():
             doc["status"] = "cancelled"
             tick(phase="cancelled")
