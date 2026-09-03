@@ -107,7 +107,20 @@ _CAMPAIGN = {
     "rounds": [
         {"round": 1, "tried": {"kind": "executor", "node": "grasp", "detail": "scripted->geometric"},
          "before": 0, "after": 1, "best": 1, "suite_sha": "a" * 64, "published": True,
-         "media": ["media/kitchen_thaw/1/grasp.gif"], "ts": 1.0},
+         "media": ["media/kitchen_thaw/1/grasp.gif"], "ts": 1.0,
+         "per_seed": [{"seed": 1, "success": True, "first_death": None, "failure_mode": None,
+                       "tunables_sha": None, "elapsed_s": 0.4, "nodes": [
+                           {"id": "reach", "ok": True, "steps": 9, "failure_mode": None, "after": [],
+                            "kind": "segment", "task": "reach"},
+                           {"id": "grasp", "ok": True, "steps": 12, "failure_mode": None, "after": ["reach"],
+                            "kind": "segment", "task": "grasp"}]},
+                      {"seed": 2, "success": False, "first_death": "grasp", "failure_mode": "slip",
+                       "tunables_sha": None, "elapsed_s": 0.3, "nodes": [
+                           {"id": "reach", "ok": True, "steps": 9, "failure_mode": None, "after": [],
+                            "kind": "segment", "task": "reach"},
+                           {"id": "grasp", "ok": False, "steps": 12, "failure_mode": "slip", "after": ["reach"],
+                            "kind": "segment", "task": "grasp"}]}],
+         "needs": []},
         {"round": 2, "tried": {"kind": "tunables", "node": "grasp", "detail": "hover_z*1.2"},
          "before": 1, "after": 1, "best": 1, "suite_sha": "b" * 64, "published": False,
          "media": [], "ts": 2.0},
@@ -118,13 +131,13 @@ _CAMPAIGN = {
              "last_round_s": 1.0, "seed_started_at": 3.0, "per_seed_partial": [
                  {"seed": 1, "success": True, "first_death": None, "failure_mode": None,
                   "elapsed_s": 0.4, "nodes": [{"id": "reach", "ok": True, "steps": 9, "failure_mode": None,
-                                               "after": [], "kind": "segment"},
+                                               "after": [], "kind": "segment", "task": "reach"},
                                               {"id": "grasp", "ok": True, "steps": 12, "failure_mode": None,
-                                               "after": ["reach"], "kind": "segment"}]}],
+                                               "after": ["reach"], "kind": "segment", "task": "grasp"}]}],
              "nodes": [{"id": "reach", "skill": "reach", "ok": True, "steps": None, "failure_mode": None,
-                        "after": [], "kind": "segment"},
+                        "after": [], "kind": "segment", "task": "reach"},
                        {"id": "grasp", "skill": "grasp", "ok": None, "steps": None, "failure_mode": None,
-                        "after": ["reach"], "kind": "segment"}],
+                        "after": ["reach"], "kind": "segment", "task": "grasp"}],
              "tried": None, "message": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2",
              "messages": [{"ts": 3.0, "text": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2"}]},
 }
@@ -165,9 +178,17 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     (camp / "campaign.json").write_text(json.dumps({k: v for k, v in _CAMPAIGN.items() if k != "live"}))
     assert bs.rsi_run(sd, "kitchen_thaw")["live"] is None   # pre-live campaign reads as null
     (camp / "campaign.json").write_text(json.dumps(_CAMPAIGN))
+    r1 = _CAMPAIGN["rounds"][0]
+    # node_rate: seed 1 2/2, seed 2 1/2 -> 0.75 (per_seed = before; no after_seeds -> null);
+    # by_task: reach passes both seeds, grasp only seed 1; round 2 carries no trail -> nulls,
+    # best carries the running max
     assert bs.rsi_series(sd, "kitchen_thaw") == [   # pre-per_seed rounds read as null
-        {"round": 1, "before": 0, "after": 1, "best": 1, "per_seed": None, "needs": None},
-        {"round": 2, "before": 1, "after": 1, "best": 1, "per_seed": None, "needs": None}]
+        {"round": 1, "before": 0, "after": 1, "best": 1, "per_seed": r1["per_seed"], "needs": [],
+         "node_rate": {"before": 0.75, "after": None, "best": 0.75},
+         "by_task": {"grasp": {"before": 0.5, "after": None}, "reach": {"before": 1.0, "after": None}}},
+        {"round": 2, "before": 1, "after": 1, "best": 1, "per_seed": None, "needs": None,
+         "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
+    assert bs.rsi_series(sd, "kitchen_thaw") == ms.rsi_series("kitchen_thaw")
     assert bs.rsi_frames(sd, "kitchen_thaw", 1) == ["media/kitchen_thaw/1/grasp.gif"]
     assert bs.rsi_frames(sd, "kitchen_thaw", 9) == [] and bs.rsi_run(sd, "nope") is None
     # traversal: a ../ task never leaves the session; a ../ session is refused
@@ -251,7 +272,8 @@ def test_rsi_campaigns_faces_are_byte_identical(tmp_path, capsys):
     assert [c["task"] for c in lib] == ["kitchen_thaw", "stack"]
     running, finished = lib
     assert running == {"task": "kitchen_thaw", "status": "running", "cursor": 2, "rounds": 2,
-                       "best": 1, "seeds": [1, 2], "arm": "auto", "updated": running["updated"],
+                       "best": 1, "seeds": [1, 2], "arm": "auto", "node_rate_best": 0.75,
+                       "updated": running["updated"],
                        "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"],
                                 "nodes_done": "1/2"},
                        "open_brief": "brief-aaaa.json"}

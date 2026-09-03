@@ -262,7 +262,7 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
     kept = [{"seed": s, "success": True, "first_death": None, "failure_mode": None,
              "tunables_sha": None, "elapsed_s": pytest.approx(1, abs=30),
              "nodes": [{"id": n, "ok": True, "steps": n_steps, "failure_mode": None,
-                        "after": after, "kind": "segment"}
+                        "after": after, "kind": "segment", "task": n.split("-")[0]}
                        for n, after in (("reach-0", []), ("grab-0", ["reach-0"]))]} for s in (1, 2)]
     assert [s["per_seed"] for s in steps] == [r1["per_seed"], r2["per_seed"]] == [kept, kept]
     # the baseline (0/2) rows carry the trail with the first-death node ok=False
@@ -294,6 +294,12 @@ def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
     assert [s["after"] for s in bs.rsi_series(sd, TASK)] == [2, 2]
     assert [(s["per_seed"], s["needs"]) for s in bs.rsi_series(sd, TASK)] == \
         [(r["per_seed"], r["needs"]) for r in doc["rounds"]]
+    # sub-task rates from the trails: the kept suite (= the published trial) verified every
+    # node of every seed, so node_rate and both stage groups (reach, grab) read 1.0
+    assert [(s["node_rate"], s["by_task"]) for s in bs.rsi_series(sd, TASK)] == [
+        ({"before": 1.0, "after": 1.0, "best": 1.0},
+         {"grab": {"before": 1.0, "after": 1.0}, "reach": {"before": 1.0, "after": 1.0}})] * 2
+    assert bs.rsi_campaigns(runtime.runs / SESSION)[0]["node_rate_best"] == 1.0
     assert bs.rsi_frames(sd, TASK, 1) == doc["rounds"][0]["media"]
 
 

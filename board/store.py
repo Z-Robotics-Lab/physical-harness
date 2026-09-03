@@ -1397,7 +1397,8 @@ def _open_brief(session_dir: Path, task: str) -> str | None:
 def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     """Every evolve campaign the session holds on disk (``campaigns/evolve-*/
     campaign.json``, so it survives a restart -- the per-boot feed does not):
-    ``{task, status, cursor, rounds (count), best, seeds, arm, updated
+    ``{task, status, cursor, rounds (count), best, seeds, arm, node_rate_best (the
+    series' running-max node pass rate | null), updated
     (campaign.json mtime), live: {phase, message, nodes_done "k/n" | null} | null, open_brief}``,
     running first, then newest ``updated`` first."""
     session_dir = Path(session_dir)
@@ -1412,6 +1413,7 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
             "task": doc.get("task", task), "status": doc.get("status"),
             "cursor": doc.get("cursor"), "rounds": len(doc.get("rounds") or []),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
+            "node_rate_best": (_series(doc) or [{}])[-1].get("node_rate", {}).get("best"),
             "updated": (d / "campaign.json").stat().st_mtime,
             "live": ({"phase": live.get("phase"), "message": live.get("message"),
                       "nodes_done": (f"{sum(n.get('ok') is True for n in live['nodes'])}/{len(live['nodes'])}"
@@ -1422,14 +1424,48 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     return out
 
 
+def _rates(rows) -> tuple[float | None, dict]:
+    """(mean node pass rate, {task: pass fraction}) over one per_seed list; a task
+    passes for a seed when every node carrying that ``task`` is ok=true. (None, {})
+    when no row carries nodes (rounds older than the trail)."""
+    rows = [r for r in rows or () if r.get("nodes")]
+    if not rows:
+        return None, {}
+    rate = sum(sum(n.get("ok") is True for n in r["nodes"]) / len(r["nodes"]) for r in rows) / len(rows)
+    passes: dict[str, int] = {}
+    for r in rows:
+        per = {}
+        for n in r["nodes"]:
+            if n.get("task"):
+                per[n["task"]] = per.get(n["task"], True) and n.get("ok") is True
+        for t, ok in per.items():
+            passes[t] = passes.get(t, 0) + ok
+    return round(rate, 4), {t: round(k / len(rows), 4) for t, k in passes.items()}
+
+
+def _series(doc: dict) -> list[dict]:
+    out, best = [], None
+    for r in doc.get("rounds") or []:
+        nb, tb = _rates(r.get("per_seed"))
+        na, ta = _rates(r.get("after_seeds"))
+        cur = na if na is not None else nb
+        best = cur if best is None or (cur is not None and cur > best) else best
+        out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs")},
+                    "node_rate": {"before": nb, "after": na, "best": best},
+                    "by_task": {t: {"before": tb.get(t), "after": ta.get(t)} for t in sorted(set(tb) | set(ta))}})
+    return out
+
+
 def rsi_series(session_dir: str | Path, task: str) -> list[dict]:
-    """Per-round {round, before, after, best, per_seed, needs} of one evolve
-    campaign, in order (the line-chart feed; ``per_seed`` = the kept suite's
-    [{seed, success, first_death, failure_mode}], ``needs`` = what would unblock a
-    round that tried nothing). [] when no campaign exists."""
-    doc = _campaign(session_dir, task) or {}
-    return [{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs")}
-            for r in doc.get("rounds") or []]
+    """Per-round {round, before, after, best, per_seed, needs, node_rate, by_task} of
+    one evolve campaign, in order (the line-chart feed; ``per_seed`` = the kept suite's
+    [{seed, success, first_death, failure_mode, nodes}], ``needs`` = what would unblock a
+    round that tried nothing; ``node_rate`` = {before, after, best}: mean over seeds of
+    ok-nodes/nodes (before from per_seed, after from after_seeds, best = running max of
+    after-or-before); ``by_task`` = {task: {before, after}} pass fraction of each sub-task
+    (every node of that task ok). Rounds without nodes read as null / {}). [] when no
+    campaign exists."""
+    return _series(_campaign(session_dir, task) or {})
 
 
 def rsi_frames(session_dir: str | Path, task: str, round: int) -> list[str]:
