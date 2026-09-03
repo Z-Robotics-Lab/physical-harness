@@ -22,7 +22,15 @@ cancelled, plus its own event tail and its outcome), and ``cancel_brief
 never as an error. A long mission is polled with brief_status, never
 reconstructed from raw files.
 
-This face is read-only but for three write fns. ``model_server <action>`` is the
+``plan_skill_task --instruction '<text>' [--channel X] [--session S]`` is the
+natural-language planning READ (board/planning.py -> plugins.task.skill_planning):
+skill-graph retrieval, DeepSeek strict JSON, the runtime's validate_plan, server-
+side expansion, binding check -- ``status`` executable / planning_only / rejected
+/ no_match, and it writes nothing. ``submit_skill_plan --plan '<record>'`` is
+its ONE explicit execute: the record is re-verified and, only if executable,
+becomes an ordinary task brief through the same shared drop below.
+
+This face is read-only but for four write fns. ``model_server <action>`` is the
 console's local-model switch (``status``/``start``/``stop``, default ``status``)
 -- the launcher it may run is a constant in board.store, never an argument, and
 the action word is whitelisted there. ``policy_server <action>`` is the same switch for
@@ -56,6 +64,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from board import cards as bc
+from board import planning as bp
 from board import store as bs
 from board import vault as bv
 
@@ -71,7 +80,11 @@ def dispatch(fn: str, name: str | None, runs: Path, status: Path, progress: Path
              after: int = 0, relation: str | None = None, after_ts: float = 0.0,
              wait_ms: int = 0, brief: str | None = None,
              session: str | None = None, seq: int = 0, out: Path | None = None,
-             sha: str | None = None, round: int = 0, checkpoint: str | None = None):
+             sha: str | None = None, round: int = 0, checkpoint: str | None = None,
+             instruction: str | None = None, channel: str = "auto",
+             plan: str | None = None, seed: int = bp.SCRATCH_SEED,
+             expand: bool = True, max_replans: int | None = None,
+             max_actuations: int | None = None):
     """Return the same object the matching board/mcp_server.py tool returns.
 
     Raises KeyError for an unknown fn and ValueError for a rejected name, so
@@ -84,6 +97,26 @@ def dispatch(fn: str, name: str | None, runs: Path, status: Path, progress: Path
         if brief is None:
             raise ValueError("submit_brief needs --brief")
         return bs.submit_brief(runs, brief, session or "session-main")
+    if fn == "plan_skill_task":
+        # READ: natural language -> validated skill chain; writes nothing. The
+        # same board.planning function the MCP tool wraps (one implementation).
+        if not instruction:
+            raise ValueError("plan_skill_task needs --instruction")
+        return bp.plan_skill_task(instruction, session or bp.DEFAULT_SESSION,
+                                  expand=expand, channel=channel, seed=seed)
+    if fn == "skill_library":
+        return bp.skill_library()
+    if fn == "submit_skill_plan":
+        # the ONE explicit execute: re-verify the record, then the shared drop.
+        if plan is None:
+            raise ValueError("submit_skill_plan needs --plan '<composite_plan json>'")
+        try:
+            record = json.loads(plan)
+        except ValueError as exc:
+            raise ValueError(f"--plan is not JSON: {exc}") from exc
+        return bp.submit_skill_plan(runs, record, session or bp.DEFAULT_SESSION,
+                                    seed=seed, max_replans=max_replans,
+                                    max_actuations=max_actuations)
     if fn in ("brief_status", "cancel_brief"):
         # The brief id rides the `name` slot (the model_server pattern); the
         # SESSION is the addressed thing, so it goes through the shared guard.
@@ -257,7 +290,13 @@ def serve(stdin, stdout, runs: Path, status: Path, progress: Path) -> int:
                               float(req.get("after_ts", 0.0)), int(req.get("wait_ms", 0)),
                               req.get("brief"), req.get("session"),
                               int(req.get("seq", 0)), sha=req.get("sha"),
-                              round=int(req.get("round", 0)), checkpoint=req.get("checkpoint"))
+                              round=int(req.get("round", 0)), checkpoint=req.get("checkpoint"),
+                              instruction=req.get("instruction"),
+                              channel=req.get("channel", "auto"), plan=req.get("plan"),
+                              seed=int(req.get("seed", bp.SCRATCH_SEED)),
+                              expand=bool(req.get("expand", True)),
+                              max_replans=req.get("max_replans"),
+                              max_actuations=req.get("max_actuations"))
         except KeyError:
             result = {"error": f"unknown fn: {req.get('fn', '')}"}
         except Exception as exc:  # bad JSON / rejected name / anything: reply, keep serving
@@ -268,10 +307,17 @@ def serve(stdin, stdout, runs: Path, status: Path, progress: Path) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("fn", help="serve|health|submit_brief|brief_status|cancel_brief|submit_proposal|proposals|rsi_run|rsi_series|rsi_frames|list_stores|store|heldout|campaign_progress|sessions|session|session_progress|suite_result|trajectories|plan_index|skill_evidence|skills|runtime_status|runtime_frame|runtime_rollout|runtime_keyframes|runtime_keyframe|runtime_events|host_vitals|model_server|policy_server|restart_services|ledger|rounds|cards|vault|vault_node|vault_neighbors")
+    parser.add_argument("fn", help="serve|health|skill_library|plan_skill_task|submit_skill_plan|submit_brief|brief_status|cancel_brief|submit_proposal|proposals|rsi_run|rsi_series|rsi_frames|list_stores|store|heldout|campaign_progress|sessions|session|session_progress|suite_result|trajectories|plan_index|skill_evidence|skills|runtime_status|runtime_frame|runtime_rollout|runtime_keyframes|runtime_keyframe|runtime_events|host_vitals|model_server|policy_server|restart_services|ledger|rounds|cards|vault|vault_node|vault_neighbors")
     parser.add_argument("name", nargs="?", default=None, help="store/session name, vault node id for vault_node/vault_neighbors, the brief id for brief_status/cancel_brief, the task for rsi_run/rsi_series/rsi_frames, the model_server/policy_server action (status|start|stop, default status), 'build' to make restart_services rebuild ph-station first, or the console port for health")
     parser.add_argument("--brief", default=None, help="submit_brief: the raw brief JSON string, dropped verbatim (zero validation; the runtime is the sole authority); submit_proposal: the raw proposal JSON {task, kind, payload, note}")
-    parser.add_argument("--session", default="session-main", help="the runtime session addressed: whose inbox submit_brief routes into, whose brief brief_status/cancel_brief names, and whose evolve campaign rsi_run/rsi_series/rsi_frames reads (default: session-main)")
+    parser.add_argument("--session", default=None, help="the runtime session addressed: whose inbox submit_brief routes into, and whose brief brief_status/cancel_brief names (default: session-main; plan_skill_task/submit_skill_plan default to session-robocasa)")
+    parser.add_argument("--instruction", default=None, help="plan_skill_task: the natural-language task to plan (read-only; nothing is executed)")
+    parser.add_argument("--channel", default="auto", help="plan_skill_task: pin the vocabulary (robocasa_skill_graph or a task name) instead of routing by retrieval")
+    parser.add_argument("--no-expand", dest="expand", action="store_false", help="plan_skill_task: skip the server-side leaf expansion")
+    parser.add_argument("--plan", default=None, help="submit_skill_plan: the composite_plan record JSON from plan_skill_task; re-verified from scratch, refused unless executable")
+    parser.add_argument("--seed", type=int, default=bp.SCRATCH_SEED, help="plan_skill_task/submit_skill_plan: the task seed (default: the 424242 scratch seed, never burns the ledger)")
+    parser.add_argument("--max-replans", type=int, default=None, help="submit_skill_plan: brief budget override")
+    parser.add_argument("--max-actuations", type=int, default=None, help="submit_skill_plan: brief budget override")
     parser.add_argument("--relation", default=None, help="vault_neighbors: restrict adjacency to one rel")
     parser.add_argument("--runs", type=Path, default=Path("runs"), help="campaign runs directory (default: runs)")
     parser.add_argument("--status", type=Path, default=None, help="STATUS.md (display-only prose; the ledger fn derives from runs/)")
@@ -293,7 +339,9 @@ def main(argv=None) -> int:
     try:
         result = dispatch(args.fn, args.name, runs, status, progress, args.after, args.relation,
                           args.after_ts, args.wait_ms, args.brief, args.session, args.seq,
-                          args.out, args.sha, args.round, args.checkpoint)
+                          args.out, args.sha, args.round, args.checkpoint,
+                          args.instruction, args.channel, args.plan, args.seed, args.expand,
+                          args.max_replans, args.max_actuations)
     except KeyError:
         print(json.dumps({"error": f"unknown fn: {args.fn}"}))
         return 2

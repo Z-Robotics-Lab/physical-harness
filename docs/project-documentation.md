@@ -144,8 +144,7 @@ ph-station 从不直接读 `runs/`。它只会调 dsh-ph-board，后者 exec sto
 gateway 在 `trusted-host` 栅栏后自动暴露 `POST /api/board/<fn>`。三个 face
 （MCP tool / CLI / 面板）调的是同一个函数，并有逐字节等价测试钉住。
 
-**面板只有两条写路径**：`submit_brief`（原子落 runtime 校验过的 inbox）和 `cancel_brief`（落取消标记，runtime 在下一个轮边界处理）；桥（dsh-ph-board）白名单里除此之外全是只读。**没有认证层**：`trusted-host` 防的是 DNS rebinding，不是身份；服务绑
-`127.0.0.1`，`/api/board/*` 只读封存的 `runs/`。
+**面板只有三条写路径**：`submit_brief`（原子落 runtime 校验过的 inbox）、`submit_skill_plan`（规划面板的“执行”按钮：服务端重新核验一张已校验、全部叶子有 binding 的 skill plan，再投一张**普通** task brief，走同一条原子落盘，见 §6.1.2）和 `cancel_brief`（落取消标记，runtime 在下一个轮边界处理）；桥（dsh-ph-board）白名单里除此之外全是只读。规划本身（`plan_skill_task`）是读：不执行、不落盘。**没有认证层**：`trusted-host` 防的是 DNS rebinding，不是身份；服务绑`127.0.0.1`，`/api/board/*` 只读封存的 `runs/`。
 
 **天花板（已标注）**：每个面板请求一个 Python 子进程，冷导入
 `board.store → harness.events.SessionLog`。人类节奏的轮询下够用；真测出慢了再把
@@ -911,6 +910,66 @@ replan，因此偶发的边缘放置不会立刻让长任务重新规划。RoboC
 启用 `--frames` 时，runtime 会把当前任务渲染帧汇成
 `runs/<session>/rollout.mp4`。它是可丢弃的实时产物，不进入证据链，也不会影响任务判定；
 任务结束后可直接在执行图的取景窗点击“下载视频”。新任务开始时会替换上一条视频。
+
+#### 6.1.2 自然语言 → skill graph → 可执行组合（`plan_skill_task`）
+
+`sims/robocasa/skill_annotation_analysis/taxonomy/unified_skill_graph.json` 是 RoboCasa365 标注
+生成的**只读**统一技能图（生成器 `robocasa/scripts/build_skill_taxonomy.py`；本仓库不复制、不重扫、
+不改它）。五种边各有各的语义，绝不混用：`IS_A`（taxonomy 分类）、`HAS_STAGE`（observed skill 的
+有序阶段）、`REALIZES`（阶段对应的 canonical 接口）、`DECOMPOSES_TO`（组合技能的有序配方）、
+`OBSERVED_TRANSITION`（数据里观察到的相邻转移，**不是**因果）。图里节点的 `executable: true` 是
+标注者的本体断言，**不是** binding。
+
+`skill_library` 把这棵 IS_A 树与当前安装的 task catalogue 做只读 union，供 ph-station 的技能库标签页展示。图节点内嵌 HAS_STAGE / REALIZES、DECOMPOSES_TO、annotation label、数据集与计数证据；运行时技能另列 task、policy 与参数 schema。只有同名 catalogue 项算直接 binding；映射到同一 canonical 的 `pick` 等实现只列为候选，绝不冒充图节点已经可调度。
+
+一条闭环，全部复用既有部件：
+
+```
+instruction ──► harness/unified_skill_graph.py   检索相关 IS_A 子树（渐进披露：紧凑目录，不是整张图）
+            ──► plugins/task/skill_planning.py    路由到一个词表（channel）：
+                                                    · robocasa_skill_graph（图词表，plugins/skill_graph_robocasa 卡授权参数/符号 oracle）
+                                                    · 或某条由自然语言驱动的 task binding（pack_all_robocasa / basket_smoke_vlm / …）
+            ──► plugins/planner_vlm                DeepSeek 严格 JSON {goal,nodes[],verify[]}；坏 JSON 重问一次，再坏就是可拒绝的空图
+            ──► plugins/task/validate.validate_plan  runtime 派发前用的同一个闸，不是拷贝
+            ──► 服务端展开                          HAS_STAGE / DECOMPOSES_TO 递归，模型自己展开的阶段名当未知 skill 拒绝
+            ──► binding 检查                        叶子只有在某张卡的 task_bindings catalogue 里**同名**声明时才算 bound
+```
+
+四种 `status`：`executable`（每个叶子都 bound）、`planning_only`（符号链可以展示，`missing_bindings`
+逐条列出缺口——标注不是控制器）、`rejected`（`validation.message` 给出校验器原话；模型两次都给不出
+合法 JSON 也落这里）、`no_match`（没有词表命中，根本不调模型）。
+
+三张脸调的是同一个函数（`board/planning.py`）：MCP 工具 `skill_library` / `plan_skill_task` / `submit_skill_plan`、
+`storecli skill_library` / `plan_skill_task --instruction=… [--channel X]` / `submit_skill_plan --plan=<record>`、ph-station
+的 `POST /api/board/skillLibrary` / `planSkillTask` / `submitSkillPlan`（技能库与规划面板）。`skill_library` 与 `plan_skill_task` 都是读，不落盘。
+`submit_skill_plan` 是唯一的执行入口：从零重新核验 `composite_plan` 记录（channel 必须是当前装着的
+task binding、`validate_plan` 用该任务当下的 catalogue/planning_context 再过一遍、每个叶子 bound），
+不合格就拒绝、不落任何文件；合格就投一张**普通** task brief `{"kind":"task","task":…,"instruction":…,
+"seed":…}`——走 `submit_brief` 同一条原子落盘，返回 `brief_status` 句柄。常驻 runtime 从 brief 重新
+规划、重新校验，是唯一权威；预览链是参考，runtime 封存的计划才是证据。
+
+配置：图路径 `PH_UNIFIED_SKILL_GRAPH`（默认工作区相对路径 `../sims/robocasa/.../unified_skill_graph.json`）；
+planner 端点默认走 planner_vlm 自己的 DeepSeek 默认值（key 只经 `DEEPSEEK_API_KEY` 或控制台凭据库），
+`PH_PLANNER_BASE_URL` / `PH_PLANNER_MODEL` / `PH_PLANNER_API_KEY_ENV` 可把三张脸一起指到别的
+OpenAI 兼容服务（测试就是这样指到假服务器的）。
+
+验收两例（`tests/test_skill_planning.py`、`tests/test_planning_faces.py`、ph-station 的
+`ui-ph-panels/tests/plan-*.client.spec.tsx`，模型一律是假的）：
+
+- **Prepare a cup of coffee.** → 图词表；紧凑目录 9/56；链 `CoffeeSetupMug.pick → CoffeeSetupMug.place →
+  StartCoffeeMachine.execute → done`；规范展开 `CoffeeSetupMug → Pick → Place`、`StartCoffeeMachine →
+  PressButton`；`planning_only`，三个叶子全在 `missing_bindings`，提交被拒。
+- **Pack every food item into its assigned tupperware.** → `pack_all_robocasa` 词表；16 个叶子全部 bound
+  （`lunch_driver` 的 `nav_/grasp_/carry_/pack_{object}`）；`executable`；提交落 brief，`brief_status`
+  在有活 runtime 时 `queued`、没有时 `stalled`。真机/仿真里的实际执行仍是 runtime 的事：这条测试证明的是
+  到 inbox 为止的控制流，不是 policy 跑通。
+
+**仍没有真实 binding 的 RoboCasa 技能**：图里 40 个 observed skill 与 16 个 canonical skill 全部
+（CoffeeSetupMug、StartCoffeeMachine、Open*/Close*、PickPlace*、TurnOn*、NavigateKitchen、Pick、
+Place、PressButton……）。今天有 binding 的是静态技能库那套折叠后的族名（`navigate / grasp / carry /
+place`，以及 robosuite 侧仍在用的 `pick` / `place_on`），且各自只在绑定它的任务场景与物体清单内。
+要让一个图技能变成可执行，得有一张卡在 `[task_bindings.<task>]` 的 catalogue 里以**同名**声明它并给出
+policy——展示别名（`grasp`→`Pick`）不算。
 
 ### 6.2 把你的 VLA 放在 socket 后面
 

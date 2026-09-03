@@ -8,8 +8,10 @@ HTTP -- so the two surfaces return byte-identical dicts and rsi_board can be
 retired (rung 4) without losing a view.
 
 The only writes are the brief lifecycle -- submit_brief/run_task drop a brief,
-cancel_brief drops a stop marker -- and both land in LIVE intake dirs through the
-one shared atomic drop. Nothing here writes the hash chain: runs/ is sealed
+submit_skill_plan drops the task brief of a re-verified skill plan, cancel_brief
+drops a stop marker -- and all land in LIVE intake dirs through the one shared
+atomic drop. plan_skill_task (natural language -> validated skill chain) is a
+read: it writes nothing and executes nothing. Nothing here writes the hash chain: runs/ is sealed
 evidence and the resident runtime is its single writer.
 
 Name-addressed reads (store/heldout/session) go through board.store.safe_child,
@@ -31,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mcp.server import MCPServer
 
 from board import cards as bc
+from board import planning as bp
 from board import store as bs
 from board import vault as bv
 from harness.manifest import discover
@@ -51,15 +54,19 @@ class _Cfg:
     progress = runs.parent / "progress.md"
     session = _DEFAULT_SESSION
     inbox = runs / _DEFAULT_SESSION / "inbox"
+    #: Planner endpoint override for plan_skill_task (None = the planner card's
+    #: own default, DeepSeek; tests point it at a fake server). Secrets never.
+    planner_params = None
 
 
 def configure(runs, status=None, progress=None, inbox=None,
-              session=_DEFAULT_SESSION) -> None:
+              session=_DEFAULT_SESSION, planner_params=None) -> None:
     _Cfg.runs = Path(runs).resolve()
     _Cfg.status = Path(status).resolve() if status else _Cfg.runs.parent / "STATUS.md"
     _Cfg.progress = Path(progress).resolve() if progress else _Cfg.runs.parent / "progress.md"
     _Cfg.session = session
     _Cfg.inbox = Path(inbox).resolve() if inbox else _Cfg.runs / session / "inbox"
+    _Cfg.planner_params = planner_params
 
 
 def _route_inbox(session: str) -> Path | None:
@@ -660,6 +667,75 @@ def run_task(task: str, seed: int, max_replans: int | None = None,
     submitted = submit_brief(brief, session=session)
     out = bs.brief_status(inbox.parent, submitted["submitted"])
     return {**out, "warning": submitted["warning"]} if "warning" in submitted else out
+
+
+# --- skill-graph planning (READ-ONLY plan, one explicit submit) ---------------
+
+
+@mcp.tool()
+def skill_library() -> dict:
+    """Inspect the complete RoboCasa taxonomy and installed runtime skills.
+
+    Returns the IS_A tree, HAS_STAGE annotations, DECOMPOSES_TO recipes,
+    bounded dataset evidence, exact policy/driver binding state, and the runtime
+    catalogue union. Read-only: no model call and no execution.
+    """
+    return bp.skill_library()
+
+
+@mcp.tool()
+def plan_skill_task(instruction: str, session: str = bp.DEFAULT_SESSION,
+                    expand: bool = True, channel: str = "auto",
+                    seed: int = bp.SCRATCH_SEED) -> dict:
+    """Turn a natural-language task into a validated skill chain. PLANS ONLY --
+    it executes nothing and writes nothing.
+
+    Pipeline (board.planning -> plugins.task.skill_planning): retrieve the
+    relevant subtree of the RoboCasa unified skill graph (IS_A taxonomy,
+    progressive disclosure: a compact catalogue, never the whole graph) and the
+    instruction-driven task bindings; route to ONE channel; ask the planner card
+    (DeepSeek, strict JSON, one re-ask on bad JSON); gate the reply with the
+    runtime's own ``validate_plan``; expand composites server-side by
+    HAS_STAGE / DECOMPOSES_TO; check every leaf for a real policy/driver binding.
+
+    Returns ``{status, goal, channel, selected_catalogue, composite_plan,
+    expanded_plan, executable, missing_bindings, unbound_oracles, validation,
+    graph_provenance, retrieval}``. ``status`` is ``executable`` (every leaf
+    bound -- hand ``composite_plan`` to submit_skill_plan), ``planning_only``
+    (the chain is symbolic; ``missing_bindings`` names each unbound leaf -- a
+    RoboCasa annotation is NOT a controller), ``rejected`` (``validation.message``
+    says why; an unparseable model reply after the one retry lands here too), or
+    ``no_match`` (no installed vocabulary matches; the model was not called).
+
+    ``channel`` pins a vocabulary (``robocasa_skill_graph`` or a task name such
+    as ``pack_all_robocasa``) instead of routing by retrieval; ``expand=false``
+    skips the leaf expansion. ``session`` only labels where a later submit would
+    route. Live state, never sealed evidence."""
+    return bp.plan_skill_task(instruction, session, expand=expand, channel=channel,
+                              seed=seed, planner_params=_Cfg.planner_params)
+
+
+@mcp.tool()
+def submit_skill_plan(plan: dict, session: str = bp.DEFAULT_SESSION,
+                      seed: int = bp.SCRATCH_SEED, max_replans: int | None = None,
+                      max_actuations: int | None = None) -> dict:
+    """Execute a plan_skill_task ``composite_plan`` record -- the ONE explicit
+    submit; plan_skill_task itself never executes.
+
+    The record is re-verified from scratch (channel must be an installed task
+    binding, the plan must pass validate_plan against that task's current
+    catalogue, every leaf must be bound); a planning_only or rejected record is
+    refused with ``{"error", "status"}`` and nothing is written. An executable
+    record becomes the ordinary task brief ``{"kind":"task","task",
+    "instruction","seed"[,budgets]}`` dropped through the SAME atomic path
+    submit_brief uses, into ``session``'s inbox, and the reply is that brief's
+    brief_status handle (``state`` queued/running/stalled, ``brief_id``) --
+    poll brief_status, stop with cancel_brief. The resident runtime re-plans
+    and re-validates from the brief as the sole authority; the previewed chain
+    is advisory and the runtime's sealed plan is the evidence."""
+    return bp.submit_skill_plan(_Cfg.runs, plan, session, _Cfg.session, _Cfg.inbox,
+                                seed=seed, max_replans=max_replans,
+                                max_actuations=max_actuations)
 
 
 def main(argv=None) -> int:

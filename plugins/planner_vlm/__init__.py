@@ -86,7 +86,12 @@ or add a recovery node before it; repeating that graph ends the task.
 executors (a key), preferring the one with measured evidence (a non-null interval) and \
 the higher lower bound; otherwise omit executor. Never name a key the skill lacks.
 - rationale: one short paragraph on why the graph is legal (which facts / ensures \
-support each requires) and sufficient."""
+support each requires) and sufficient.
+- If taxonomy is present, a catalogue skill listed with stages or a decomposition is a \
+COMPOSITE: select it whole; the server expands it from the skill graph. Never hand-expand \
+it into stages, and never emit a stage name as a skill.
+- If binding_availability is present, prefer skills marked bound:true whenever they can \
+achieve the goal; a plan that uses an unbound skill is planning-only and will not run."""
 
 _DECOMPOSE_RULES = """You are a robot mission decomposer. Reply with ONE JSON object and \
 nothing else (no prose, no code fences), exactly the shape of the input's output_schema.
@@ -159,7 +164,7 @@ class VlmPlanner:
         proj = protocol.vlm_projection(
             records, brief.get("facts") or (), brief.get("objects") or (),
             done_ids, fault, show_evidence=bool(brief.get("show_evidence")))
-        return {
+        payload = {
             **proj,
             "goal": (brief.get("instruction")
                      or brief.get("default_instruction")
@@ -172,6 +177,13 @@ class VlmPlanner:
             "completed_nodes": [{"id": n["id"], "skill": n["skill"],
                                  "args": dict(n["args"])} for n in completed],
         }
+        # Skill-graph planning (plugins/task/skill_planning) threads two more
+        # server-authored context blocks; they are ABSENT from every other task
+        # brief, so those payloads stay byte-identical.
+        for key in ("taxonomy", "binding_availability"):
+            if brief.get(key):
+                payload[key] = brief[key]
+        return payload
 
     @staticmethod
     def _parse(text: str, key: str = "nodes") -> Mapping:
@@ -283,7 +295,10 @@ class VlmPlanner:
                           brief.get("instruction"),
                           brief.get("default_instruction"),
                           brief.get("planning_context"),
-                          brief.get("fault")], sort_keys=True, default=str)
+                          brief.get("fault"),
+                          # skill-graph briefs: a changed catalogue (retrieval or
+                          # graph file) is a fresh generation, same instruction
+                          brief.get("catalogue_digest")], sort_keys=True, default=str)
         frozen = _FROZEN.get(key)
         if frozen is None:
             plan, prompt_sha = self._generate(brief)

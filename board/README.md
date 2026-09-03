@@ -19,6 +19,13 @@ server below; the exported deliverable is a self-contained HTML report.
   `sessions`, `session`, `session_progress`, `runtime_status`, `runtime_events`,
   `runtime_frame`, `runtime_rollout`, `runtime_keyframes`, `runtime_keyframe`, `host_vitals`,
   `ledger`, `rounds`), each one call into `board.store` returning the same dicts,
+  `skill_library` (the full RoboCasa IS_A tree unioned with installed runtime
+  catalogues, including exact binding status and bounded annotation evidence),
+  `plan_skill_task` (natural language → skill-graph retrieval → DeepSeek strict
+  JSON → `validate_plan` → server-side expansion → binding check; a READ, it
+  executes nothing — `board/planning.py`, `docs/project-documentation.md` §6.1.2)
+  and its one explicit execute `submit_skill_plan` (re-verifies the record, then
+  drops an ordinary task brief through the same path as submit_brief),
   plus `submit_brief`, which drops a brief into the
   resident runtime's inbox (the runtime re-validates `_BRIEF_KEYS` server-side —
   the tool never becomes the authority). Three brief kinds: `task`, `campaign`,
@@ -39,6 +46,7 @@ server below; the exported deliverable is a self-contained HTML report.
   content-addressed. Owns the `safe_child` traversal guard both surfaces reuse.
 - `board/report.py` — pure HTML/SVG report builder + the `--out` headless entry.
 - `board/mcp_server.py` — the MCP passthrough over `board.store` + `submit_brief`.
+- `board/planning.py` — the skill-library read plus two skill-graph planning faces (`skill_library`, `plan_skill_task`, `submit_skill_plan`) over `plugins/task/skill_planning.py`, shared by MCP, CLI and the ph-station bridge.
 
 Reads are robust to partial/mid-write JSON: an unparseable artifact or a
 half-written index line is skipped and counted, so a campaign still writing
