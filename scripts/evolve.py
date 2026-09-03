@@ -5,8 +5,9 @@ mode only) as its own process group. One round: run the task's seed suite in-pro
 (the SAME ``_mount_plan``/``task_brief``/``workload.run`` a task brief uses), read
 each seed's first-death node + fault signature + per-node executor, let the LLM
 proposer (scripts/evolve_llm: the model reads the round's trails + log excerpt and
-answers a tunables / executor / code-as-policy card proposal; ``--proposer rules``
-or an invalid / unreachable answer falls back to) the built-in rules proposer pick ONE change -- the first-death node's executor (a bound policy whose
+answers a tunables / executor / code-as-policy card proposal, repairing a rejected one
+up to 3 times from the exact error -- a card is preflighted on the first seed alone;
+``--proposer rules`` or an unreachable endpoint falls back to) the built-in rules proposer pick ONE change -- the first-death node's executor (a bound policy whose
 ``evidence.by_executor`` beats the measured rate) else a one-dimensional +/-20%
 tunables perturbation of that node's driver (its card's mount params, applied via
 ``PH_MOUNT_PARAMS_OVERRIDE``) else nothing, with the honest reason -- re-run the
@@ -73,6 +74,8 @@ OVERRIDE_ENV = "PH_MOUNT_PARAMS_OVERRIDE"
 EXTRA_ENV = "PH_PLUGINS_EXTRA"
 _BASE_EXTRA = os.environ.get(EXTRA_ENV, "")
 PLANNER_REF = "scripts.evolve:planner_provider"
+#: Consecutive rounds with nothing tried that end the loop (status done, needs on the row).
+MAX_NONE = 2
 
 
 class EvolveStore:
@@ -240,6 +243,13 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
             "elapsed_s": round(time.time() - t_suite, 3),
             "logs": logs}   # the dying nodes' fault/verify rows: the LLM proposer's log excerpt
+
+
+def _merge(a: dict, b: dict) -> dict:
+    """Two ``run_suite`` results over disjoint seeds as one (the preflight seed + the rest)."""
+    per = {**a["seeds"], **b["seeds"]}
+    return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
+            "elapsed_s": round(a["elapsed_s"] + b["elapsed_s"], 3), "logs": a["logs"] + b["logs"]}
 
 
 def per_seed(suite: dict) -> list[dict]:
@@ -498,6 +508,8 @@ def main(argv=None) -> int:
         raise SystemExit(f"no task binding for {args.task!r}")
     records = hr._binding_records(binding)
     emb = hr.task_brief(args.task, binding)["embodiment"]
+    if keys := Counter(k for r in records.values() for k in r.bindings if emb not in r.bindings):
+        emb = keys.most_common(1)[0][0]   # robocasa: the records bind under the card's short name, not the env ref
 
     store = EvolveStore(args.session, args.task)
     doc = store.load() or {"task": args.task, "session": args.session.name,
@@ -505,10 +517,12 @@ def main(argv=None) -> int:
                            "rounds": [], "best": 0, "cursor": 0, "status": "running",
                            "applied": {"executors": {}, "tunables": {}}}
     seeds, arm, applied = doc["seeds"], doc["arm"], doc["applied"]
-    # A resume whose --rounds does not reach past the cursor means "N more rounds"
+    # ``rounds`` counts rounds with a REAL try (a rejected / empty round is not an idea
+    # tried); a resume whose --rounds does not reach past the tries so far means "N more"
     # (the console's 开始/继续 sends a task-only brief, so rounds is the default):
     # otherwise the round loop is empty and the brief "finishes" in a blink.
-    target = args.rounds if args.rounds > doc["cursor"] else doc["cursor"] + args.rounds
+    tries = sum(r["tried"]["kind"] != "none" for r in doc["rounds"])
+    target = args.rounds if args.rounds > tries else tries + args.rounds
     doc["status"] = "running"
     # live = where the loop is RIGHT NOW (rsi_run's ``live``): rewritten with the
     # doc at every phase/seed/node boundary. One writer, tmp+rename -> no race.
@@ -537,13 +551,26 @@ def main(argv=None) -> int:
             live["messages"] = (live["messages"] + [{"ts": time.time(), "text": msg}])[-20:]
         store.save(doc)
 
+    def preflight(tried: dict) -> None:
+        """A card's trial on the FIRST seed alone, before the suite: an exception inside
+        the executor comes back to the model as a repair, not a burned suite. The seed's
+        result is kept and merged into the retest (never run twice)."""
+        try:
+            pre["out"] = suite([int(seeds[0]), int(seeds[0])], apply(tried, applied))
+        finally:   # mount_params reads the accepted overlay again, not the trial's
+            os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
+
     tick()
-    base = None
-    for r in range(doc["cursor"] + 1, target + 1):
+    base, pre, r, nones = None, {}, doc["cursor"], 0
+    # stop: the target reached, or MAX_NONE rounds in a row with nothing tried (a stuck
+    # model cannot loop forever); a none whose ``needs`` is empty (nothing could unblock
+    # it: every seed succeeded) ends the loop at once.
+    while tries < target and nones < MAX_NONE:
         if args.cancel_marker is not None and args.cancel_marker.exists():
             doc["status"] = "cancelled"
             tick(phase="cancelled")
             return 3
+        r += 1
         t_round = time.time()
         tick(phase="baseline" if base is None else "propose", round=r, round_started_at=t_round, tried=None)
         sim_s0 = live["sim_s"]
@@ -552,6 +579,7 @@ def main(argv=None) -> int:
         os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])  # mount_params: the accepted overlay, not the last trial's
         prop = take_proposal(args.session, args.task, r)
         proposer, llm, tried = "inbox", None, None
+        pre.clear()
         if prop:
             tried = from_proposal(prop, before)
         elif args.proposer == "llm":
@@ -560,7 +588,7 @@ def main(argv=None) -> int:
                 ep = evolve_llm.endpoint()
                 tried, llm = evolve_llm.llm_propose(
                     ep, evolve_llm.rsi_projection(doc, before, records, emb, arm, binding, before.get("logs") or []),
-                    before, r, store.path.parent / "llm", session=args.session)
+                    before, r, store.path.parent / "llm", session=args.session, preflight=preflight)
             except Exception as exc:  # noqa: BLE001 -- no endpoint card / mount error: the rules take over
                 llm = {"model": None, "prompt_sha": None, "raw_sha": None, "summary": None,
                        "rationale": None, "reason": f"{type(exc).__name__}: {exc}"[:300]}
@@ -573,7 +601,10 @@ def main(argv=None) -> int:
             trial = apply(tried, applied)
             tick(phase="retest")
             try:
-                after = suite(seeds, trial)
+                after = pre.get("out")   # the preflight seed already ran under this trial
+                if after is None or int(seeds[1]) > int(seeds[0]):
+                    more = suite([int(seeds[0]) + (1 if after else 0), int(seeds[1])], trial)
+                    after = _merge(after, more) if after else more
             except Exception as exc:  # noqa: BLE001 -- the trial's failure is the round's finding
                 tried["detail"]["error"] = repr(exc)
                 after = before
@@ -624,6 +655,10 @@ def main(argv=None) -> int:
         doc["cursor"], doc["applied"] = r, applied
         tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
         base = kept
+        if tried["kind"] != "none":
+            tries, nones = tries + 1, 0
+        else:
+            nones = MAX_NONE if not tried["detail"].get("needs") else nones + 1
     doc["status"] = "done"
     tick(phase="done")
     return 0

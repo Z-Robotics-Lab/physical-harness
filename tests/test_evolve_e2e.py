@@ -21,6 +21,7 @@ from board import mcp_server as ms
 from board import store as bs
 from board import storecli
 from harness import fakes, media, protocol
+from harness.skill_executor import InprocExecutor
 from harness.skill_library import segment_specs
 
 EMB = "test_evolve_e2e:env_provider"
@@ -56,6 +57,7 @@ class _Handle(fakes._FakeEnvHandle):
         return dict(_OBS)
 
     def step(self, action):
+        assert len(action) == 1, f"expected a 1-dim action, got {action!r}"   # the shape gate a real env has
         self.t += 1
         return dict(_OBS), 0.0, False, {}
 
@@ -78,10 +80,12 @@ class _Env:
 
 
 class _Driver:
-    """Scripted episode driver: grab succeeds only under a non-scripted executor.
-    Each segment drives STEPS env steps (so the media recorder sees frames)."""
+    """Scripted episode driver: grab succeeds only under a non-scripted executor, whose
+    ``act`` then drives (the kitchen seam). Each segment drives STEPS env steps (so the
+    media recorder sees frames)."""
     STEPS = 8
     n = 0
+    _ex = None
 
     @property
     def exhausted(self):
@@ -95,10 +99,10 @@ class _Driver:
 
     def act(self, obs):
         self.n += 1
-        return (0.0,)
+        return self._ex.act(obs) if self._ex is not None else (0.0,)
 
     def enter_segment(self, env, spec, executor=None):
-        self.n = 0
+        self.n, self._ex = 0, executor
         self.ok = spec.task != "grab" or executor is not None
 
     def segment_success(self, env):
@@ -110,9 +114,14 @@ class _Policy:
         return _Driver()
 
 
+class _AltExecutor(InprocExecutor):
+    def act(self, obs):
+        return (0.0,)
+
+
 class _Alt:
     def make_driver(self, spec):
-        return object()
+        return _AltExecutor()
 
 
 class _Planner:
@@ -193,7 +202,7 @@ def two_rounds(runtime):
     t = threading.Thread(target=_poll, args=(stop, runtime.campaign, _LIVE), daemon=True)
     t.start()
     try:
-        return runtime.run({"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 2,
+        return runtime.run({"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 2, "proposer": "rules",
                             "arm": "auto"})
     finally:
         stop.set()
@@ -306,7 +315,7 @@ def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
 def test_cancel_lands_and_resubmit_resumes_from_cursor(runtime, two_rounds):
     before = len(bs.chain_rows(runtime.session))
     name = bs.submit_brief(runtime.runs, json.dumps(
-        {"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 4}), session=SESSION)["submitted"]
+        {"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 4, "proposer": "rules"}), session=SESSION)["submitted"]
     _wait(lambda: (runtime.session / "processing" / name).exists(), 30, "claim")
     assert bs.cancel_brief(runtime.session, name)["requested"] is True
     _wait(lambda: (runtime.session / "cancelled" / name).exists(), 60, "cancelled filing")
@@ -315,14 +324,14 @@ def test_cancel_lands_and_resubmit_resumes_from_cursor(runtime, two_rounds):
     doc = _doc(runtime)
     assert doc["status"] == "cancelled" and doc["cursor"] == 2 and len(doc["rounds"]) == 2
     # resume: same task again -> continues at round 3
-    _, rows = runtime.run({"kind": "evolve", "task": TASK, "rounds": 3})
+    _, rows = runtime.run({"kind": "evolve", "task": TASK, "rounds": 3, "proposer": "rules"})
     doc = _doc(runtime)
     assert doc["status"] == "done" and doc["cursor"] == 3
     assert [r["round"] for r in doc["rounds"]] == [1, 2, 3]
     assert doc["rounds"][2]["tried"]["kind"] == "none" and doc["rounds"][2]["best"] == 2
     # 开始/继续 on a finished campaign sends a task-only brief (rounds = default):
     # that means "N more rounds", never an empty loop that finishes in a blink.
-    runtime.run({"kind": "evolve", "task": TASK, "rounds": 1})
+    runtime.run({"kind": "evolve", "task": TASK, "rounds": 1, "proposer": "rules"})
     doc = json.loads((runtime.runs / SESSION / "campaigns" / f"evolve-{TASK}" / "campaign.json").read_text())
     assert doc["status"] == "done" and doc["cursor"] == 4 and [r["round"] for r in doc["rounds"]] == [1, 2, 3, 4]
     assert [s["round"] for s in _kinds(rows, "rsi_step")] == [3]

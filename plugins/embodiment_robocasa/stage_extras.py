@@ -197,13 +197,25 @@ class CompositeStageDriver:
         self._stage: Any = None
         self._cap: int = 0
         self.k: int = 0
+        #: an arm's executor bound for THIS segment by ``enter_segment(..., executor=)``
+        #: (same seam as KitchenThawDriver): inproc = a code-as-policy card that binds
+        #: the live env itself, raw obs in / 12-dim action out; else the pi0.5 contract.
+        self._executor: Any = None
+        self._native: bool = False
+        self._prompt: str = ""
 
     # --- obs-only PolicyDriver surface ---------------------------------------
     def observe_once(self, obs) -> np.ndarray:
         return np.zeros(D.ADIM)
 
     def act(self, obs) -> np.ndarray:
-        a = self._stage.act(self._env, obs)
+        if self._native:
+            a = self._executor.act(obs)
+        elif self._executor is not None:
+            from plugins.embodiment_robocasa import vla_io
+            a = vla_io.lerobot_to_env(self._executor.act(vla_io.build_obs(obs, self._prompt)))
+        else:
+            a = self._stage.act(self._env, obs)
         self.k += 1
         return a
 
@@ -232,7 +244,9 @@ class CompositeStageDriver:
         return self._identity
 
     # --- the episodic-segment protocol ----------------------------------------
-    def enter_segment(self, env, spec) -> None:
+    def enter_segment(self, env, spec, executor: Any = None) -> None:
+        """Arm ``spec.task``'s stage driver on the live env; ``executor`` (an arm's
+        policy driver) takes the actions over, the stage keeps done() and the cap."""
         task = getattr(spec, "task", None)
         if task not in self._stages:
             raise ValueError(
@@ -244,6 +258,13 @@ class CompositeStageDriver:
         self._stage = factory()
         self._cap = D.tunables()["segment_cap"] or cap
         self.k = 0
+        self._executor = executor
+        self._native = executor is not None and executor.handshake()["transport"] == "inproc"
+        if executor is not None:
+            executor.reset()  # a chunk computed for another situation is stale
+            self._prompt = str(env.get_ep_meta().get("lang") or task)
+        if self._native:  # the stage's target (make_recovery's seam) is the executor's too
+            executor.bind(env, target=getattr(self._stage, "obj_name", None))
 
     def segment_success(self, env) -> bool:
         return bool(self._stage.done(env))
