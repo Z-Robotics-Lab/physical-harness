@@ -117,10 +117,14 @@ _CAMPAIGN = {
              "node": "grasp", "started_at": 0.5, "round_started_at": 2.5, "phase_started_at": 2.5,
              "last_round_s": 1.0, "seed_started_at": 3.0, "per_seed_partial": [
                  {"seed": 1, "success": True, "first_death": None, "failure_mode": None,
-                  "elapsed_s": 0.4, "nodes": [{"id": "reach", "ok": True, "steps": 9, "failure_mode": None},
-                                              {"id": "grasp", "ok": True, "steps": 12, "failure_mode": None}]}],
-             "nodes": [{"id": "reach", "skill": "reach", "ok": True, "steps": None, "failure_mode": None},
-                       {"id": "grasp", "skill": "grasp", "ok": None, "steps": None, "failure_mode": None}],
+                  "elapsed_s": 0.4, "nodes": [{"id": "reach", "ok": True, "steps": 9, "failure_mode": None,
+                                               "after": [], "kind": "segment"},
+                                              {"id": "grasp", "ok": True, "steps": 12, "failure_mode": None,
+                                               "after": ["reach"], "kind": "segment"}]}],
+             "nodes": [{"id": "reach", "skill": "reach", "ok": True, "steps": None, "failure_mode": None,
+                        "after": [], "kind": "segment"},
+                       {"id": "grasp", "skill": "grasp", "ok": None, "steps": None, "failure_mode": None,
+                        "after": ["reach"], "kind": "segment"}],
              "tried": None, "message": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2",
              "messages": [{"ts": 3.0, "text": "第 3 轮 基线评测：种子 2 运行中 (grasp) 节点 1/2，2/2"}]},
 }

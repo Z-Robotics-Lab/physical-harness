@@ -111,7 +111,8 @@ def planner_provider(inner: str, inner_params=None, executors=None) -> _Forced:
 
 class _Tap(SessionLog):
     """The per-seed ledger as a node trail: ``task.plan`` sets ``nodes`` (plan order,
-    ``ok`` None; a replan resets all but the verified-ok nodes), each ``task.verify`` fills that node's ``ok`` (+
+    ``ok`` None, ``after``/``kind`` = the graph's edges and node kind, so the trail draws as
+    a graph; a replan resets all but the verified-ok nodes and rewrites every edge), each ``task.verify`` fills that node's ``ok`` (+
     ``steps`` / ``failure_mode`` when the row carries them). The node in flight is
     the first not yet verified ok -- an inference (no node-start row exists), not
     a reading. ``on_change(nodes)`` fires at every change."""
@@ -124,9 +125,10 @@ class _Tap(SessionLog):
         seq = super().append(kind, data)
         if kind == "task.plan" and data.get("graph"):
             done = {n["id"]: n for n in self.nodes if n["ok"] is True}   # a replan keeps verified nodes
-            self.nodes = [done.get(n["id"]) or {"id": n["id"], "skill": n.get("skill"), "ok": None,
-                                                "steps": None, "failure_mode": None}
-                          for n in data["graph"].get("nodes") or []]
+            self.nodes = [{**(done.get(n["id"]) or {"id": n["id"], "skill": n.get("skill"), "ok": None,
+                                                    "steps": None, "failure_mode": None}),
+                           "after": list(n.get("after") or []), "kind": n.get("kind", "manipulate")}   # validator's default
+                          for n in data["graph"].get("nodes") or []]   # edges always from the latest graph
         elif kind == "task.verify" and (hit := [n for n in self.nodes if n["id"] == data.get("node")]):
             hit[0].update(ok=all((data.get("results") or {}).values()), steps=data.get("steps"),
                           failure_mode=(data.get("diagnostics") or {}).get("failure_mode"))
@@ -200,7 +202,8 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
         per[str(seed)] = {
             "success": bool(out["success"]),
             "elapsed_s": round(time.time() - t_seed, 1),
-            "trail": [{k: n[k] for k in ("id", "ok", "steps", "failure_mode")} for n in log.nodes],
+            "trail": [{k: n[k] for k in ("id", "ok", "steps", "failure_mode", "after", "kind")}
+                      for n in log.nodes],
             "first_death": dead,
             "failure_mode": (nodes[dead].get("diagnostics") or {}).get("failure_mode") if dead else None,
             "fault": {k: faults[0].get(k) for k in ("kind", "node", "msg")} if faults else None,
@@ -221,7 +224,7 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
 def per_seed(suite: dict) -> list[dict]:
     """The operator-facing per-seed summary sealed with every round (rsi_step /
     campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha, elapsed_s,
-    nodes: [{id, ok, steps, failure_mode}]}]`` (the knobs the dying node ran under; the
+    nodes: [{id, ok, steps, failure_mode, after, kind}]}]`` (the knobs the dying node ran under; the
     node trail's final state) -- the seed detail that otherwise lives only in this process."""
     return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
              "elapsed_s": s.get("elapsed_s"), "nodes": s.get("trail") or [],

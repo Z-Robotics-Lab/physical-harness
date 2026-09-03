@@ -218,6 +218,9 @@ def test_live_block_shows_progress_during_the_run_and_done_at_the_end(runtime, t
     assert trails[0] == (None, None) and any(t[0] is True for t in trails), trails
     assert all(t in ((None, None), (True, None), (True, True), (True, False)) for t in trails), trails
     assert all(l["nodes"][0]["id"] == "reach-0" and l["nodes"][1]["skill"] == "grab" for l in _LIVE if l["nodes"])
+    # every trail node carries the plan graph's edges and kind: grab-0 comes after reach-0
+    assert all([(n["after"], n["kind"]) for n in l["nodes"]] == [([], "segment"), (["reach-0"], "segment")]
+               for l in _LIVE if l["nodes"])
     assert all(l["seed_started_at"] for l in base if l["seed"] is not None)
     assert [m["text"] for m in _LIVE[-1]["messages"]][-1] == "已完成 2 轮"
     assert len(_LIVE[-1]["messages"]) == 20 and all(m["ts"] for m in _LIVE[-1]["messages"])
@@ -258,8 +261,9 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
     assert isinstance(n_steps, int) and n_steps > 0
     kept = [{"seed": s, "success": True, "first_death": None, "failure_mode": None,
              "tunables_sha": None, "elapsed_s": pytest.approx(1, abs=30),
-             "nodes": [{"id": n, "ok": True, "steps": n_steps, "failure_mode": None}
-                       for n in ("reach-0", "grab-0")]} for s in (1, 2)]
+             "nodes": [{"id": n, "ok": True, "steps": n_steps, "failure_mode": None,
+                        "after": after, "kind": "segment"}
+                       for n, after in (("reach-0", []), ("grab-0", ["reach-0"]))]} for s in (1, 2)]
     assert [s["per_seed"] for s in steps] == [r1["per_seed"], r2["per_seed"]] == [kept, kept]
     # the baseline (0/2) rows carry the trail with the first-death node ok=False
     base_rows = [p for l in _LIVE for p in l["per_seed_partial"] if l["phase"] == "baseline"]
