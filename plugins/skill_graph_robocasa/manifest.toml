@@ -1,0 +1,14 @@
+# The RoboCasa skill-graph card: the planner-facing VOCABULARY for the
+# annotation-derived unified skill graph (sims/robocasa/skill_annotation_analysis/
+# taxonomy/unified_skill_graph.json, read through harness.unified_skill_graph).
+#
+# No [mounts] and no [task_bindings]: this card binds NOTHING executable. It
+# authors the argument schema a planner may pass to a canonical graph skill, the
+# symbolic verify predicate a graph-only plan names, and the display aliases from
+# the static skill library's names to the graph's canonical interfaces. The
+# folded base plan sha is untouched (nothing here enters discover()'s mount set).
+#
+# A plan built over this vocabulary is PLANNING-ONLY until some other card binds
+# the same skill NAME in a [task_bindings.<task>] catalogue -- see
+# plugins/task/skill_planning.py. An annotation is not a controller.
+needs_sim = false
