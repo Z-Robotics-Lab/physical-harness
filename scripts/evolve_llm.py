@@ -125,7 +125,8 @@ where the stage's constants and methods live; scripted_driver_source shows its c
 each under a "# module" line). Context lines must match the source exactly; the diff is \
 applied to a COPY of the module and the patched stage class drives the first-death node; \
 the installed card is untouched. A hunk that does not apply comes back to you.
-- none: nothing worth trying (say why in rationale).
+- none: only when nothing is left to try -- the brief's untried lists what remains; while it \
+is not empty, answer one of those instead (say why in rationale).
 summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try.
 Each seed's keyframes are the failure keyframes of its first-death node (first frame, \
 stall / last-progress frame, last frame; 128px); when attached as images they are labelled \
@@ -304,15 +305,17 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
 
 
 def brief(proj: dict) -> dict:
-    """Call 1's compact brief: the projection minus ``MATERIAL_KEYS``, the last 5 rounds
-    detailed and the older ones as counts, bounded to ``BRIEF_CHARS`` (log excerpt first,
-    then the detailed rounds' per_seed)."""
+    """Call 1's compact brief: the projection minus ``MATERIAL_KEYS``, plus ``untried`` (what
+    is left on the first-death node -- the only thing that makes a ``none`` acceptable), the
+    last 5 rounds detailed and the older ones as counts, bounded to ``BRIEF_CHARS`` (log
+    excerpt first, then the detailed rounds' per_seed)."""
     b = {k: v for k, v in proj.items() if k not in MATERIAL_KEYS}
     hist = b.get("history") or []
     old, b["history"] = hist[:-5], [dict(r) for r in hist[-5:]]
     if old:
         b["history_older"] = {"rounds": len(old), "published": sum(bool(r["published"]) for r in old),
                               "kinds": dict(Counter(r["tried"]["kind"] for r in old))}
+    b["untried"] = _untried(proj, _tried_pairs(proj))
     b["log_excerpt"] = list(b.get("log_excerpt") or [])
     size = lambda: len(json.dumps(b, sort_keys=True, default=str))
     while size() > BRIEF_CHARS and b["log_excerpt"]:
@@ -675,17 +678,38 @@ def _repeat_why(key: tuple, fd: dict, seen: set) -> str:
             + (f" (hinted for the failure mode: {json.dumps(hints, sort_keys=True)})" if hints else "") + ".")
 
 
-def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: set | None = None) -> dict:
+def _untried(proj: dict, seen: set) -> list[str]:
+    """What is still open on the first-death node: every (knob, direction) not in ``seen``,
+    every bound executor not tried, and a patch per module while no patch was tried. The
+    model may answer ``none`` only when this is empty."""
+    fd = proj.get("first_death") or {}
+    tun = fd.get("tunables") or {}
+    left = [f"tunables {k} {d}" for k in sorted(tun.get("values") or {}) for d in ("down", "up")
+            if ("tunables", k, d == "up") not in seen]
+    left += [f"executor {k}" for k in sorted(set(fd.get("executors") or {}) - {fd.get("executor")}
+                                             - {k[1] for k in seen if k[0] == "executor"})]
+    if not any(((r.get("tried") or {}).get("detail") or {}).get("module") for r in proj.get("history") or ()):
+        left += [f"patch {m}" for m in fd.get("modules") or ()]
+    return left
+
+
+def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: set | None = None,
+         last: bool = False) -> dict:
     """One parsed answer -> this round's ``tried``; raises ValueError with the exact
     rejection text (validation / a (knob, direction) or executor ``seen`` already /
-    doctor / dry instantiation / preflight seed). ``seen`` (default: the campaign's
-    history) grows with every answer, so a round cannot repeat itself either."""
+    doctor / dry instantiation / preflight seed / a ``none`` while ``_untried`` is not empty,
+    unless ``last``: the final attempt takes the none honestly). ``seen`` (default: the
+    campaign's history) grows with every answer, so a round cannot repeat itself either."""
     from scripts.evolve import _none, from_proposal   # noqa: PLC0415 -- evolve imports this module
     seen = _tried_pairs(proj) if seen is None else seen
     pay = ans["payload"]
     p = {"id": f"llm:round-{round_no}", "kind": ans["kind"], "payload": pay, "note": ans["rationale"]}
     fd = proj["first_death"]
     if ans["kind"] == "none":
+        if (left := _untried(proj, seen)) and not last:   # none is for a round with nothing left
+            raise ValueError("none is only allowed when nothing is left to try, and these are still "
+                             f"untried on {fd.get('node')}: {', '.join(left)}. Answer one of them, or "
+                             "say in rationale why each of them cannot help.")
         return _none(f"llm: {ans['rationale'] or 'nothing to try'}", fd.get("node"))
     if ans["kind"] == "tunables":
         if pay.get("ref") != fd.get("tunables", {}).get("ref") or not isinstance(pay.get("to"), (int, float)) \
@@ -774,7 +798,8 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
                     msgs.insert(1, mat)
                     msgs += [{"role": "assistant", "content": raw}, ask]
                 continue
-            tried = _try(ans, proj, before, round_no, preflight, seen)
+            tried = _try(ans, proj, before, round_no, preflight, seen,
+                         last=len(audit["attempts"]) == MAX_ATTEMPTS - 1)
             why = None
             break
         except Exception as exc:  # noqa: BLE001 -- bad JSON / payload / doctor / preflight: the model repairs

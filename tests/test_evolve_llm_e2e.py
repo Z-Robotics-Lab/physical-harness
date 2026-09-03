@@ -269,3 +269,50 @@ def test_an_executor_already_tried_is_rejected_this_round_too_and_the_round_ends
     assert "no node the suite ran ('nope')" in reasons[1]           # burns geometric for this round
     assert "geometric was already tried in this campaign (tried: alt, geometric)" in reasons[2]
     assert tried["kind"] == "none" and tried["detail"]["reason"].startswith("llm: 3 answers rejected")
+
+
+def test_none_is_rejected_while_something_is_untried_and_accepted_on_the_third_answer(tmp_path, monkeypatch):
+    """The live model answered none twice while the brief still offered untried knobs: none
+    now comes back with the concrete list, and an answer off that list is the round's try."""
+    from scripts import evolve, evolve_llm
+    monkeypatch.setattr(evolve, "mount_params", lambda ref: {"tunables": {"hover_dz": 0.10, "stall_k": 40}})
+    proj, before = _repeat_proj([])
+    proj["first_death"]["modules"] = ["plugins.x.mod"]
+    none = {"kind": "none", "payload": {}, "summary": "没辙了。", "rationale": "参数都不管用"}
+    ep = _fake(tmp_path, [none,
+                          {"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "stall_k"], "to": 28},
+                           "summary": "试 stall_k。", "rationale": "还没试过"}], name="none.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    why = audit["attempts"][0]["reason"]
+    assert "none is only allowed when nothing is left to try" in why and "untried on grab-0" in why
+    assert "tunables hover_dz down, tunables hover_dz up, tunables stall_k down, tunables stall_k up" in why
+    assert "executor alt, executor geometric, patch plugins.x.mod" in why
+    assert why in audit["messages"][3]["content"]        # the existing repair loop carries it back
+    assert audit["brief"]["untried"][0] == "tunables hover_dz down"   # call 1 saw the same list
+    assert (tried["kind"], tried["detail"]["path"]) == ("tunables", ["tunables", "stall_k"])
+    assert len(audit["attempts"]) == 1
+
+
+def test_none_is_accepted_at_once_when_nothing_is_left_to_try(tmp_path):
+    from scripts import evolve_llm
+    proj, before = _repeat_proj([])
+    proj["first_death"] |= {"executors": {"scripted": {}}, "tunables": {"ref": "r", "path": [], "values": {}}}
+    ep = _fake(tmp_path, [{"kind": "none", "payload": {}, "summary": "都过了。", "rationale": "无事可试"}],
+               name="empty.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    assert audit["brief"]["untried"] == [] and audit["attempts"] == [] and audit["calls"] == 1
+    assert tried["kind"] == "none" and tried["detail"]["reason"] == "llm: 无事可试"
+
+
+def test_three_nones_are_taken_honestly_on_the_third_attempt(tmp_path):
+    """The model insists: rejected twice (an explanation is still an answer), accepted third."""
+    from scripts import evolve_llm
+    proj, before = _repeat_proj([])
+    none = lambda why: {"kind": "none", "payload": {}, "summary": "没辙。", "rationale": why}
+    ep = _fake(tmp_path, [none("参数都不管用"), none("每个 knob 都解释过了"), none("坚持 none")], name="3none.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    assert len(audit["attempts"]) == 2 and audit["calls"] == 3
+    assert tried["kind"] == "none" and tried["detail"]["reason"] == "llm: 坚持 none"
