@@ -58,9 +58,10 @@ def test_fold_over_real_runs():
     # 25th: the pure-data benchmark_robocasa suite card; 26th: the planner_library
     # PlanRecord-first planner card, consumed by ref, no mounts; 27th: the
     # executor_mcp_segment MCP segment-executor card, provides executor
-    # mcp_segment, no mounts).
+    # mcp_segment, no mounts; 28th: skill_graph_robocasa, the PR #5 unified
+    # skill-graph card).
     assert {STACK, ADC, EB} <= set(by_id)
-    assert sum(n["kind"] == "package" for n in g["nodes"]) == 27
+    assert sum(n["kind"] == "package" for n in g["nodes"]) == 28
     assert sum(n["kind"] == "capability" for n in g["nodes"]) == 10
 
     stack = by_id[STACK]
