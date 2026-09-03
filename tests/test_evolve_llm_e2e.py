@@ -205,3 +205,67 @@ def test_real_deepseek_reads_the_recycle_cans_brief_within_budget(tmp_path):
     print("usage", row["usage"], "reason", row["reason"], "tried", tried and tried["kind"])
     assert row["usage"] and row["usage"]["prompt"] <= 13000, row
     assert row["reason"] is None and row["summary"]
+
+
+def _repeat_proj(history: list) -> tuple[dict, dict]:
+    """A round whose first death is grab-0: two knobs, three bound executors, and the
+    campaign history the model must not repeat."""
+    proj = {"first_death": {"node": "grab-0", "skill": "grab", "executor": "scripted",
+                            "executors": {"scripted": {}, "alt": {}, "geometric": {}},
+                            "tunables": {"ref": "r", "path": ["tunables"],
+                                         "values": {"hover_dz": 0.10, "stall_k": 40},
+                                         "hints": {"reach_stall": ["hover_dz"]}}},
+            "history": history, "this_round": {"per_seed": []}}
+    before = {"seeds": {"1": {"first_death": "grab-0",
+                              "nodes": {"grab-0": {"skill": "grab", "executor": "scripted"}}}}}
+    return proj, before
+
+
+def _fake(tmp_path, canned, name="canned.json"):
+    from scripts import evolve_llm
+    f = tmp_path / name
+    f.write_text(json.dumps(canned))
+    return evolve_llm.load_provider(evolve_llm.FAKE_REF, {"path": str(f)})
+
+
+def test_a_knob_and_direction_the_campaign_already_tried_is_sent_back_with_what_is_left(tmp_path, monkeypatch):
+    """drop_edge_margin 0.10->0.15 then 0.10->0.20 (same knob, same direction) is what the
+    live model did despite the prompt rule: the harness rejects it through the repair loop."""
+    from scripts import evolve, evolve_llm
+    monkeypatch.setattr(evolve, "mount_params", lambda ref: {"tunables": {"hover_dz": 0.10, "stall_k": 40}})
+    proj, before = _repeat_proj([{"round": 1, "tried": {"kind": "tunables", "node": "grab-0", "detail": {
+        "ref": "r", "path": ["tunables", "hover_dz"], "from": 0.10, "to": 0.15}}}])
+    ep = _fake(tmp_path, [
+        {"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "hover_dz"], "to": 0.20},
+         "summary": "再放大一点。", "rationale": "同一个 knob 同一个方向"},
+        {"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "stall_k"], "to": 28},
+         "summary": "换 stall_k。", "rationale": "换没试过的"}])
+    tried, row = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    why = audit["attempts"][0]["reason"]
+    assert "hover_dz up was already tried in this campaign (tried: hover_dz up)" in why
+    assert "untried instead: hover_dz down, stall_k down, stall_k up" in why
+    assert '"reach_stall": ["hover_dz"]' in why          # the hints say which knob to reach for
+    assert why in audit["messages"][3]["content"]        # verbatim, through the existing repair loop
+    # the second answer names a knob nothing tried: it is this round's try
+    assert (tried["kind"], tried["detail"]["path"], tried["detail"]["to"]) == ("tunables", ["tunables", "stall_k"], 28)
+    assert tried["detail"]["from"] == 40 and row["reason"] is None and len(audit["attempts"]) == 1
+
+
+def test_an_executor_already_tried_is_rejected_this_round_too_and_the_round_ends_honestly(tmp_path):
+    """An executor switch history already ran, then the same answer again after an unrelated
+    rejection: the round's own attempts count as tried, so three answers exhaust the round."""
+    from scripts import evolve_llm
+    proj, before = _repeat_proj([{"round": 1, "tried": {"kind": "card", "node": "grab-0",
+                                                        "detail": {"to": "alt", "ref": "c:provider"}}}])
+    ans = lambda to, node=None: {"kind": "executor", "payload": {"to": to, **({"node": node} if node else {})},
+                                 "summary": f"换 {to}。", "rationale": "-"}
+    ep = _fake(tmp_path, [ans("alt"), ans("geometric", "nope"), ans("geometric")], name="exec.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    reasons = [a["reason"] for a in audit["attempts"]]
+    assert "alt was already tried in this campaign (tried: alt)" in reasons[0]
+    assert "untried instead: geometric" in reasons[0]
+    assert "no node the suite ran ('nope')" in reasons[1]           # burns geometric for this round
+    assert "geometric was already tried in this campaign (tried: alt, geometric)" in reasons[2]
+    assert tried["kind"] == "none" and tried["detail"]["reason"].startswith("llm: 3 answers rejected")

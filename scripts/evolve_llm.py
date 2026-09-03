@@ -18,7 +18,8 @@ installed card is never touched) / none. Two calls at most: call 1 = the compact
 without its payload gets call 2, the static code material (``MATERIAL_KEYS``:
 contract, reference card, driver source, primitives) inserted FIRST after the system
 message (prefix cache) and the brief last. The answer is validated strictly (schema +
-``scripts.evolve.from_proposal``); a rejected answer (bad JSON, bad payload, doctor
+``scripts.evolve.from_proposal``); a rejected answer (bad JSON, bad payload, a (knob,
+direction) or executor this campaign already tried, doctor
 red, a contract miss at instantiation, an exception inside the executor on the
 preflight seed) goes back to the model VERBATIM as a follow-up message, up to
 ``MAX_ATTEMPTS`` rejections per round (``attempts`` / ``calls`` in the audit file); after that the round is
@@ -634,10 +635,53 @@ def _needs_material(ans: dict) -> bool:
     return ans["kind"] in _NEED and not all(k in ans["payload"] for k in _NEED[ans["kind"]])
 
 
-def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight) -> dict:
+_DIR = {True: "up", False: "down"}
+
+
+def _tried_pairs(proj: dict) -> set:
+    """What this campaign already tried on the first-death node, from the round rows:
+    ``("tunables", knob, went up?)`` (``detail.path/from/to`` on the same driver ref) and
+    ``("executor", key, None)`` (an executor / card switch). The model may not repeat one."""
+    fd = proj.get("first_death") or {}
+    ref, node, out = (fd.get("tunables") or {}).get("ref"), fd.get("node"), set()
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    for r in proj.get("history") or ():
+        t = r.get("tried") or {}
+        d = t.get("detail") or {}
+        if t.get("kind") == "tunables" and d.get("ref") == ref and d.get("path") \
+                and num(d.get("from")) and num(d.get("to")):
+            out.add(("tunables", d["path"][-1], d["to"] > d["from"]))
+        elif t.get("kind") in ("executor", "card") and t.get("node") == node and d.get("to"):
+            out.add(("executor", d["to"], None))
+    return out
+
+
+def _repeat_why(key: tuple, fd: dict, seen: set) -> str:
+    """The rejection text for a (knob, direction) / executor already in ``seen``: what the
+    campaign tried and what is still untried, so the answer has somewhere to go."""
+    show = lambda k: f"{k[1]} {_DIR[k[2]]}" if k[0] == "tunables" else str(k[1])
+    tun = fd.get("tunables") or {}
+    if key[0] == "tunables":
+        left = [f"{k} {d}" for k in sorted(tun.get("values") or {}) for d in ("down", "up")
+                if ("tunables", k, d == "up") not in seen]
+        hints = {m: ks for m, ks in (tun.get("hints") or {}).items() if ks}
+    else:
+        left = sorted(set(fd.get("executors") or {}) - {fd.get("executor")}
+                      - {k[1] for k in seen if k[0] == "executor"})
+        hints = {}
+    return (f"{show(key)} was already tried in this campaign (tried: "
+            f"{', '.join(sorted(show(k) for k in seen if k[0] == key[0]))}). Answer one still "
+            f"untried instead: {', '.join(left) or 'nothing left -- decide none'}"
+            + (f" (hinted for the failure mode: {json.dumps(hints, sort_keys=True)})" if hints else "") + ".")
+
+
+def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: set | None = None) -> dict:
     """One parsed answer -> this round's ``tried``; raises ValueError with the exact
-    rejection text (validation / doctor / dry instantiation / preflight seed)."""
+    rejection text (validation / a (knob, direction) or executor ``seen`` already /
+    doctor / dry instantiation / preflight seed). ``seen`` (default: the campaign's
+    history) grows with every answer, so a round cannot repeat itself either."""
     from scripts.evolve import _none, from_proposal   # noqa: PLC0415 -- evolve imports this module
+    seen = _tried_pairs(proj) if seen is None else seen
     pay = ans["payload"]
     p = {"id": f"llm:round-{round_no}", "kind": ans["kind"], "payload": pay, "note": ans["rationale"]}
     fd = proj["first_death"]
@@ -648,10 +692,19 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight) -> dict:
                 or not (isinstance(pay.get("path"), list) and all(isinstance(x, str) for x in pay["path"])):
             raise ValueError(f"tunables payload must be {{ref: {fd.get('tunables', {}).get('ref')!r}, "
                              f"path: [str], to: number}}, got {pay}")
+        cur = (fd.get("tunables", {}).get("values") or {}).get(pay["path"][-1] if pay["path"] else None)
+        if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+            key = ("tunables", pay["path"][-1], pay["to"] > cur)
+            if key in seen:
+                raise ValueError(_repeat_why(key, fd, seen))
+            seen.add(key)
         tried = from_proposal(p, before)
     elif ans["kind"] == "executor":
         if pay.get("to") not in fd.get("executors", {}) or pay.get("to") == fd.get("executor"):
             raise ValueError(f"executor.to must be another key of {sorted(fd.get('executors', {}))}, got {pay.get('to')!r}")
+        if ("executor", pay["to"], None) in seen:
+            raise ValueError(_repeat_why(("executor", pay["to"], None), fd, seen))
+        seen.add(("executor", pay["to"], None))
         tried = from_proposal(p, before)
     else:   # card / patch: materialised under the candidates root, then the same card path
         if why := (write_card(pay) if ans["kind"] == "card" else write_patch(pay, fd, round_no)):
@@ -681,6 +734,7 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
     image parts; the audit / prompt_sha keep their paths only, never the bytes."""
     from scripts.evolve import _none   # noqa: PLC0415 -- evolve imports this module
     b, materials = brief(proj), {k: proj[k] for k in MATERIAL_KEYS if k in proj}
+    seen = _tried_pairs(proj)   # grows with this round's answers: no repeat inside the round either
     text = ("Round input:\n" + json.dumps(b, sort_keys=True, default=str)
             + "\n\nOutput ONLY the proposal JSON object now.")
     images, audit_images = _image_parts(proj, session) if getattr(ep, "images", False) else ([], [])
@@ -720,7 +774,7 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
                     msgs.insert(1, mat)
                     msgs += [{"role": "assistant", "content": raw}, ask]
                 continue
-            tried = _try(ans, proj, before, round_no, preflight)
+            tried = _try(ans, proj, before, round_no, preflight, seen)
             why = None
             break
         except Exception as exc:  # noqa: BLE001 -- bad JSON / payload / doctor / preflight: the model repairs
