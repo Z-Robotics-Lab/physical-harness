@@ -48,7 +48,9 @@ CANNED = [
     _card("grab_llm", "llm", GOOD),                                  # round 2, attempt 2: repaired
     _card("grab_stub", "stub", BAD_SHAPE, node="grab-0"),            # round 3, attempt 1: raises on the seed
     "not json at all",                                               # round 3, attempt 2
-    _card("grab_stub", "stub", BAD_SHAPE, node="grab-0"),            # round 3, attempt 3
+    _card("grab_stub", "stub2", BAD_SHAPE, node="grab-0"),           # round 3, attempt 3 (a payload
+                                                                     # identical to attempt 1 would be
+                                                                     # a repeat, not a third attempt)
     {"kind": "none", "payload": {}, "summary": "没有值得试的。", "rationale": "两颗种子都过了"},   # round 4
 ]
 
@@ -103,8 +105,11 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     a2 = audits["round-2.json"]
     assert len(a2["attempts"]) == 1 and a2["attempts"][0]["reason"].startswith("doctor:ref 'grab_other:provider'")
     assert "must name a provider inside grab_llm" in a2["attempts"][0]["reason"]
-    assert a2["calls"] == 2 and a2["messages"][2]["role"] == "assistant" and a2["messages"][3]["role"] == "user"
-    assert a2["attempts"][0]["reason"] in a2["messages"][3]["content"] and a2["raw"] == json.dumps(CANNED[2])
+    # the card came WITH its payload on call 1 (no material asked for): the rejection carries
+    # the material the model wrote blind, inserted after the system message
+    assert a2["calls"] == 2 and [m["role"] for m in a2["messages"]] == ["system", "user", "user", "assistant", "user"]
+    assert a2["messages"][1]["content"].startswith("Materials (static):") and "executor_contract" in a2["messages"][1]["content"]
+    assert a2["attempts"][0]["reason"] in a2["messages"][4]["content"] and a2["raw"] == json.dumps(CANNED[2])
     assert doc["applied"]["cards"]["llm"]["ref"] == "grab_llm:provider"
     rec = json.loads((runtime.session / "skills" / f"{r2['tried']['detail']['digest']}.json").read_text())
     assert rec["bindings"][EMB]["policies"]["llm"]["ref"] == "grab_llm:provider"
@@ -203,7 +208,9 @@ def test_real_deepseek_reads_the_recycle_cans_brief_within_budget(tmp_path):
     finally:
         monkey.undo()
     print("usage", row["usage"], "reason", row["reason"], "tried", tried and tried["kind"])
-    assert row["usage"] and row["usage"]["prompt"] <= 13000, row
+    # call 1 is the brief alone (~5k); a card / patch decision adds call 2's materials,
+    # which now carry the full text of every editable module
+    assert row["usage"] and row["usage"]["prompt"] <= 30000, row
     assert row["reason"] is None and row["summary"]
 
 

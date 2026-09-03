@@ -17,7 +17,8 @@ root door (``InMemorySkillGraph.publish``, the same one scripts/publish_plans.py
 uses). Every round lands atomically in ``campaigns/evolve-<task>/campaign.json``
 (rounds[], best, cursor, status) with the kept suite's per-seed summary
 (``per_seed``) and, when nothing was tried, ``needs`` -- what would unblock the
-proposer; the runtime seals the ``rsi_step`` rows off it. The same file carries a
+proposer, plus ``stuck`` when the round's node has taken ``STUCK_ROUNDS`` rounds
+without improving (the brief then widens what may be patched there); the runtime seals the ``rsi_step`` rows off it. The same file carries a
 ``live`` block (phase / seed / node / partial per-seed, rewritten at every phase and
 seed boundary): live state the board's rsi_run shows, never sealed.
 With ``PH_RSI_FRAMES`` set (the runtime passes its frame.jpg when --frames is on)
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import os
 import sys
@@ -81,6 +83,11 @@ PLANNER_REF = "scripts.evolve:planner_provider"
 #: round, doubling up to NONE_BACKOFF_S[1], reset by the next real try.
 MAX_NONE = 2
 NONE_BACKOFF_S = (float(os.environ.get("PH_NONE_BACKOFF_S", "60")), 600.0)
+#: Rounds that targeted ONE node without improving before the round is called stuck
+#: (brief keys ``stuck_rounds`` / ``stuck``): the brief then says parameter tweaks on
+#: that node are exhausted and widens the patchable modules to the card's whole stage
+#: pipeline (``pipeline_modules``), so the model changes code or targets another node.
+STUCK_ROUNDS = 6
 
 
 class EvolveStore:
@@ -285,9 +292,63 @@ def _binding(c: dict) -> dict:
             "transport": c.get("transport", "inproc")}
 
 
-def _first_death(before: dict):
-    deaths = Counter(s["first_death"] for s in before["seeds"].values() if s["first_death"])
-    return deaths.most_common(1)[0][0] if deaths else None
+def death_nodes(before: dict, history: list | None = None) -> list[dict]:
+    """The DISTINCT first-death nodes of this round's seeds, LEAST-RECENTLY-TARGETED
+    first: ``[{node, seeds, failure_mode, rounds_targeted, last_round}]``. Rotating over
+    this list is what keeps one node (the commonest death) from eating the campaign --
+    with 4243 dying at drop-can1 and 4244 at nav-can1, nav-can1 never got a round.
+    Ties (nothing targeted yet) go to the node the most seeds die at, then by name."""
+    rows: dict[str, dict] = {}
+    for seed, s in sorted(before["seeds"].items(), key=lambda kv: int(kv[0])):
+        if not s.get("first_death"):
+            continue
+        d = rows.setdefault(s["first_death"], {"node": s["first_death"], "seeds": [],
+                                               "failure_mode": None, "rounds_targeted": 0,
+                                               "last_round": 0})
+        d["seeds"].append(int(seed))
+        d["failure_mode"] = d["failure_mode"] or s.get("failure_mode")
+    for r in history or ():
+        d = rows.get((r.get("tried") or {}).get("node"))
+        if d is not None:
+            d["rounds_targeted"] += 1
+            d["last_round"] = max(d["last_round"], int(r.get("round") or 0))
+    return sorted(rows.values(), key=lambda d: (d["last_round"], -len(d["seeds"]), d["node"]))
+
+
+def _first_death(before: dict, history: list | None = None):
+    """The node this round targets: the least-recently-targeted first-death node
+    (without ``history``, the commonest -- the fallback for a call that has none)."""
+    nodes = death_nodes(before, history)
+    return nodes[0]["node"] if nodes else None
+
+
+def stuck_on(node, history: list | None, rounds: int | None = None) -> dict | None:
+    """``{node, rounds}`` when the last ``rounds`` (``STUCK_ROUNDS``) rounds that targeted
+    ``node`` all failed to improve -- rounds on other nodes do not break the streak, or
+    rotation would hide it. None while the streak is shorter."""
+    streak = 0
+    for r in reversed(history or ()):
+        if (r.get("tried") or {}).get("node") != node:
+            continue
+        if r.get("published") or r.get("outcome") == "improved":
+            break
+        streak += 1
+    return {"node": node, "rounds": streak} if node and streak >= (rounds or STUCK_ROUNDS) else None
+
+
+def pipeline_modules(ref: str, binding: dict) -> list[str]:
+    """The other modules of the card's stage pipeline, patchable once a node is stuck:
+    the stage-table module (``ref``), its package's shared ``drivers``, and the mission
+    planner. Only the importable ones (``write_patch`` imports what it is given)."""
+    out = set()
+    mod = ref.partition(":")[0]
+    for m in {mod, f"{mod.rpartition('.')[0]}.drivers", (binding.get("planner") or "").partition(":")[0]}:
+        try:
+            if m and importlib.util.find_spec(m):
+                out.add(m)
+        except (ImportError, ValueError):
+            pass
+    return sorted(out)
 
 
 def take_proposal(session: Path, task: str, round_no: int) -> dict | None:
@@ -345,10 +406,9 @@ def propose(before: dict, records: dict, emb: str, arm: str, binding: dict,
     first-death node (won or lost) is not proposed again, nor is a (knob,
     direction) tunables step. Knobs the card's ``[tunable_hints]`` ties to the
     node's failure_mode go first, each in both directions (-30% then +30%)."""
-    deaths = Counter(s["first_death"] for s in before["seeds"].values() if s["first_death"])
-    if not deaths:
+    node = _first_death(before, history)   # rotates over the distinct first-death nodes
+    if node is None:
         return _none("no first death: every seed succeeded", needs=())
-    node = deaths.most_common(1)[0][0]
     modes = Counter(s.get("failure_mode") for s in before["seeds"].values()
                     if s["first_death"] == node and s.get("failure_mode"))
     mode = modes.most_common(1)[0][0] if modes else None
@@ -665,6 +725,8 @@ def main(argv=None) -> int:
         doc["best"] = max(int(doc["best"] or 0), kept["count"])
         doc["rounds"].append({
             "round": r, "tried": tried, "before": before["count"], "after": after["count"],
+            # the streak the brief widened on (None while the node is not stuck)
+            "stuck": stuck_on(tried["node"], doc["rounds"]),
             "best": doc["best"], "suite_sha": after["sha"], "published": published,
             # the hypothesis tree: which accepted state this try grew from, and how it went
             "parent": max((x["round"] for x in doc["rounds"] if x["published"]), default=0),

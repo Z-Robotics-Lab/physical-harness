@@ -9,15 +9,18 @@ bounded excerpt of the dying node's log rows -- and answers ONE proposal in the
 proposals-inbox shape (``PROPOSAL_SCHEMA``): tunables / executor / card
 (code-as-policy: the model writes a candidate card under ``plugins/candidates/<name>/``,
 checked by scripts/plugin_doctor, dry-instantiated (``dry_run``) and preflighted on
-ONE seed before it is mounted) / patch (a unified diff against ONE module of the
-first-death skill's card -- ``first_death.modules`` -- applied by ``apply_diff`` to a
-COPY under the candidate dir, whose generated card (``PATCH_CARD``) instantiates the
+ONE seed before it is mounted) / patch (exact-snippet ``edits`` -- ``{old, new}`` where
+``old`` is copied verbatim out of the numbered module text in ``module_sources`` and must
+occur exactly once -- against ONE module of the first-death skill's card
+(``first_death.modules``), applied by ``apply_edits`` (a unified ``diff`` through
+``apply_diff`` is still accepted) to a COPY under the candidate dir, whose generated card (``PATCH_CARD``) instantiates the
 patched stage class as an InprocExecutor through the same native-executor seam; the
 installed card is never touched) / none. Two calls at most: call 1 = the compact brief
-(``brief``, <= ``BRIEF_CHARS``) asking for a decision; only a card / patch decision
-without its payload gets call 2, the static code material (``MATERIAL_KEYS``:
-contract, reference card, driver source, primitives) inserted FIRST after the system
-message (prefix cache) and the brief last. The answer is validated strictly (schema +
+(``brief``, <= ``BRIEF_CHARS``) asking for a decision; a card / patch decision gets call 2,
+the static code material (``MATERIAL_KEYS``: contract, reference card, driver source,
+``module_sources``, primitives) inserted FIRST after the system message (prefix cache) and
+the brief last -- when it answered without a payload, and equally when it wrote one BLIND
+and was rejected (the live model invents a snippet on call 1: the material rides its repair). The answer is validated strictly (schema +
 ``scripts.evolve.from_proposal``); a rejected answer (bad JSON, bad payload, a (knob,
 direction) or executor this campaign already tried, doctor
 red, a contract miss at instantiation, an exception inside the executor on the
@@ -35,6 +38,7 @@ in the chain, and the api key never leaves the endpoint's Authorization header.
 
 from __future__ import annotations
 
+import ast
 import base64
 import importlib
 import inspect
@@ -62,9 +66,13 @@ CANDIDATES_ROOT = Path(os.environ.get("PH_CANDIDATES_ROOT") or PLUGINS_ROOT / "c
 #: The worked example every card answer is shown in full (the one real candidate).
 REFERENCE_CARD = PLUGINS_ROOT / "candidates" / "grasp_geometric_robocasa"
 MAX_LOG_LINES = 60
-#: Prompt bound: ~12k DeepSeek tokens (measured ~2.5 chars/token on this JSON); over
-#: it the log excerpt goes first, then older rounds' per-seed detail, then the driver source.
-PROMPT_CHARS = 30_000
+#: Prompt bound of call 2 (~24k DeepSeek tokens, measured ~2.5 chars/token on this JSON);
+#: over it the log excerpt goes first, then older rounds' per-seed detail, then the driver
+#: source. The editable modules carry their own bound (``MODULE_CHARS``).
+PROMPT_CHARS = 60_000
+#: Bound of ``module_sources`` (the full text of every module a patch may edit): the stage's
+#: own module is always whole, the others fall back to class/function extracts past it.
+MODULE_CHARS = 30_000
 #: Call-1 bound (the decision brief): the log excerpt goes first, then per_seed of
 #: the 5 detailed rounds (older rounds are counts only, always).
 BRIEF_CHARS = 12_000
@@ -72,7 +80,7 @@ BRIEF_CHARS = 12_000
 MAX_ATTEMPTS = 3
 #: The static code material of call 2 (a card / patch decision without its payload).
 MATERIAL_KEYS = ("card_template", "executor_contract", "reference_card", "scripted_driver_source",
-                 "primitives", "obs_keys", "action_order")
+                 "module_sources", "primitives", "obs_keys", "action_order")
 KINDS = ("tunables", "executor", "card", "patch", "none")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 
@@ -95,7 +103,11 @@ PAYLOAD_BY_KIND = {
              "node": "<optional node id>"},
     "patch": {"name": "<[a-z][a-z0-9_]{2,40}: the candidate dir name>",
               "module": "<one of first_death.modules>",
-              "diff": "<unified diff against that module's source: @@ hunks with exact context lines>",
+              "edits": [{"old": "<a snippet COPIED VERBATIM out of module_sources[module] with the "
+                                "'NNNN| ' line-number prefix stripped; it must occur EXACTLY ONCE "
+                                "in that module, whitespace and indentation included>",
+                         "new": "<what replaces it, same indentation>"}],
+              "diff": "<optional alternative to edits: a unified diff, @@ hunks with exact context lines>",
               "to": "<new executor key>", "node": "<optional node id>"},
     "none": {},
 }
@@ -107,7 +119,8 @@ ONE change to try next; the harness re-runs the same seeds and keeps the change 
 more seeds succeed. Reply with ONE JSON object and nothing else, exactly the shape of \
 output_schema: exactly ONE of the payload shapes, matching decision. A card or patch \
 decision may come without payload: you then get the code material (contract, reference \
-card, the dying stage's driver source, primitives) and write the full payload.
+card, the dying stage's driver source, the FULL numbered text of every editable module in \
+module_sources, primitives) and write the full payload.
 Allowed answers:
 - tunables: one knob of tunables.values (ref = tunables.ref, path = tunables.path + [knob]) \
 to a new numeric value; do not repeat a (knob, direction) already in history.
@@ -120,11 +133,18 @@ scripted_driver_source does wrong for this failure_mode; reach the embodiment's 
 through primitives BY REF (importlib), never by import; read poses off env, not obs. \
 It is doctor-checked, instantiated and run on one seed before the suite; any error \
 comes back to you verbatim -- fix exactly that and answer again.
-- patch: a unified diff against ONE module of first_death.modules (the scripted driver \
-where the stage's constants and methods live; scripted_driver_source shows its classes, \
-each under a "# module" line). Context lines must match the source exactly; the diff is \
-applied to a COPY of the module and the patched stage class drives the first-death node; \
-the installed card is untouched. A hunk that does not apply comes back to you.
+- patch: edit ONE module of first_death.modules (the scripted driver where the stage's \
+constants and methods live). Answer patch with NO payload the first time: the module text \
+comes back in the next message, and you cannot copy a snippet you have not been shown. \
+module_sources[module] is that module's REAL text, every line \
+prefixed "NNNN| " (the 1-based line number); first_death.modules_full says which modules are \
+whole and which are class/function extracts. Each edit is {old, new}: `old` is a snippet you \
+COPY VERBATIM out of that text with the "NNNN| " prefix stripped -- never retyped, never \
+invented, never from a file you were not given -- and it must occur EXACTLY ONCE in the \
+module (add surrounding lines to make it unique). The edits are applied to a COPY of the \
+module and the patched stage class drives the first-death node; the installed card is \
+untouched. An `old` found 0 or >1 times comes back to you with the count and the \
+neighbourhood. (A unified diff in "diff" instead of "edits" still works.)
 - none: only when nothing is left to try -- the brief's untried lists what remains; while it \
 is not empty, answer one of those instead (say why in rationale).
 summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try.
@@ -161,6 +181,60 @@ def _stage_source(ref: str, task: str | None) -> str | None:
     """Those classes' source, each under a ``# module <name>`` line (a patch names one)."""
     cls = _stage_classes(ref, task)
     return "\n".join(f"# module {c.__module__}\n" + inspect.getsource(c) for c in cls) if cls else None
+
+
+def _numbered(lines: list[str], a: int = 0, b: int | None = None) -> str:
+    """Source lines as ``NNNN| <text>`` with 1-based numbers (an edit strips the prefix)."""
+    b = len(lines) if b is None else min(b, len(lines))
+    return "\n".join(f"{i + 1:4d}| {lines[i]}" for i in range(max(0, a), b))
+
+
+def _extract(src: str, budget: int) -> str:
+    """A module past the budget: its top-level class / def blocks, whole ones only while
+    ``budget`` lasts, numbered as in the file (so a snippet copied out of it is still
+    exact) and every skipped stretch marked."""
+    lines = src.split("\n")
+    try:
+        body = ast.parse(src).body
+    except SyntaxError:
+        return _numbered(lines)
+    out, pos, left = [], 0, budget
+    for n in body:
+        if not isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        block = _numbered(lines, n.lineno - 1, n.end_lineno)
+        if len(block) > left:
+            continue
+        left -= len(block)
+        if n.lineno - 1 > pos:
+            out.append(f"# ... lines {pos + 1}-{n.lineno - 1} omitted (extract)")
+        out.append(block)
+        pos = n.end_lineno
+    if pos < len(lines):
+        out.append(f"# ... lines {pos + 1}-{len(lines)} omitted (extract)")
+    return "\n".join(out)
+
+
+def _module_sources(modules, stage_module: str | None) -> tuple[dict, list[str]]:
+    """``{module: "# file: <path>\\n<numbered source>"}`` for every module a patch may edit
+    (``first_death.modules``) -- what an exact-snippet edit must be copied out of. The stage's
+    own module is always whole; the others are whole while ``MODULE_CHARS`` lasts and
+    class/function extracts after. Returns (sources, the modules given in full)."""
+    out, full, left, repo = {}, [], MODULE_CHARS, PLUGINS_ROOT.parent
+    for i, m in enumerate(sorted(modules, key=lambda m: m != stage_module)):
+        try:
+            f = Path(inspect.getsourcefile(importlib.import_module(m)))
+            text = f.read_text()
+        except Exception:  # noqa: BLE001 -- a module with no file on disk is simply not offered
+            continue
+        body = _numbered(text.split("\n"))
+        if i and len(body) > left:
+            body = _extract(text, max(left, 4_000))
+        else:
+            full.append(m)
+        out[m] = f"# file: {f.relative_to(repo) if f.is_relative_to(repo) else f}\n{body}"
+        left -= len(body)
+    return out, full
 
 
 def _primitives(ref: str) -> dict:
@@ -224,12 +298,13 @@ def _contract(pkg: str, skill: str | None, emb: str | None) -> dict:
     }
 
 
-def _driver(before: dict, records: dict, emb: str, arm: str, binding: dict) -> dict:
-    """First-death node -> {node, skill, executor, rate, executors, tunables, embodiment,
-    task}: what the rules proposer reads, projected for the model (same rearm /
-    mount_params seams). ``embodiment`` is the key the skill's record binds under."""
+def _driver(before: dict, records: dict, emb: str, arm: str, binding: dict, node=None) -> dict:
+    """The round's TARGET node (``node``, else the commonest first death) -> {node, skill,
+    executor, rate, executors, tunables, embodiment, task}: what the rules proposer reads,
+    projected for the model (same rearm / mount_params seams). ``embodiment`` is the key
+    the skill's record binds under."""
     from scripts.evolve import _first_death   # noqa: PLC0415 -- evolve imports this module
-    node = _first_death(before)
+    node = node or _first_death(before)
     if node is None:
         return {"node": None}
     runs = [s["nodes"][node] for s in before["seeds"].values() if node in s["nodes"]]
@@ -259,9 +334,12 @@ def _driver(before: dict, records: dict, emb: str, arm: str, binding: dict) -> d
 def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, binding: dict,
                    log_excerpt: list[str]) -> dict:
     """The compact brief the model reads for the round after ``doc['cursor']``."""
+    from scripts import evolve   # noqa: PLC0415 -- evolve imports this module
     rounds = doc.get("rounds") or []
-    fd = _driver(before, records, emb, arm, binding)
+    deaths = evolve.death_nodes(before, rounds)
+    fd = _driver(before, records, emb, arm, binding, evolve._first_death(before, rounds))
     ref = fd.get("tunables", {}).get("ref") or binding["policy"]
+    cls = _stage_classes(ref, fd.get("task"))
     proj = {
         "task": doc["task"], "embodiment": emb, "seeds": doc["seeds"], "arm": arm,
         "round": int(doc.get("cursor") or 0) + 1,
@@ -291,7 +369,31 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
         "scripted_driver_source": _stage_source(ref, fd.get("task")),
         **_primitives(ref),
         "output_schema": PROPOSAL_SCHEMA, "payload_by_kind": PAYLOAD_BY_KIND,
+        # every node the seeds die at, least-recently-targeted first: the round targets
+        # the head of this list so no node (drop-can1 for 66 rounds) eats the campaign
+        "death_nodes": [{k: d[k] for k in ("node", "seeds", "failure_mode", "rounds_targeted")}
+                        for d in deaths],
+        "target": {"node": fd.get("node"),
+                   "why": ("the least-recently-targeted of the seeds' first-death nodes"
+                           if len(deaths) > 1 else "the only first-death node")},
+        "stuck_rounds": evolve.STUCK_ROUNDS,
     }
+    if st := evolve.stuck_on(fd.get("node"), rounds):
+        # stuck: name the whole stage pipeline as patchable and say the knobs are spent
+        fd["modules"] = sorted({*(fd.get("modules") or []),
+                                *evolve.pipeline_modules(ref, binding)})
+        proj["stuck"] = {
+            **st, "modules": fd["modules"],
+            "tried": sorted(f"tunables {k[1]} {_DIR[k[2]]}" if k[0] == "tunables" else f"executor {k[1]}"
+                            for k in _tried_pairs(proj)),
+            "note": (f"{st['rounds']} rounds targeted {st['node']} with no improvement: parameter "
+                     "tweaks on it are exhausted (stuck.tried lists them). Change CODE -- a patch "
+                     "may name ANY module in stuck.modules now, not only the stage class's own -- "
+                     "or target another node of death_nodes.")}
+    # last, so a stuck round's widened fd["modules"] gets its source too: the real text of
+    # every module a patch may edit, numbered, what an exact-snippet `old` is copied out of
+    proj["module_sources"], fd["modules_full"] = _module_sources(
+        fd.get("modules") or [], cls[-1].__module__ if cls else None)
     size = lambda: len(json.dumps(proj, sort_keys=True, default=str))
     if size() > PROMPT_CHARS:
         proj["log_excerpt"] = proj["log_excerpt"][-MAX_LOG_LINES // 4:]
@@ -316,6 +418,9 @@ def brief(proj: dict) -> dict:
         b["history_older"] = {"rounds": len(old), "published": sum(bool(r["published"]) for r in old),
                               "kinds": dict(Counter(r["tried"]["kind"] for r in old))}
     b["untried"] = _untried(proj, _tried_pairs(proj))
+    fd = proj.get("first_death") or {}
+    if (fd.get("tunables") or {}).get("values") and not any(u.startswith("tunables ") for u in b["untried"]):
+        b["exhausted"] = f"tunables exhausted for {fd.get('node')}: every (knob, direction) is tried"
     b["log_excerpt"] = list(b.get("log_excerpt") or [])
     size = lambda: len(json.dumps(b, sort_keys=True, default=str))
     while size() > BRIEF_CHARS and b["log_excerpt"]:
@@ -455,6 +560,40 @@ def apply_diff(text: str, diff: str) -> str:
     return "\n".join(out + src[pos:])
 
 
+def _near(src: str, old: str, limit: int = 2) -> str:
+    """Where the first line of ``old`` that occurs at all does occur: ±6 numbered lines
+    around up to ``limit`` such places, so the model can copy the real snippet."""
+    lines, hits = src.split("\n"), []
+    for want in (l.strip() for l in old.split("\n") if l.strip()):
+        hits = [i for i, l in enumerate(lines) if l.strip() == want][:limit]
+        if hits:
+            break
+    if not hits:
+        return ("that snippet's first line occurs nowhere in the module -- copy `old` verbatim "
+                "out of module_sources[module] (strip the 'NNNN| ' prefix); do not retype it.")
+    return "\n\n".join("the module around line %d reads:\n%s" % (i + 1, _numbered(lines, i - 6, i + 7))
+                       for i in hits)
+
+
+def apply_edits(text: str, edits: list) -> str:
+    """Exact-snippet edits: each ``{old, new}``'s ``old`` must occur EXACTLY ONCE in the
+    source (whitespace included) and is replaced by ``new``. ``ValueError`` names the edit,
+    the occurrence count and the neighbourhood the snippet nearly matched."""
+    for i, e in enumerate(edits, 1):
+        old, new = (e or {}).get("old"), (e or {}).get("new")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise ValueError(f"edit {i} must be {{old: <non-empty snippet>, new: <replacement>}}, got {e!r}")
+        n = text.count(old)
+        if n != 1:
+            raise ValueError(f"edit {i}: `old` occurs {n} times in the module, it must occur exactly once"
+                             + (" (add the surrounding lines to make it unique)" if n > 1 else "")
+                             + f". You sent:\n{old}\n" + _near(text, old))
+        if old == new:
+            raise ValueError(f"edit {i} changes nothing: old == new")
+        text = text.replace(old, new, 1)
+    return text
+
+
 _IMPORT = re.compile(r"^from (plugins\.[\w.]+) import ([\w ,]+)$", re.M)
 
 
@@ -488,6 +627,9 @@ TASK = "{task}"
 
 
 def _repoint(cls, mod):
+    # ponytail: a REBUILT subclass keeps the old __class__ cell, so a zero-arg super() inside
+    # it raises TypeError (stage_extras.NavToObjectDriver over a patched drivers.py); rebind
+    # those cells with types.FunctionType when a patch needs a base module's subclasses.
     if cls is object:
         return cls
     if cls.__module__ == PATCHED:
@@ -551,25 +693,31 @@ def provider(**params):
 
 def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_ROOT) -> str | None:
     """Materialise a ``patch`` answer: the module copied under ``root/<name>/`` with the
-    diff applied (imports of the installed package rewritten by ref), the card's
+    ``edits`` (or ``diff``) applied (imports of the installed package rewritten by ref), the card's
     ``[tunables]`` copied when the module reads its own manifest, a manifest binding
     ``<to>`` and the generated ``PATCH_CARD``; then the card checks (``_doctor``). Fills
     ``pay['path'] / ['ref']``. Returns the refusal (``patch:...`` / ``doctor:...``) or None."""
-    name, module, diff, to = pay.get("name"), pay.get("module"), pay.get("diff"), pay.get("to")
+    name, module, to = pay.get("name"), pay.get("module"), pay.get("to")
+    edits, diff = pay.get("edits"), pay.get("diff")
     if not isinstance(name, str) or not _NAME.match(name):
         return f"patch:candidate name {name!r} is not [a-z][a-z0-9_]{{2,40}}"
     if module not in (fd.get("modules") or []):
         return f"patch:module must be one of first_death.modules {fd.get('modules')}, got {module!r}"
-    if not isinstance(diff, str) or not diff.strip() or not isinstance(to, str) or not to:
-        return "patch:payload needs a non-empty unified diff and an executor key `to`"
+    if not isinstance(to, str) or not to:
+        return "patch:payload needs an executor key `to`"
+    if edits is not None and not (isinstance(edits, list) and edits):
+        return "patch:`edits` must be a non-empty list of {old, new} objects"
+    if edits is None and not (isinstance(diff, str) and diff.strip()):
+        return ("patch:payload needs `edits`: [{old, new}] -- each `old` copied verbatim out of "
+                "module_sources[module] (a unified `diff` is still accepted instead)")
     mod = importlib.import_module(module)
     src = Path(inspect.getsourcefile(mod)).read_text()
     try:
-        new = apply_diff(src, diff)
+        new = apply_edits(src, edits) if edits is not None else apply_diff(src, diff)
     except ValueError as exc:
         return f"patch:{exc}"
     if new == src:
-        return "patch:the diff changes nothing"
+        return "patch:the patch changes nothing"
     pkg, base = _card_package(root), module.rpartition(".")[2]
     ref = f"{pkg}{name}:provider"
     d = root / name
@@ -628,14 +776,21 @@ def _image_parts(proj: dict, session: Path | None) -> tuple[list[dict], list[dic
 
 REPAIR = ("Your proposal was rejected:\n{why}\n\nFix exactly that and output ONLY the corrected "
           "proposal JSON object (same output_schema, same decision unless the error says otherwise).")
+#: A payload byte-identical to one already rejected this round: cheaper to say so than to
+#: re-run the whole rejection, and the second one ends the round honestly.
+REPEAT = ("你重复了上一条被拒的回答（{why}）。必须换一个做法：改别的地方，或改用 {kinds}。\n"
+          "只输出修改后的 proposal JSON 对象。")
+REPEATED = "llm: repeated the same rejected answer"
 ASK = ("You decided {kind}: {rationale}\n\nThe code material is above (materials). Output ONLY the full "
        "proposal JSON object now: decision {kind} with its complete payload (payload_by_kind.{kind}).")
-_NEED = {"card": ("name", "files"), "patch": ("name", "module", "diff")}
+_NEED = {"card": ("name", "files"), "patch": ("name", "module")}
 
 
 def _needs_material(ans: dict) -> bool:
     """A card / patch decision whose payload is not there yet (call 2 supplies the material)."""
-    return ans["kind"] in _NEED and not all(k in ans["payload"] for k in _NEED[ans["kind"]])
+    pay = ans["payload"]
+    return ans["kind"] in _NEED and (not all(k in pay for k in _NEED[ans["kind"]])
+                                     or (ans["kind"] == "patch" and not (pay.get("edits") or pay.get("diff"))))
 
 
 _DIR = {True: "up", False: "down"}
@@ -703,6 +858,7 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
     from scripts.evolve import _none, from_proposal   # noqa: PLC0415 -- evolve imports this module
     seen = _tried_pairs(proj) if seen is None else seen
     pay = ans["payload"]
+    pay.setdefault("node", (proj.get("first_death") or {}).get("node"))   # the round's target; the model may override
     p = {"id": f"llm:round-{round_no}", "kind": ans["kind"], "payload": pay, "note": ans["rationale"]}
     fd = proj["first_death"]
     if ans["kind"] == "none":
@@ -735,7 +891,8 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
             raise ValueError(why)
         tried = from_proposal({**p, "kind": "card", "payload": {k: pay[k] for k in ("path", "to", "ref", "params", "node") if k in pay}}, before)
         if ans["kind"] == "patch" and tried["kind"] == "card":
-            tried["detail"].update(module=pay["module"], diff=pay["diff"])
+            tried["detail"].update(module=pay["module"],
+                                   **{k: pay[k] for k in ("edits", "diff") if k in pay})
     if tried["kind"] == "none":
         raise ValueError(tried["detail"]["reason"])   # from_proposal's refusal: the answer was unusable
     if ans["kind"] in ("card", "patch") and preflight is not None:
@@ -753,7 +910,9 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
     exact error goes back as the next user message; after the last attempt ``tried`` is an
     honest none carrying that reason (``needs`` lists it). ``tried`` is None only when the
     endpoint itself failed (the row's ``reason`` says why; the caller falls back to the
-    rules). ``preflight(tried)`` (a card's one-seed trial) may raise to reject. When the
+    rules). An answer whose payload is byte-identical to one already rejected this round
+    costs no attempt: it gets ``REPEAT`` back once, and a second identical answer ends the
+    round with an honest none (``REPEATED``). ``preflight(tried)`` (a card's one-seed trial) may raise to reject. When the
     endpoint accepts images (``ep.images``) the seeds' failure keyframes ride along as
     image parts; the audit / prompt_sha keep their paths only, never the bytes."""
     from scripts.evolve import _none   # noqa: PLC0415 -- evolve imports this module
@@ -769,8 +928,12 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
     row = {"model": getattr(ep, "identity", repr(ep)), "prompt_sha": content_id(audit_msgs),
            "raw_sha": None, "summary": None, "rationale": None, "reason": None, "usage": None}
     audit = {"round": round_no, **row, "messages": audit_msgs, "brief": b, "materials": materials,
-             "calls": 0, "raw": None, "attempts": []}
+             "calls": 0, "raw": None, "attempts": [], "repeats": []}
+    # the static code material (call 2): inserted after the system message -- once, whether
+    # the model asked for it by answering without a payload or wrote one blind and was rejected
+    mat = {"role": "user", "content": "Materials (static):\n" + json.dumps(materials, sort_keys=True, default=str)}
     tried, why, path, step2 = None, None, None, False
+    rejected = {}   # payload sha -> its rejection; a byte-identical answer is not a new attempt
     while len(audit["attempts"]) < MAX_ATTEMPTS:
         try:
             # ponytail: DeepSeek reasoning tokens count against max_tokens and left content
@@ -786,17 +949,33 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
             row["usage"] = {k: (row["usage"] or {}).get(k, 0) + (usage.get(k) or 0) for k in ("prompt", "completion")}
         audit["raw"] = raw
         row["raw_sha"] = audit["raw_sha"] = sha_json(raw)
-        ans = None
+        ans, dig = None, None
         try:
             ans = _parse(raw)
             row["summary"], row["rationale"] = ans["summary"], ans["rationale"]
             if not step2 and _needs_material(ans):   # call 2: the static material FIRST (prefix
                 step2 = True                           # cache), the brief last, then the ask
-                mat = {"role": "user", "content": "Materials (static):\n" + json.dumps(materials, sort_keys=True, default=str)}
                 ask = {"role": "user", "content": ASK.format(kind=ans["kind"], rationale=ans["rationale"][:1000])}
                 for msgs in (messages, audit_msgs):
                     msgs.insert(1, mat)
                     msgs += [{"role": "assistant", "content": raw}, ask]
+                continue
+            # ``none`` carries no payload, so it can only look identical: its own ladder
+            # (_untried, then the honest take on the last attempt) already bounds it.
+            dig = sha_json([ans["kind"], ans["payload"]]) if ans["kind"] != "none" else None
+            if dig in rejected:   # the same payload, byte for byte
+                audit["repeats"].append({"raw": raw, "reason": rejected[dig]})
+                if len(audit["repeats"]) > 1:   # twice: stop paying for it, end the round honestly
+                    tried = _none(REPEATED, proj["first_death"].get("node"), needs=("proposal", REPEATED))
+                    if path:
+                        tried["detail"]["path"] = path
+                    why = None
+                    break
+                nag = {"role": "user", "content": REPEAT.format(
+                    why=rejected[dig].strip().splitlines()[0][:300],
+                    kinds="/".join(k for k in KINDS if k != ans["kind"]))}
+                messages += [{"role": "assistant", "content": raw}, nag]
+                audit_msgs += [{"role": "assistant", "content": raw}, nag]
                 continue
             tried = _try(ans, proj, before, round_no, preflight, seen,
                          last=len(audit["attempts"]) == MAX_ATTEMPTS - 1)
@@ -805,8 +984,14 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
         except Exception as exc:  # noqa: BLE001 -- bad JSON / payload / doctor / preflight: the model repairs
             why = str(exc) if str(exc).startswith(("doctor:", "preflight:", "patch:")) else f"{type(exc).__name__}: {exc}"
             path = (ans or {}).get("payload", {}).get("path") or path   # the files stay for the operator
+            if dig is not None:   # hashed BEFORE write_card/write_patch grew the payload
+                rejected[dig] = why
             audit["attempts"].append({"raw": raw, "usage": usage, "reason": why})
             repair = {"role": "user", "content": REPAIR.format(why=why[:4000])}
+            if not step2 and (ans or {}).get("kind") in _NEED:
+                step2 = True   # it wrote the payload blind (an invented diff/snippet): the
+                for msgs in (messages, audit_msgs):   # real source it must copy from, now
+                    msgs.insert(1, mat)
             messages += [{"role": "assistant", "content": raw}, repair]
             audit_msgs += [{"role": "assistant", "content": raw}, repair]
     if tried is None and why is not None:   # every attempt rejected: an honest none, not a rules try

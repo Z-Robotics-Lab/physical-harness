@@ -27,21 +27,26 @@ _CARD = _E2E_CARD.replace("test_evolve_e2e:env_provider", EMB).replace("test_evo
     .replace("[task_bindings.e2e_evolve]", "[task_bindings.e2e_patch]")
 TASK = "e2e_patch"
 
-BAD = "--- a/patch_stage.py\n+++ b/patch_stage.py\n@@ -30,2 +30,2 @@\n class GrabStage:\n-    STOP = 0.99\n+    STOP = 0.4\n"
-GOOD = "--- a/patch_stage.py\n+++ b/patch_stage.py\n@@ -1,3 +1,3 @@\n     # the loaded standoff: the scripted value never closes the grab\n-    STOP = 0.65\n+    STOP = 0.4\n"
+TWICE = [{"old": "        return (0.0,)", "new": "        return (0.1,)"}]        # 2 places
+ABSENT = [{"old": "class GrabStage:\n    STOP = 0.99", "new": "class GrabStage:\n    STOP = 0.4"}]
+GOOD = [{"old": "    # the loaded standoff: the scripted value never closes the grab\n    STOP = 0.65",
+         "new": "    # patched by the proposer\n    STOP = 0.4"}]
+DIFF = "--- a/patch_stage.py\n+++ b/patch_stage.py\n@@ -1,3 +1,3 @@\n class GrabStage:\n-    STOP = 0.99\n+    STOP = 0.4\n"
 
 
-def _patch(diff):
-    return {"kind": "patch", "payload": {"name": "grab_stop", "module": MODULE, "to": "patched", "diff": diff},
-            "summary": "把 STOP 调小。", "rationale": "the standoff never closes"}
+def _patch(edits=None, diff=None):
+    pay = {"name": "grab_stop", "module": MODULE, "to": "patched"}
+    pay["edits" if edits is not None else "diff"] = edits if edits is not None else diff
+    return {"kind": "patch", "payload": pay, "summary": "把 STOP 调小。", "rationale": "the standoff never closes"}
 
 
 CANNED = [
     {"decision": "tunables", "payload": {"ref": "fakes.patch_stage:policy_provider", "path": ["stall_k"], "to": 28},
      "summary": "两颗种子都死在 grab-0。", "rationale": "先试 knob"},          # round 1: one call
     {"decision": "patch", "summary": "STOP 太大。", "rationale": "grab never closes"},   # round 2 call 1: no payload
-    _patch(BAD),                                                                       # call 2: does not apply
-    _patch(GOOD),                                                                      # repair: applies, wins
+    _patch(TWICE),                                                                     # call 2: `old` twice
+    _patch(ABSENT),                                                                    # repair 1: `old` absent
+    _patch(GOOD),                                                                      # repair 2: applies, wins
 ]
 
 
@@ -60,7 +65,7 @@ def runtime(tmp_path_factory):
         rt.stop()
 
 
-def test_patch_lands_on_a_copy_after_two_steps_and_a_repair(runtime):
+def test_patch_edits_land_on_a_copy_after_two_steps_and_two_repairs(runtime):
     doc = json.loads(runtime.campaign.read_text())
     r1, r2 = doc["rounds"][:2]
     audits = {p.name: json.loads(p.read_text()) for p in (runtime.campaign.parent / "llm").glob("round-*.json")}
@@ -70,18 +75,27 @@ def test_patch_lands_on_a_copy_after_two_steps_and_a_repair(runtime):
     assert a1["calls"] == 1 and a1["attempts"] == [] and [m["role"] for m in a1["messages"]] == ["system", "user"]
     assert "Materials" not in a1["messages"][1]["content"] and "reference_card" not in a1["brief"]
     assert a1["brief"]["first_death"]["modules"] == [MODULE] and "scripted_driver_source" in a1["materials"]
-    # round 2: call 2 = [system, materials, brief, assistant, ask]; the bad hunk's exact text went back
-    assert a2["calls"] == 3 and len(a2["attempts"]) == 1
+    # the materials carry the module's REAL text, numbered, no elision: an edit is copied out of it
+    src = a1["materials"]["module_sources"][MODULE]
+    assert src.startswith("# file: ") and "patch_stage.py\n" in src.split("\n")[0] + "\n"
+    assert "  36|     STOP = 0.65" in src and a1["brief"]["first_death"]["modules_full"] == [MODULE]
+    assert INSTALLED.read_text().split("\n")[35] == "    STOP = 0.65"     # 1-based line 36, verbatim
+    # round 2: call 2 = [system, materials, brief, assistant, ask]; both bad edits' text went back
+    assert a2["calls"] == 4 and len(a2["attempts"]) == 2
     roles = [m["role"] for m in a2["messages"]]
-    assert roles == ["system", "user", "user", "assistant", "user", "assistant", "user"]
+    assert roles == ["system", "user", "user", "assistant", "user"] + ["assistant", "user"] * 2
     assert a2["messages"][1]["content"].startswith("Materials (static):") and "executor_contract" in a2["messages"][1]["content"]
     assert a2["messages"][2]["content"].startswith("Round input:") and a2["messages"][4]["content"].startswith("You decided patch")
-    assert a2["attempts"][0]["reason"].startswith("patch:hunk 1 does not apply") and "STOP = 0.99" in a2["attempts"][0]["reason"]
-    assert "nearest matching line" in a2["attempts"][0]["reason"] and "class GrabStage" in a2["attempts"][0]["reason"]
-    assert a2["attempts"][0]["reason"] in a2["messages"][6]["content"]
-    # the repaired diff: applied on a copy, the installed file untouched, the card bound and published
+    twice, absent = (a["reason"] for a in a2["attempts"])
+    assert twice.startswith("patch:edit 1: `old` occurs 2 times in the module, it must occur exactly once")
+    assert "add the surrounding lines" in twice and "the module around line 28 reads:" in twice
+    assert "  28|         return (0.0,)" in twice and "  44|         return (0.0,)" in twice
+    assert absent.startswith("patch:edit 1: `old` occurs 0 times in the module")
+    assert "the module around line 34 reads:" in absent and "  34| class GrabStage:" in absent
+    assert twice in a2["messages"][6]["content"] and absent in a2["messages"][8]["content"]
+    # the repaired edits: applied on a copy, the installed file untouched, the card bound and published
     assert (r2["proposer"], r2["tried"]["kind"], r2["tried"]["detail"]["to"]) == ("llm", "card", "patched")
-    assert r2["tried"]["detail"]["module"] == MODULE and r2["tried"]["detail"]["diff"] == GOOD
+    assert r2["tried"]["detail"]["module"] == MODULE and r2["tried"]["detail"]["edits"] == GOOD
     assert (r2["before"], r2["after"], r2["published"]) == (0, 2, True)
     assert runtime.sha[0] == runtime.sha[1] and "STOP = 0.65" in INSTALLED.read_text()
     cand = runtime.runs / "candidates" / "grab_stop"
@@ -122,3 +136,70 @@ def test_recycle_cans_call_1_brief_stays_under_12k_chars():
     assert b["first_death"]["modules"] == ["plugins.embodiment_robocasa.recycle_driver", "plugins.embodiment_robocasa.stage_extras"]
     assert not any(k in b for k in evolve_llm.MATERIAL_KEYS) and b["payload_by_kind"]["patch"]["module"]
     assert proj["scripted_driver_source"].startswith("# module plugins.embodiment_robocasa.stage_extras\n")
+
+
+def test_apply_edits_replaces_an_exact_snippet_and_names_the_count_and_the_neighbourhood():
+    src = "a\nb\n\nc = 1\nd\nc = 1\n"
+    assert evolve_llm.apply_edits(src, [{"old": "b\n\nc = 1", "new": "b\n\nc = 2"}]) == "a\nb\n\nc = 2\nd\nc = 1\n"
+    with pytest.raises(ValueError, match="edit 1: `old` occurs 2 times"):
+        evolve_llm.apply_edits(src, [{"old": "c = 1", "new": "c = 2"}])
+    with pytest.raises(ValueError, match="edit 2: `old` occurs 0 times"):
+        evolve_llm.apply_edits(src, [{"old": "a\n", "new": "z\n"}, {"old": "q = 9", "new": "q = 8"}])
+    with pytest.raises(ValueError, match="changes nothing"):
+        evolve_llm.apply_edits(src, [{"old": "d", "new": "d"}])
+    with pytest.raises(ValueError, match="edit 1 must be"):
+        evolve_llm.apply_edits(src, [{"new": "d"}])
+    # the 0-count message points at the first line that DOES occur, with real line numbers
+    why = str(pytest.raises(ValueError, evolve_llm.apply_edits, src, [{"old": "b\nq = 9", "new": "x"}]).value)
+    assert "the module around line 2 reads:" in why and "   2| b" in why
+
+
+def test_a_unified_diff_is_still_accepted_where_edits_would_go(tmp_path):
+    pay = {"name": "grab_diff", "module": MODULE, "to": "patched", "diff": DIFF}
+    why = evolve_llm.write_patch(pay, {"modules": [MODULE]}, 0, tmp_path)
+    assert why.startswith("patch:hunk 1 does not apply")      # the diff path, not the edits path
+    assert evolve_llm.write_patch({**pay, "diff": None}, {"modules": [MODULE]}, 0, tmp_path) \
+        .startswith("patch:payload needs `edits`")
+
+
+def test_an_answer_identical_to_a_rejected_one_costs_no_attempt_and_ends_the_round(tmp_path):
+    """Rounds 56-66 of the live campaign: the model resent the byte-identical answer three
+    times, each one paying for a full attempt. Now the repeat is named, then taken as none."""
+    from test_evolve_llm_e2e import _fake, _repeat_proj
+
+    proj, before = _repeat_proj([{"round": 1, "tried": {"kind": "tunables", "node": "grab-0", "detail": {
+        "ref": "r", "path": ["tunables", "hover_dz"], "from": 0.10, "to": 0.15}}}])
+    same = {"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "hover_dz"], "to": 0.20},
+            "summary": "再放大一点。", "rationale": "同一个方向"}
+    ep = _fake(tmp_path, [same, same, same], name="same.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    assert len(audit["attempts"]) == 1 and len(audit["repeats"]) == 2   # the repeats are not attempts
+    assert audit["repeats"][0]["reason"] == audit["attempts"][0]["reason"]
+    nag = audit["messages"][5]["content"]
+    assert nag.startswith("你重复了上一条被拒的回答（ValueError: hover_dz up was already tried")
+    assert "必须换一个做法：改别的地方，或改用 executor/card/patch/none。" in nag
+    assert tried["kind"] == "none" and tried["detail"]["reason"] == "llm: repeated the same rejected answer"
+    assert tried["detail"]["needs"] == ["proposal", "llm: repeated the same rejected answer"]
+
+
+def test_a_patch_written_blind_is_rejected_with_the_module_text_attached(tmp_path):
+    """Round 70 of the live campaign: the model answered patch WITH a payload on call 1, so
+    the two-step never fired and it was told to copy `old` out of material it had never been
+    shown. The material now rides that rejection."""
+    from test_evolve_llm_e2e import _fake, _repeat_proj
+
+    proj, before = _repeat_proj([])
+    proj["first_death"]["modules"] = [MODULE]
+    proj["module_sources"], _ = evolve_llm._module_sources([MODULE], MODULE)
+    ep = _fake(tmp_path, [_patch(ABSENT),   # invented, with no source in front of it
+                          {"kind": "executor", "payload": {"to": "alt"}, "summary": "换。", "rationale": "-"}],
+               name="blind.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    assert audit["calls"] == 2 and len(audit["attempts"]) == 1
+    assert [m["role"] for m in audit["messages"]] == ["system", "user", "user", "assistant", "user"]
+    mat = audit["messages"][1]["content"]           # inserted after the system message, once
+    assert mat.startswith("Materials (static):") and "  36|     STOP = 0.65" in mat
+    assert audit["messages"][4]["content"].startswith("Your proposal was rejected")
+    assert tried["kind"] == "executor" and tried["detail"]["to"] == "alt"
