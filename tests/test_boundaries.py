@@ -40,13 +40,22 @@ def _imports(path: pathlib.Path):
             yield node.lineno, node.module or ""
 
 
+#: The card tree these boundary rules govern: everything under plugins/ EXCEPT
+#: plugins/candidates/, which an evolve round writes at runtime (a model-written
+#: candidate is a run artefact, gitignored, and never mounted without the doctor).
+#: A candidate that breaks a boundary must fail its doctor, not this suite.
+def _cards():
+    return [p for p in pathlib.Path("plugins").rglob("*.py")
+            if "candidates" not in p.relative_to("plugins").parts[:1]]
+
+
 def _plugin_package(path: pathlib.Path) -> str:
     rel = path.relative_to("plugins")
     return rel.parts[0].removesuffix(".py")
 
 
 def test_plugins_never_import_each_other():
-    for path in pathlib.Path("plugins").rglob("*.py"):
+    for path in _cards():
         own = _plugin_package(path)
         for lineno, name in _imports(path):
             if name.startswith("plugins"):
@@ -57,7 +66,7 @@ def test_plugins_never_import_each_other():
 
 
 def test_plugins_import_only_the_allowed_surfaces():
-    for path in pathlib.Path("plugins").rglob("*.py"):
+    for path in _cards():
         for lineno, name in _imports(path):
             root = name.split(".")[0]
             assert _allowed(root, _plugin_package(path)) or root.startswith("plugins"), \

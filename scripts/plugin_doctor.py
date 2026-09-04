@@ -34,6 +34,7 @@ providers (and any simulator they drag in) are imported lazily via
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
 import sys
@@ -226,6 +227,25 @@ class Report:
         self.results.append(Result(tier, name, status, detail))
 
 
+#: What a card may import outright: the harness surface, the stdlib and numpy.
+#: Anything else belongs in the manifest's third_party or is reached by ref.
+_CARD_IMPORTS = frozenset(sys.stdlib_module_names) | {"harness", "governor", "numpy", "plugins"}
+
+
+def _module_imports(path: Path):
+    """(lineno, dotted module) for every import in one file; unparsable -> none."""
+    try:
+        tree = ast.parse(path.read_text())
+    except (OSError, SyntaxError):
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                yield node.lineno, a.name
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            yield node.lineno, node.module or ""
+
+
 def check(plugin_dir: str | Path) -> Report:
     """Run Tier A + Tier B on one card directory and return its report card."""
     plugin_dir = Path(plugin_dir)
@@ -237,6 +257,27 @@ def check(plugin_dir: str | Path) -> Report:
                 "actuation:real refused -- a real actuator needs a separate "
                 "authenticated runtime, never the sim doctor")
         return rep
+
+    # The boundary rule tests/test_boundaries.py pins for INSTALLED cards is
+    # checked here for every card, because a model-written candidate is not in
+    # that suite's scan: a card may import harness/, its own package and its
+    # declared third_party, never a sibling card.
+    # A patch card is a COPY of one module of ``patched_from``: it may import that
+    # package and inherits its third_party (evolve_llm.write_patch writes both).
+    kin = {plugin_dir.name, data.get("patched_from", "")}
+    for path in sorted(plugin_dir.rglob("*.py")):
+        for lineno, mod in _module_imports(path):
+            root = mod.split(".")[0]
+            if root == "plugins":
+                sib = mod.split(".")[1] if len(mod.split(".")) > 1 else ""
+                if sib not in ("",) and sib not in kin:
+                    rep.add("A", "boundary", "FAIL",
+                            f"{path.name}:{lineno} imports sibling card {mod} -- "
+                            "cards reach each other by ref, never by import")
+            elif root not in _CARD_IMPORTS and root not in tuple(data.get("third_party", ())):
+                rep.add("A", "boundary", "FAIL",
+                        f"{path.name}:{lineno} imports {mod}: declare it in "
+                        "third_party or reach it by ref")
 
     needs_sim = bool(data.get("needs_sim", False))
     if needs_sim:

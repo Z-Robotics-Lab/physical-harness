@@ -1072,14 +1072,40 @@ def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_
     if getattr(mod, "_MANIFEST", None) is not None:   # the copy reads [tunables] off ITS manifest
         tun = "\n[tunables]\n" + "".join(f"{k} = {v!r}\n" for k, v in tomllib.loads(
             Path(mod._MANIFEST).read_text()).get("tunables", {}).items() if isinstance(v, (int, float)))
+    # A patched copy carries its ORIGIN card: the copy legitimately imports that
+    # package (it IS a copy of it) and needs the same third_party, so the doctor's
+    # boundary check must judge it against the origin, not as a standalone card.
+    origin = module.split(".")[1] if module.startswith("plugins.") else ""
+    om = Path("plugins") / origin / "manifest.toml"
+    tp = list(tomllib.loads(om.read_text()).get("third_party", ())) if om.exists() else []
+    # A copy may import whatever the ORIGINAL imported: fold the module's own
+    # import roots in, so the doctor's boundary check judges the patch, not the
+    # dependencies it inherited verbatim.
+    tp += [r for r in sorted({m.split(".")[0] for _, m in _module_roots(new)}) if r not in tp]
     (d / "manifest.toml").write_text(
-        f'needs_sim = true\n[executors.{to}]\nskill = "{fd.get("skill")}"\nembodiment = "{fd.get("embodiment")}"\n'
+        f'needs_sim = true\npatched_from = "{origin}"\n'
+        + (f"third_party = {list(tp)!r}\n" if tp else "")
+        + f'[executors.{to}]\nskill = "{fd.get("skill")}"\nembodiment = "{fd.get("embodiment")}"\n'
         f'ref = "{ref}"\ntransport = "inproc"\n{tun}')
     (d / "__init__.py").write_text(PATCH_CARD.format(
         name=name, module=module, round=round_no, to=to, skill=fd.get("skill"), ref=ref,
         installed=str(fd.get("tunables", {}).get("ref", "")).partition(":")[0], base=base, task=fd.get("task")))
     pay["path"], pay["ref"], pay["match"] = str(d), ref, modes or ["diff"]
     return _doctor(d, ref, pay)
+
+
+def _module_roots(text: str):
+    """(lineno, dotted module) for every import in a source text; unparsable -> none."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                yield node.lineno, a.name
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            yield node.lineno, node.module or ""
 
 
 def dry_run(ref: str, params: dict, transport: str = "inproc") -> str | None:
