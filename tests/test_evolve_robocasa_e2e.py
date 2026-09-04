@@ -136,8 +136,34 @@ def test_evolve_recycle_cans_4243_perturbs_the_hinted_drop_knob(tmp_path):
         assert r2["tried"]["detail"]["to"] == pytest.approx(0.845)
         # the dying node carries its stall geometry (the LLM brief's nodes[].trace)
         tr = dead["trace"]
-        assert set(tr) == {"start", "stall", "end"} and tr["stall"]["d_eef_target"] > 0.03, tr
+        assert set(tr) == {"start", "stall", "end", "series"} and tr["stall"]["d_eef_target"] > 0.03, tr
         assert all("trace" not in n for n in base["nodes"] if n["id"] != dead["id"])
+        # the per-step series: what the driver COMMANDED each step. On drop-can1 the
+        # place stage only ever commands the arm (base_mode -1), so the base pose it
+        # inherited is fixed for the whole segment -- the reach gap is not closable here.
+        ser = tr["series"]
+        assert 0 < len(ser) <= 40 and 0 < ser[-1]["step"] <= dead["steps"], ser[-1:]
+        if dead["id"].startswith("drop-"):
+            assert all(r["cmd"]["mode"] == "arm" for r in ser), ser[:2]
+            b0 = ser[0]["base"]   # the base never MOVES (< 2 cm of physical jitter)
+            assert max(abs(r["base"][i] - b0[i]) for r in ser for i in (0, 1)) < 0.02
+            assert not any(c in r["cmd"]["nonzero"] for r in ser for c in ("vx", "vy", "wyaw"))
+            # ... and where that unreachable point came from: the stove's own bbox
+            g = dead["geometry"]
+            assert g["reach_max"] == 0.664 and set(g) >= {"point", "stove_center", "stove_half_extent",
+                                                          "edge_margin", "spread", "drop_dz", "slot"}
+            assert g["d_base_point"] > g["reach_max"], g   # geometrically out of reach
+            # WHO parked the base there: the segment that ran just before it
+            up = dead["upstream"]
+            assert up["node"] == f"carry-can{dead['id'][-1]}" and up["steps"] > 0, up
+            assert up["trace_end"]["d_base_target"] > 0, up
+        # the successful-reference index: every segment that has ever passed, with the
+        # distance it passed at (nodes that only ever died are listed as null)
+        ref = doc["reference"]
+        assert set(ref) >= {n["id"] for n in base["nodes"] if n["kind"] == "segment"}
+        assert ref[dead["id"]] is None or ref[dead["id"]]["round"] in (1, 2)
+        for v in ref.values():
+            assert v is None or {"node", "seed", "steps", "d_eef", "d_base", "round"} == {*v}
         # the overlay reached the driver: the trial's dying node sealed another tunables_sha
         trial = r1["after_seeds"][0]
         assert len(trial["tunables_sha"] or "") == 16 and trial["tunables_sha"] != base["tunables_sha"]

@@ -25,6 +25,12 @@ def test_unreachable_drop_stalls_early_and_recovers(monkeypatch):
         env.reset()
         drv = ClusterDropDriver("can1", 0)
         real = drv._drop_point(env)
+        # the point's PROVENANCE, read off the live stove: bbox + the card's knobs
+        prov = drv.provenance()
+        t0 = D.tunables()
+        assert prov["stove_half_extent"] > 0 and prov["stove_top_z"] > 0.5, prov
+        assert prov["edge_margin"] == t0["drop_edge_margin"] and prov["slot"] == 0
+        assert np.linalg.norm(prov["toward_counter"]) == pytest.approx(1.0, abs=1e-2)  # rounded to mm
         far = real + np.array([3.0, 0.0, 0.0])
         drv._point = far  # bypass the lazy stove/counter lookup with an unreachable aim
         done, steps, obs = D.run_stage(env, drv, 300)
@@ -34,9 +40,19 @@ def test_unreachable_drop_stalls_early_and_recovers(monkeypatch):
         assert diag["failure_mode"] == "reach_stall"
         tr = diag["trace"]   # the numeric stall geometry a proposer reads
         print("trace", tr)
-        assert set(tr) == {"start", "stall", "end"} and 0 < tr["stall"]["step"] <= steps
+        assert set(tr) == {"start", "stall", "end", "series"} and 0 < tr["stall"]["step"] <= steps
         assert tr["stall"]["d_eef_target"] > 2.5 and tr["stall"]["target"][0] == pytest.approx(far[0], abs=1e-3)
         assert len(tr["stall"]["base"]) == 3 and len(tr["stall"]["eef"]) == 3
+        # the per-step series: a place stage commands the ARM only, so the base pose it
+        # inherited never changes -- an out-of-reach point is not closable in this segment
+        ser = tr["series"]
+        assert 0 < len(ser) <= D.SERIES_MAX and 0 < ser[-1]["step"] <= steps
+        assert all(r["cmd"]["mode"] == "arm" for r in ser), ser[:2]
+        assert not any(c in r["cmd"]["nonzero"] for r in ser for c in ("vx", "vy", "wyaw"))
+        b0 = ser[0]["base"]   # < 2 cm of physical jitter while the gap is metres:
+        assert max(abs(r["base"][i] - b0[i]) for r in ser for i in (0, 1)) < 0.02
+        g = diag["geometry"]
+        assert g["reach_max"] == D.REACH_MAX and g["d_base_point"] > g["reach_max"], g
         # the reach repair built for this stage aims at its drop point and runs out
         drv._point = real
         d0 = float(np.linalg.norm(D._eef(env) - real))

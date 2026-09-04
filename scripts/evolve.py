@@ -15,10 +15,16 @@ same seeds, and publish when the success count improves: the skill record with
 the measured ``by_executor`` row folded in goes through the evolution-only skills
 root door (``InMemorySkillGraph.publish``, the same one scripts/publish_plans.py
 uses). Every round lands atomically in ``campaigns/evolve-<task>/campaign.json``
-(rounds[], best, cursor, status) with the kept suite's per-seed summary
+(rounds[], best, cursor, status, ``reference`` = the last successful pass of every
+plan segment) with the kept suite's per-seed summary
 (``per_seed``) and, when nothing was tried, ``needs`` -- what would unblock the
 proposer, plus ``stuck`` when the round's node has taken ``STUCK_ROUNDS`` rounds
-without improving (the brief then widens what may be patched there); the runtime seals the ``rsi_step`` rows off it. The same file carries a
+without improving (the brief then widens what may be patched there). A trial that
+improves is re-scored over its ORIGIN FAILURE CLUSTER (``regression``, the baseline
+seeds that shared its first missing milestone) before the fresh-seed confirm and is
+not published when it lost one of them; a confirm seed that blocks a publish is burned
+into the dev seeds (``burned``) and fresh confirm seeds are drawn above them. The
+model's causal ``layer`` and its notebook ``notes`` ride the round row too; the runtime seals the ``rsi_step`` rows off it. The same file carries a
 ``live`` block (phase / seed / node / partial per-seed, rewritten at every phase and
 seed boundary): live state the board's rsi_run shows, never sealed.
 With ``PH_RSI_FRAMES`` set (the runtime passes its frame.jpg when --frames is on)
@@ -245,12 +251,17 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                       for nid, n in nodes.items()}}
         for n in per[str(seed)]["trail"]:   # final state from the result: a replan reset the live
             r = nodes.get(n["id"]) or {}      # trail, and the verify row carries no steps/diagnostics
+            diag = r.get("diagnostics") or {}
             if n["ok"] is None and "success" in r:
                 n["ok"] = bool(r["success"])
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
-            n["failure_mode"] = n["failure_mode"] or (r.get("diagnostics") or {}).get("failure_mode")
-            if n["id"] == dead and (r.get("diagnostics") or {}).get("trace"):   # the stall geometry,
-                n["trace"] = r["diagnostics"]["trace"]                          # first death only
+            n["failure_mode"] = n["failure_mode"] or diag.get("failure_mode")
+            if (diag.get("trace") or {}).get("end"):   # where this segment ENDED, every node:
+                n["trace_end"] = diag["trace"]["end"]  # the reference index + the upstream row
+            if n["id"] == dead and diag.get("trace"):   # the stall geometry (with the per-step
+                n["trace"] = diag["trace"]              # ``series``) and the target's provenance,
+                n["geometry"] = diag.get("geometry")    # first death only
+        _link_upstream(per[str(seed)]["trail"], dead, skills)
         logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
                                         evolve_llm.MAX_LOG_LINES // (int(seeds[1]) - int(seeds[0]) + 1))
         tick(per_seed_partial=per_seed({"seeds": per}))
@@ -266,13 +277,51 @@ def _merge(a: dict, b: dict) -> dict:
             "elapsed_s": round(a["elapsed_s"] + b["elapsed_s"], 3), "logs": a["logs"] + b["logs"]}
 
 
+def _link_upstream(trail: list, dead, skills: dict) -> None:
+    """Give the first-death row an ``upstream``: ``{node, skill, steps, trace_end}`` of
+    the SEGMENT that ran just before it (verify/decide nodes move nothing; a recovery
+    node between them is skipped -- the question is which leg parked the base where the
+    dying stage found it). Without it "the base never moved" is a fact with no author."""
+    i = next((k for k, n in enumerate(trail) if n["id"] == dead), None) if dead else None
+    if i is None:
+        return
+    up = next((n for n in reversed(trail[:i]) if n.get("kind") == "segment" and n.get("steps")), None)
+    if up is not None:
+        trail[i]["upstream"] = {"node": up["id"], "skill": skills.get(up["id"]),
+                                "steps": up["steps"], "trace_end": up.get("trace_end")}
+
+
+def update_reference(doc: dict, kept: dict, rnd: int) -> dict:
+    """The campaign's SUCCESSFUL REFERENCE INDEX (Zetta, cheap version): per plan
+    segment, the LAST round in which it passed -- ``reference: {node: {node, seed,
+    steps, d_eef, d_base, round} | null}``, null = the node has run and never passed.
+    The healthy baseline a death is measured against ("nav-can1 passed on 4243 with
+    d_base 0.13; here it is 1.03"). Kept across rounds, never reset."""
+    ref = doc.setdefault("reference", {})
+    for seed, s in kept["seeds"].items():
+        for n in s.get("trail") or []:
+            if n.get("kind") != "segment":
+                continue
+            ref.setdefault(n["id"], None)
+            if n.get("ok") and n.get("steps") is not None:
+                end = n.get("trace_end") or {}
+                ref[n["id"]] = {"node": n["id"], "seed": int(seed), "steps": n["steps"],
+                                "d_eef": end.get("d_eef_target"),
+                                "d_base": end.get("d_base_target"), "round": rnd}
+    return ref
+
+
 def per_seed(suite: dict) -> list[dict]:
     """The operator-facing per-seed summary sealed with every round (rsi_step /
     campaign.json): ``[{seed, success, first_death, failure_mode, tunables_sha, elapsed_s,
-    nodes: [{id, ok, steps, failure_mode, after, kind, task, trace?}]}]`` (the knobs the dying node ran
-    under; the node trail's final state; ``trace`` = the first-death node's stall geometry
-    {start, stall, end} x {eef, target, base, d_eef_target, d_base_target, step}, when its
-    driver traced) -- the seed detail that otherwise lives only in this process."""
+    nodes: [{id, ok, steps, failure_mode, after, kind, task, trace_end?, trace?, geometry?,
+    upstream?}]}]`` (the knobs the dying node ran under; the node trail's final state;
+    ``trace_end`` = every traced segment's last {eef, target, base, d_eef_target,
+    d_base_target, step}; and on the FIRST-DEATH row alone ``trace`` = its stall geometry
+    {start, stall, end} + the downsampled per-step ``series``, ``geometry`` = where its
+    target came from (fixture bbox / dock, the knobs used, the arm's reach_max), and
+    ``upstream`` = the segment that ran before it) -- the seed detail that otherwise
+    lives only in this process."""
     return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
              "elapsed_s": s.get("elapsed_s"), "nodes": s.get("trail") or [],
              "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")
@@ -334,6 +383,32 @@ def stuck_on(node, history: list | None, rounds: int | None = None) -> dict | No
             break
         streak += 1
     return {"node": node, "rounds": streak} if node and streak >= (rounds or STUCK_ROUNDS) else None
+
+
+def cluster_seeds(rounds: list, before: dict, milestone) -> list[int]:
+    """The ORIGIN CLUSTER of a milestone: the seeds that shared it as their first missing
+    milestone in the campaign's BASELINE round (round 1's per_seed), else in this round --
+    the cohort a fix has to keep, seeds it has already won included."""
+    if not milestone:   # nothing died: there is no cluster to regress against
+        return []
+    rows = ((rounds[0].get("per_seed") if rounds else None) or per_seed(before))
+    return sorted(int(r["seed"]) for r in rows
+                  if evolve_llm.first_missing(r.get("nodes")) == milestone)
+
+
+def regression(rounds: list, before: dict, after: dict, milestone) -> dict | None:
+    """HISTORICAL REGRESSION over the origin cluster (Zetta's acceptance step before the
+    fresh-seed confirm): ``{seeds, before, after, lost}`` = how many of that cluster's seeds
+    succeed under the accepted state vs under the trial, and WHICH ones the trial lost. The
+    retest re-runs EVERY dev seed and the dev range only ever grows (a burned confirm seed
+    joins it), so the cluster is always inside both suites and this reads their results --
+    no seed is re-run twice. A non-empty ``lost`` blocks the publish (a net win that swaps
+    one cluster seed for two is still a regression). None when the cluster is empty."""
+    cs = cluster_seeds(rounds, before, milestone)
+    ok = lambda suite, s: bool((suite["seeds"].get(str(s)) or {}).get("success"))
+    hit = lambda suite: sum(ok(suite, s) for s in cs)
+    return {"seeds": cs, "before": hit(before), "after": hit(after),
+            "lost": [s for s in cs if ok(before, s) and not ok(after, s)]} if cs else None
 
 
 def pipeline_modules(ref: str, binding: dict) -> list[str]:
@@ -683,7 +758,7 @@ def main(argv=None) -> int:
             proposer = "rules"
             tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
         tick(tried=tried)
-        after, published, confirm = before, False, None
+        after, published, confirm, regr, burned = before, False, None, None, []
         if tried["kind"] != "none":
             trial = apply(tried, applied)
             tick(phase="retest")
@@ -696,6 +771,10 @@ def main(argv=None) -> int:
                 tried["detail"]["error"] = repr(exc)
                 after = before
             published = after["count"] > before["count"]
+            if published:   # the whole origin cluster first, then the fresh seeds
+                regr = regression(doc["rounds"], before, after, tried["node"])
+                if regr and regr["lost"]:
+                    published = False   # it fixed this round's seed and broke one the cluster had
             if published and args.confirm_seeds > 0:
                 # ASPIRE's debug-vs-eval split, light: the win must hold on fresh scratch seeds
                 # right above the block (never the ledger), SAME overlay, against the accepted
@@ -714,6 +793,13 @@ def main(argv=None) -> int:
                 published = ca >= cb["count"]
                 if published:
                     cb["count"] = ca   # the trial is the next accepted state on these seeds too
+                elif ca >= 0:
+                    # the held-out seed forced another edit: it is burned as held-out. It joins
+                    # the dev list (the range grows over it) and the next round draws fresh
+                    # confirm seeds above -- confirm_base re-measures itself on the new pair.
+                    burned = list(range(cs[0], cs[1] + 1))
+                    seeds[1] = cs[1]   # ``seeds`` IS doc["seeds"]
+                    tick(seeds_total=int(seeds[1]) - int(seeds[0]) + 1)
             if published:
                 tick(phase="publish")
                 applied = trial
@@ -723,10 +809,15 @@ def main(argv=None) -> int:
                 records[skill] = SkillRecordV0.from_dict(d)   # later rounds build on what was published
         kept = after if published else before
         doc["best"] = max(int(doc["best"] or 0), kept["count"])
+        update_reference(doc, kept, r)   # the successful-reference index, campaign-wide
         doc["rounds"].append({
             "round": r, "tried": tried, "before": before["count"], "after": after["count"],
             # the streak the brief widened on (None while the node is not stuck)
             "stuck": stuck_on(tried["node"], doc["rounds"]),
+            # the diagnosis: which causal layer the try claims, what the round taught, the
+            # origin cluster re-scored under it, and the confirm seeds it burned into dev
+            "layer": tried["detail"].get("layer"), "notes": tried["detail"].get("notes"),
+            "regression": regr, "burned": burned,
             "best": doc["best"], "suite_sha": after["sha"], "published": published,
             # the hypothesis tree: which accepted state this try grew from, and how it went
             "parent": max((x["round"] for x in doc["rounds"] if x["published"]), default=0),

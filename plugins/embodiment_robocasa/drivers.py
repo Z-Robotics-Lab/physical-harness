@@ -45,6 +45,34 @@ ADIM = 12
 GRIP_CLOSE = 1.0
 GRIP_OPEN = -1.0
 
+#: channel names of the 12-dim action, MODE excluded (it is reported as ``cmd.mode``).
+CHANNELS = ("dx", "dy", "dz", "rx", "ry", "rz", "grip", "vx", "vy", "wyaw", "torso")
+
+#: MEASURED max horizontal eef extension from base centre: a bare push reaches
+#: 0.664 m (GraspDriver.RETRY's yaw-style note; under a yaw servo ~0.56), which is
+#: why the standoff sphere is tuned at FWD 0.65. Descriptive, NOT a knob -- it is
+#: surfaced in the stage geometry so a proposer can tell an out-of-reach target
+#: (base->target > this) from a controller that merely stalled.
+REACH_MAX = 0.664
+
+#: per-step ``Trace`` rows kept in the sealed series (the raw steps are downsampled).
+SERIES_MAX = 40
+
+
+def _r3(v) -> list:
+    return [round(float(x), 3) for x in v]
+
+
+def _cmd(a) -> dict:
+    """What the driver actually COMMANDED this step: ``{mode: "arm"|"base",
+    nonzero: [channel names], norm}`` (grip excluded -- it is its own column, and
+    always saturated). ``mode "arm"`` on every row of a segment == the base was
+    never commanded there, whatever the base pose says."""
+    a = np.asarray(a, float)
+    return {"mode": "base" if a[MODE] > 0 else "arm",
+            "nonzero": [n for i, n in enumerate(CHANNELS) if i != GRIP and abs(a[i]) > 1e-3],
+            "norm": round(float(np.linalg.norm(np.delete(a[:TORSO + 1], GRIP))), 3)}
+
 # Navigate success tolerance == NavigateKitchen._check_success (kitchen_navigate.py).
 NAV_POS_TOL = 0.20
 NAV_ORI_COS = 0.98
@@ -117,14 +145,17 @@ class StallDetector:
 class Trace:
     """Numeric geometry of a stall-able phase -- {start, stall, end}, each
     {eef:[x,y,z], target:[x,y,z] (hover/drop point, or a dock with z 0), base:[x,y,yaw],
-    d_eef_target, d_base_target, step} -- sealed as the segment's diagnostics["trace"]
-    so a proposer SEES the reach gap (drop point vs eef vs base) instead of guessing
-    it. Diagnostics only, never control."""
+    d_eef_target, d_base_target, step} -- plus ``series``, the downsampled PER-STEP
+    trajectory ({step, phase, eef, target, base, d_eef, d_base, grip, cmd}), sealed as
+    the segment's diagnostics["trace"] so a proposer SEES the reach gap (drop point vs
+    eef vs base) AND what was commanded each step (``cmd.mode`` "arm" on every row ==
+    the base was never commanded) instead of guessing. Diagnostics only, never control."""
 
     def __init__(self) -> None:
         self.rows: dict = {}
         self.step = 0
         self.target = None
+        self.samples: list = []   # raw per-step rows; dump() downsamples them
 
     def at(self, key: str, env, target=None) -> None:
         """Snapshot ``key`` at the live pose; ``start`` keeps its first snapshot,
@@ -135,16 +166,39 @@ class Trace:
             return
         eef, (xy, psi) = _eef(env), _base_pose(env)
         t, k = self.target, len(self.target)
-        r3 = lambda v: [round(float(x), 3) for x in v]
-        self.rows[key] = {"eef": r3(eef), "target": r3([*t, *[0.0] * (3 - k)]),
-                          "base": r3([*xy, psi]),
+        self.rows[key] = {"eef": _r3(eef), "target": _r3([*t, *[0.0] * (3 - k)]),
+                          "base": _r3([*xy, psi]),
                           "d_eef_target": round(float(np.linalg.norm(eef[:k] - t)), 3),
                           "d_base_target": round(float(np.linalg.norm(xy - t[:2])), 3),
                           "step": int(self.step)}
 
+    def sample(self, env, phase: str, action) -> None:
+        """One raw per-step row for the ``series``: where the eef/base WERE and what
+        the driver commanded. Silent until a target exists (a stationary stow has
+        nothing to measure to)."""
+        if self.target is None:
+            return
+        eef, (xy, psi) = _eef(env), _base_pose(env)
+        t, k = self.target, len(self.target)
+        self.samples.append(
+            {"step": int(self.step), "phase": str(phase), "eef": _r3(eef),
+             "target": _r3([*t, *[0.0] * (3 - k)]), "base": _r3([*xy, psi]),
+             "d_eef": round(float(np.linalg.norm(eef[:k] - t)), 3),
+             "d_base": round(float(np.linalg.norm(xy - t[:2])), 3),
+             "grip": round(float(np.asarray(action, float)[GRIP]), 3),
+             "cmd": _cmd(action)})
+
     def dump(self, env) -> dict:
+        """{start, stall, end} + ``series``: every Nth raw row (<= SERIES_MAX, the
+        last step always included) -- the per-step trajectory of the segment."""
         self.at("end", env)
-        return dict(self.rows)
+        out = dict(self.rows)
+        if self.samples:
+            n = max(1, -(-len(self.samples) // (SERIES_MAX - 1)))
+            out["series"] = self.samples[::n]
+            if out["series"][-1] is not self.samples[-1]:
+                out["series"].append(self.samples[-1])
+        return out
 
 
 def stage_diagnostics(stage, env) -> dict:
@@ -421,6 +475,15 @@ class NavigateDriver:
                 self.failure_mode = "nav_stall"
 
     def act(self, env, obs):
+        a = self._act(env, obs)
+        self._trace.sample(env, self._phase(), a)
+        return a
+
+    def _phase(self) -> str:
+        return ("reverse" if getattr(self, "_rev", 0) > 0 else
+                "stow" if self._stow_left > 0 else "carry" if self.carry else "drive")
+
+    def _act(self, env, obs):
         gxy, gyaw = self._target(env)
         if not self.carry:
             self._watch(env, float(np.linalg.norm(np.asarray(gxy, float) - _base_pose(env)[0])))
@@ -477,7 +540,14 @@ class NavigateDriver:
         return bool(d <= NAV_POS_TOL and np.cos(gyaw - psi) >= NAV_ORI_COS)
 
     def diagnostics(self, env) -> dict:
-        return {"failure_mode": self.failure_mode, "trace": self._trace.dump(env)}
+        """+ ``geometry``: WHERE this leg was aiming and what stopped it -- the dock
+        pose it computed, the loaded standoff/arrival bands it stops at, and the arm's
+        reach from wherever it parks (the next stage's whole budget)."""
+        gxy, gyaw = self._target(env)
+        return {"failure_mode": self.failure_mode, "trace": self._trace.dump(env),
+                "geometry": {"dock": _r3([*gxy, gyaw]), "carry": bool(self.carry),
+                             "carry_stop": self.CARRY_STOP, "carry_near": self.CARRY_NEAR,
+                             "nav_pos_tol": NAV_POS_TOL, "reach_max": REACH_MAX}}
 
 
 class GraspDriver:
@@ -691,6 +761,12 @@ class GraspDriver:
         return m[:2] + off
 
     def act(self, env, obs):
+        phase = self.phase          # the phase this step's action was computed FOR
+        a = self._act(env, obs)
+        self._trace.sample(env, phase, a)
+        return a
+
+    def _act(self, env, obs):
         m = _obj_pos(env, self.obj_name)
         eef = _eef(env)
         torso = _torso_cmd(env, self._torso_target(env))
@@ -888,6 +964,12 @@ class PlaceDriver:
     _drop_point = _interior
 
     def act(self, env, obs):
+        phase = self.phase          # the phase this step's action was computed FOR
+        a = self._act(env, obs)
+        self._trace.sample(env, phase, a)
+        return a
+
+    def _act(self, env, obs):
         c = self._interior(env)
         eef = _eef(env)
         self._trace.step += 1

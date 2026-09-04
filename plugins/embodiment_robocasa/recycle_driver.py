@@ -42,6 +42,7 @@ class ClusterDropDriver(X.PointPlaceDriver):
         t = D.tunables()
         self.slot = slot           # 0..3, deterministic per can
         self._point = None
+        self._prov: dict[str, Any] = {}
         self._edge_margin = t["drop_edge_margin"]   # past the stove bbox edge, toward the counter
         self._spread = t["drop_spread"]             # per-can lateral pitch along the stove edge
         self._drop_dz = t["drop_dz"]                # release height above the stove-top plane
@@ -63,7 +64,19 @@ class ClusterDropDriver(X.PointPlaceDriver):
             xy = (center[:2] + u * (half + self._edge_margin)
                   + v * self._spread * (self.slot - 1.5))
             self._point = np.array([xy[0], xy[1], top_z + self._drop_dz])
+            # everything the point was built from, for the segment's diagnostics:
+            # the point is EDGE_MARGIN past the stove's own bbox, so how far the base
+            # must stand from it is a property of the FIXTURE, not of this stage.
+            self._prov = {
+                "source": "stove bbox + counter direction (ClusterDropDriver._drop_point)",
+                "stove_center": D._r3(center), "stove_top_z": round(top_z, 3),
+                "stove_half_extent": round(half, 3), "toward_counter": D._r3(u),
+                "edge_margin": self._edge_margin, "spread": self._spread,
+                "drop_dz": self._drop_dz, "slot": self.slot}
         return self._point
+
+    def provenance(self) -> dict[str, Any]:
+        return dict(self._prov)
 
     def done(self, env) -> bool:
         import robocasa.utils.object_utils as OU

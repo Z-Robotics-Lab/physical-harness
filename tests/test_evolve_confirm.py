@@ -110,7 +110,8 @@ max_replans = 1
 """
 
 
-def _campaign(tmp_path, monkeypatch, mode: str, canned=None, confirm=2) -> tuple[Path, dict]:
+def _campaign(tmp_path, monkeypatch, mode: str, canned=None, confirm=2, seeds=("1", "2"),
+              pre=None) -> tuple[Path, dict]:
     root = tmp_path / mode
     (root / "plugins" / "conf").mkdir(parents=True)
     (root / "plugins" / "conf" / "manifest.toml").write_text(_CARD)
@@ -119,8 +120,11 @@ def _campaign(tmp_path, monkeypatch, mode: str, canned=None, confirm=2) -> tuple
     monkeypatch.setenv("PH_TEST_CONFIRM_MODE", mode)
     monkeypatch.delenv("MUJOCO_GL", raising=False)
     argv = ["--mode", "evolution", "--task", TASK, "--session", str(root / "s"),
-            "--skills-root", str(root / "s" / "skills"), "--seeds", "1", "2", "--rounds", "1",
+            "--skills-root", str(root / "s" / "skills"), "--seeds", *seeds, "--rounds", "1",
             "--confirm-seeds", str(confirm)]
+    if pre is not None:   # an earlier campaign on disk (the baseline the origin cluster comes from)
+        (root / "s" / "campaigns" / f"evolve-{TASK}").mkdir(parents=True)
+        (root / "s" / "campaigns" / f"evolve-{TASK}" / "campaign.json").write_text(json.dumps(pre))
     if canned is not None:
         (root / "canned.json").write_text(json.dumps(canned))
         monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(root / "canned.json"))
@@ -137,6 +141,9 @@ def test_win_on_debug_seeds_that_holds_on_confirm_seeds_is_published(tmp_path, m
     r = doc["rounds"][0]
     assert (r["before"], r["after"], r["published"], r["outcome"], r["parent"]) == (0, 2, True, "improved", 0)
     assert r["confirm"] == {"seeds": [3, 4], "before": 2, "after": 2}
+    # the origin cluster (both debug seeds died at grab-0) is re-scored BEFORE the fresh seeds
+    assert r["regression"] == {"seeds": [1, 2], "before": 0, "after": 2, "lost": []}
+    assert r["burned"] == [] and r["layer"] is None
     assert doc["confirm_base"] == {"seeds": [3, 4], "count": 2}   # cached: the next confirm skips the baseline
     assert r["usage"]["sim_s"] > 0 and r["usage"]["llm_tokens"] is None and doc["live"]["sim_s"] >= r["usage"]["sim_s"]
     assert any("新种子确认" in m["text"] for m in doc["live"]["messages"])
@@ -227,3 +234,37 @@ def test_proposal_tunables_from_is_the_knobs_current_value(monkeypatch):
     assert evolve.from_proposal(p, before)["detail"]["from"] == 40
     p["payload"]["path"] = ["tunables", "nope"]
     assert evolve.from_proposal(p, before)["detail"]["from"] is None
+
+
+def _baseline(rng, seeds, milestone="grab-0") -> dict:
+    """A campaign (dev range ``rng``) whose round 1 baseline put every dev seed in one
+    failure cluster -- the origin cluster a later round's fix must not regress."""
+    return {"task": TASK, "session": "s", "seeds": list(rng), "arm": "auto", "best": 0, "cursor": 1,
+            "status": "running", "applied": {"executors": {}, "tunables": {}},
+            "rounds": [{"round": 1, "tried": {"kind": "none", "node": milestone, "detail": {}},
+                        "before": 0, "after": 0, "best": 0, "published": False, "outcome": "none",
+                        "per_seed": [{"seed": s, "success": False, "first_death": milestone,
+                                      "nodes": [{"id": milestone, "ok": False}]} for s in seeds]}]}
+
+
+def test_a_trial_that_loses_a_seed_of_its_origin_cluster_is_not_published(tmp_path, monkeypatch):
+    """Zetta's historical regression: seed 3 was in the grab-0 cluster and the accepted state
+    already wins it; the trial wins 1 and 2 but breaks 3 -- a net gain that is still a
+    regression, so the publish is blocked before the fresh-seed confirm ever runs."""
+    _, doc = _campaign(tmp_path, monkeypatch, "regress", seeds=("1", "3"),
+                       pre=_baseline([1, 3], [1, 2, 3]))
+    r = doc["rounds"][-1]
+    assert (r["round"], r["before"], r["after"], r["outcome"]) == (2, 1, 2, "improved")
+    assert r["regression"] == {"seeds": [1, 2, 3], "before": 1, "after": 2, "lost": [3]}
+    assert r["published"] is False and r["confirm"] is None   # the cluster comes first
+    assert doc["applied"]["executors"] == {} and doc["best"] == 1
+
+
+def test_a_confirm_seed_that_blocks_a_publish_is_burned_into_the_dev_seeds(tmp_path, monkeypatch):
+    """Held-out burn: the confirm seeds forced another edit, so they join the dev list and
+    the next round draws fresh ones above them."""
+    _, doc = _campaign(tmp_path, monkeypatch, "regress")
+    r = doc["rounds"][0]
+    assert r["confirm"] == {"seeds": [3, 4], "before": 2, "after": 0} and r["published"] is False
+    assert r["burned"] == [3, 4] and doc["seeds"] == [1, 4]
+    assert doc["live"]["seeds_total"] == 4

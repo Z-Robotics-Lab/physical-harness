@@ -1062,7 +1062,9 @@ def _seal_rounds(rt: Runtime, brief_id: str, task: str, path: Path) -> None:
                                        **{k: rd.get(k) for k in ("round", "tried", "before", "after",
                                                                  "best", "published", "suite_sha",
                                                                  "per_seed", "needs", "proposer", "llm",
-                                                                 "parent", "outcome", "confirm", "usage")}})
+                                                                 "parent", "outcome", "confirm", "usage",
+                                                                 # the round's diagnosis and its acceptance
+                                                                 "layer", "notes", "regression", "burned")}})
 
 
 def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:

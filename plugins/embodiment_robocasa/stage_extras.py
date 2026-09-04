@@ -63,9 +63,9 @@ class NavToObjectDriver(D.NavigateDriver):
             self._goal = (np.asarray(pos[:2], float), float(ori[2]))
         return self._goal
 
-    def act(self, env, obs):
+    def _act(self, env, obs):   # the parent's act() wraps this and samples the series
         if self.carry:
-            return super().act(env, obs)
+            return super()._act(env, obs)
         gxy, gyaw = self._target(env)
         xy, _ = D._base_pose(env)
         self._hist.append(xy.copy())
@@ -115,13 +115,34 @@ class PointPlaceDriver:
     def done(self, env) -> bool:
         raise NotImplementedError
 
+    def provenance(self) -> dict[str, Any]:
+        """Where ``_drop_point`` came from (subclass-supplied: the fixture geometry and
+        the knobs that placed the point). Empty = the point is a live object pose."""
+        return {}
+
     def diagnostics(self, env) -> dict[str, Any]:
-        """Live terminal details used to explain a bounded place failure."""
+        """Live terminal details used to explain a bounded place failure, plus
+        ``geometry``: the drop point's PROVENANCE and the arm's reach from wherever the
+        base was parked -- a point farther from the base than ``reach_max`` cannot be
+        reached by this stage at all (base_mode is -1 throughout: see trace.series)."""
+        point = np.asarray(self._drop_point(env), float)
+        xy, psi = D._base_pose(env)
         return {"phase": self.phase, "failure_mode": self.failure_mode,
-                "trace": self._trace.dump(env)}
+                "trace": self._trace.dump(env),
+                "geometry": {"point": D._r3(point), "over_dz": self._over_dz,
+                             "reach_tol": self._reach_tol, "reach_max": D.REACH_MAX,
+                             "base": D._r3([*xy, psi]),
+                             "d_base_point": round(float(np.linalg.norm(xy - point[:2])), 3),
+                             **self.provenance()}}
 
     # -- the shared phase chain ------------------------------------------------
     def act(self, env, obs):
+        phase = self.phase          # the phase this step's action was computed FOR
+        a = self._act(env, obs)
+        self._trace.sample(env, phase, a)   # the per-step series (diagnostics)
+        return a
+
+    def _act(self, env, obs):
         c = np.asarray(self._drop_point(env), float)
         eef = D._eef(env)
         self._trace.step += 1

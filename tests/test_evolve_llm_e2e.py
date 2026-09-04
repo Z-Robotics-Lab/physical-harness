@@ -43,7 +43,8 @@ def _card(name, to, code, ref=None, node=None):
 CANNED = [
     {"kind": "tunables", "payload": {"ref": "test_evolve_e2e:policy_provider",
                                      "path": ["tunables", "stall_k"], "to": 28},
-     "summary": "两颗种子都死在 grab-0。", "rationale": "先把 stall_k 调低"},
+     "summary": "两颗种子都死在 grab-0。", "rationale": "先把 stall_k 调低",
+     "layer": "parameter", "notes": "grab-0 的 stall_k 还没试过下调。"},
     _card("grab_llm", "llm", GOOD, ref="grab_other:provider"),      # round 2, attempt 1: ref outside the dir
     _card("grab_llm", "llm", GOOD),                                  # round 2, attempt 2: repaired
     _card("grab_stub", "stub", BAD_SHAPE, node="grab-0"),            # round 3, attempt 1: raises on the seed
@@ -78,6 +79,9 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     assert (r1["proposer"], r1["tried"]["kind"], r1["tried"]["node"]) == ("llm", "tunables", "grab-0")
     assert (r1["tried"]["detail"]["path"], r1["tried"]["detail"]["to"]) == (["tunables", "stall_k"], 28)
     assert r1["llm"]["summary"] == "两颗种子都死在 grab-0。" and r1["llm"]["rationale"] == "先把 stall_k 调低"
+    # the diagnosis rides the round row (and the sealed step): which layer, what it taught
+    assert (r1["layer"], r1["notes"]) == ("parameter", "grab-0 的 stall_k 还没试过下调。")
+    assert r1["tried"]["detail"]["layer"] == "parameter"
     assert len(r1["llm"]["prompt_sha"]) == 64 and len(r1["llm"]["raw_sha"]) == 64
     assert r1["llm"]["model"].startswith("fake(") and r1["llm"]["reason"] is None
     assert (r1["before"], r1["after"], r1["published"]) == (0, 0, False)
@@ -132,6 +136,7 @@ def test_llm_answers_drive_the_rounds_repair_from_the_exact_error_and_stop_hones
     # the round rows ride rsi_step / rsi_series; the live log said what the LLM was doing
     steps = _kinds(runtime.rows, "rsi_step")
     assert [s["proposer"] for s in steps] == ["llm"] * 4 and steps[0]["llm"] == r1["llm"]
+    assert (steps[0]["layer"], steps[0]["notes"]) == ("parameter", r1["notes"])
     assert [s["proposer"] for s in bs.rsi_series(runtime.session, TASK)] == ["llm"] * 4
     assert any(m["text"].startswith("LLM 分析第") for m in doc["live"]["messages"])
 
@@ -157,7 +162,7 @@ def test_dry_run_refuses_a_stub_that_is_no_executor(tmp_path, monkeypatch):
     assert evolve_llm.dry_run("plugins.candidates.grasp_geometric_robocasa:provider", {}) is None
 
 
-def recycle_cans_projection() -> tuple[dict, dict]:
+def recycle_cans_projection(doc_extra=None, trace=None) -> tuple[dict, dict]:
     """The recycle_cans brief on a synthetic 'died at drop-can1 with reach_stall' round
     (the production shape, no simulator): the robocasa driver source + primitives ride."""
     from harness.manifest import discover
@@ -168,11 +173,13 @@ def recycle_cans_projection() -> tuple[dict, dict]:
     seed = {"success": False, "first_death": "drop-can1", "failure_mode": "reach_stall", "keyframes": [],
             "fault": {"kind": "node_failure", "node": "drop-can1", "msg": "node 'drop-can1' failed"},
             "trail": [{"id": n, "ok": n != "drop-can1", "steps": 100, "failure_mode": None}
+                      | ({"trace": trace} if trace and n == "drop-can1" else {})
                       for n in ("nav-can1", "grasp-can1", "carry-can1", "drop-can1")],
             "nodes": {n: {"skill": n.replace("-", "_"), "success": n != "drop-can1", "executor": "scripted"}
                       for n in ("nav-can1", "grasp-can1", "carry-can1", "drop-can1")}}
     before = {"count": 0, "seeds": {"4243": seed, "4244": dict(seed)}}
-    doc = {"task": "recycle_cans", "seeds": [4243, 4244], "cursor": 0, "rounds": [], "applied": {}}
+    doc = {"task": "recycle_cans", "seeds": [4243, 4244], "cursor": 0, "rounds": [], "applied": {},
+           **(doc_extra or {})}
     return evolve_llm.rsi_projection(doc, before, records, "robocasa", "scripted", binding,
                                      ["seed 4243 task.fault {...}"] * 10), before
 
@@ -196,9 +203,10 @@ def test_recycle_cans_brief_carries_the_drop_driver_source_and_stays_bounded(tmp
 
 @pytest.mark.skipif(not os.environ.get("PH_LLM_E2E"), reason="opt-in: one real DeepSeek call")
 def test_real_deepseek_reads_the_recycle_cans_brief_within_budget(tmp_path):
-    """One real round-1 call on the recycle_cans brief: the prompt fits ~12k tokens and the
+    """One real round-1 call on the recycle_cans brief: the prompt fits the budget and the
     answer parses (any kind; a card is doctor-checked in the tmp candidates root)."""
     from scripts import evolve_llm
+    from scripts.evolve_llm import PROMPT_CHARS
     monkey = pytest.MonkeyPatch()
     monkey.setattr(evolve_llm, "CANDIDATES_ROOT", tmp_path / "candidates")
     try:
@@ -208,9 +216,10 @@ def test_real_deepseek_reads_the_recycle_cans_brief_within_budget(tmp_path):
     finally:
         monkey.undo()
     print("usage", row["usage"], "reason", row["reason"], "tried", tried and tried["kind"])
-    # call 1 is the brief alone (~5k); a card / patch decision adds call 2's materials,
-    # which now carry the full text of every editable module
-    assert row["usage"] and row["usage"]["prompt"] <= 30000, row
+    # call 1 is the brief alone (~6k); a card / patch decision adds call 2's materials, which
+    # carry the full text of every editable module -- PROMPT_CHARS/2.5 tokens at the ceiling
+    # (measured 42k on the production round: brief + materials + the repair)
+    assert row["usage"] and row["usage"]["prompt"] <= PROMPT_CHARS // 2, row
     assert row["reason"] is None and row["summary"]
 
 
@@ -360,3 +369,109 @@ def test_an_unbounded_run_waits_instead_of_stopping_and_only_cancel_ends_it(tmp_
         assert bs.rsi_run(rt.session, TASK)["open_brief"] is None
     finally:
         rt.stop()
+
+
+# ── Zetta: the layer ladder, the failure clusters and the lab notebook ────────────
+
+def _exhausted_proj(extra_history=()):
+    """grab-0 with every (knob, direction) already tried: the brief's ``exhausted`` flag is
+    set, so the parameter layer is closed there."""
+    hist = [{"round": i, "tried": {"kind": "tunables", "node": "grab-0", "detail": {
+        "ref": "r", "path": ["tunables", k], "from": 1.0, "to": to}}}
+        for i, (k, to) in enumerate((("hover_dz", 2.0), ("hover_dz", 0.5),
+                                     ("stall_k", 2.0), ("stall_k", 0.5)), 1)]
+    return _repeat_proj([*hist, *extra_history])
+
+
+def test_a_parameter_layer_answer_is_refused_once_the_knobs_are_exhausted(tmp_path):
+    """Zetta's top-down rule: with the parameter layer closed the answer must come from a
+    higher one -- the rejection names them, and a state-layer answer is the round's try."""
+    from scripts import evolve_llm
+    proj, before = _exhausted_proj()
+    assert "parameter layer is CLOSED" in evolve_llm.brief(proj)["exhausted"]
+    ep = _fake(tmp_path, [
+        {"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "hover_dz"], "to": 0.2},
+         "summary": "再调 hover_dz。", "rationale": "参数", "layer": "parameter"},
+        {"kind": "executor", "payload": {"to": "alt"}, "summary": "换执行器。", "rationale": "几何不对",
+         "layer": "state", "notes": "drop 点在底盘 1.0 m 外，抓取段底盘不能动。"}], name="layer.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    why = json.loads((tmp_path / "llm" / "round-2.json").read_text())["attempts"][0]["reason"]
+    assert "the parameter layer is CLOSED on grab-0" in why
+    assert "evaluation, plan, state, recovery" in why and "is the predicate / oracle right" in why
+    assert "hover_dz up, hover_dz down" not in why or "already tried" in why
+    # the higher-layer answer is taken, with its layer and its notebook note on the try
+    assert (tried["kind"], tried["detail"]["to"]) == ("executor", "alt")
+    assert tried["detail"]["layer"] == "state"
+    assert tried["detail"]["notes"] == "drop 点在底盘 1.0 m 外，抓取段底盘不能动。"
+
+
+def test_a_tunables_answer_is_a_parameter_answer_even_unlabelled(tmp_path):
+    """The live model does not label its layer: a knob change IS the parameter layer."""
+    from scripts import evolve_llm
+    proj, before = _exhausted_proj()
+    ep = _fake(tmp_path, [{"kind": "tunables", "payload": {"ref": "r", "path": ["tunables", "stall_k"], "to": 9},
+                           "summary": "调 stall_k。", "rationale": "-"}] * 3, name="unlabelled.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 2, tmp_path / "llm")
+    audit = json.loads((tmp_path / "llm" / "round-2.json").read_text())
+    assert "the parameter layer is CLOSED on grab-0" in audit["attempts"][0]["reason"]
+    assert tried["kind"] == "none" and tried["detail"]["reason"].startswith("llm: ")
+
+
+def test_an_invalid_layer_is_rejected_and_the_ladder_named():
+    from scripts.evolve_llm import _parse
+    with pytest.raises(ValueError, match="layer must be evaluation|plan|state|recovery|parameter"):
+        _parse(json.dumps({"kind": "none", "payload": {}, "summary": "x", "layer": "vibes"}))
+
+
+def test_the_brief_carries_the_clusters_the_first_missing_milestone_the_divergence_and_the_notebook():
+    """The recycle_cans round as Zetta reads it: each seed a milestone chain indexed by its
+    first missing milestone, the seeds clustered by (milestone, failure_mode), the numeric
+    divergence from the successful reference at that milestone, and the last rounds' notes."""
+    from scripts import evolve_llm
+    trace = {"start": {"d_base_target": 1.028, "d_eef_target": 0.626, "step": 1},
+             "stall": {"d_base_target": 1.028, "d_eef_target": 0.572, "step": 65},
+             "end": {"d_base_target": 1.028, "d_eef_target": 0.574, "step": 65}}
+    notes = [{"round": i, "notes": f"第 {i} 轮：调参没用。"} for i in range(1, 13)]
+    proj, _ = recycle_cans_projection(
+        {"reference": {"drop-can1": {"d_base_target": 0.35, "d_eef_target": {"mean": 0.05}}},
+         "rounds": [{"round": n["round"], "tried": {"kind": "none", "node": "drop-can1", "detail": {}},
+                     "before": 0, "after": 0, "published": False, "notes": n["notes"]} for n in notes]},
+        trace=trace)
+    assert proj["clusters"] == [{"milestone": "drop-can1", "failure_mode": "reach_stall",
+                                 "seeds": [4243, 4244], "size": 2}]
+    assert proj["target"]["cluster"] == proj["clusters"][0]
+    row = proj["this_round"]["per_seed"][0]
+    assert row["first_missing_milestone"] == "drop-can1"
+    assert row["divergence"]["d_base_target"] == {"seed": 1.028, "reference": 0.35, "delta": 0.678}
+    assert row["divergence"]["d_eef_target"]["delta"] == 0.524   # a distribution row: its mean
+    assert proj["notebook"] == notes[-10:] and len(proj["notebook"]) == 10
+    assert proj["layers"]["plan"].startswith("is the node graph right")
+    b = evolve_llm.brief(proj)   # call 1 sees all of it
+    assert b["clusters"] == proj["clusters"] and b["notebook"] == proj["notebook"]
+    assert b["this_round"]["per_seed"][0]["divergence"] == row["divergence"]
+    assert b["layers"] == proj["layers"] and b["target"]["cluster"] == proj["clusters"][0]
+
+
+def test_first_missing_milestone_is_the_first_node_not_completed():
+    from scripts.evolve_llm import first_missing
+    trail = [{"id": "nav", "ok": True}, {"id": "recover-drop", "ok": True},
+             {"id": "drop", "ok": False}, {"id": "placed", "ok": None}]
+    assert first_missing(trail) == "drop" and first_missing([{"id": "a", "ok": True}]) is None
+    assert first_missing([]) is None
+
+
+def test_the_first_death_row_keeps_its_geometry_and_upstream_for_the_brief():
+    """The causal evidence rides the seed row, not only the trace: without ``geometry``
+    (d_base_point vs the arm's reach_max) and ``upstream`` (the segment that parked the
+    base there) "the base never moved" is a fact with no author and no reach to compare
+    it against. Both are on the first-death row alone."""
+    from scripts.evolve_llm import _seed_row
+    geo = {"d_base_point": 1.028, "reach_max": 0.664}
+    up = {"node": "carry-can1", "skill": "carry", "steps": 174, "trace_end": {"d_base_target": 0.644}}
+    s = {"first_death": "drop-can1", "trail": [
+        {"id": "carry-can1", "ok": True, "steps": 174, "trace_end": {"d_base_target": 0.644}},
+        {"id": "drop-can1", "ok": False, "steps": 65, "trace": {"end": {}},
+         "geometry": geo, "upstream": up}]}
+    trail = _seed_row(4243, s, {})["trail"]
+    assert set(trail[0]) == {"id", "ok", "steps", "failure_mode"}
+    assert trail[1]["geometry"] == geo and trail[1]["upstream"] == up

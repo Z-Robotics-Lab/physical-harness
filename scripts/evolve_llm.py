@@ -5,8 +5,15 @@ task, seeds, round history (tried + before->after + per-seed first death), this
 round's per-seed node trails, the knobs of the first-death node's driver with their
 current values and the card's failure-mode hints, the executors bound on that
 skill with their evidence, the inbox proposals already consumed, ``needs`` and a
-bounded excerpt of the dying node's log rows -- and answers ONE proposal in the
-proposals-inbox shape (``PROPOSAL_SCHEMA``): tunables / executor / card
+bounded excerpt of the dying node's log rows; each seed is its MILESTONE CHAIN with
+its FIRST MISSING MILESTONE and the numeric divergence from the campaign's successful
+reference there, the failing seeds grouped into ``clusters`` by (first missing
+milestone, failure_mode) with the one the round targets named on ``target.cluster``,
+the fixed causal ladder ``layers`` to diagnose top-down with, and the ``notebook``
+of the last 10 rounds' notes -- and answers ONE proposal in the
+proposals-inbox shape (``PROPOSAL_SCHEMA``, with the ``layer`` it diagnosed at and an optional notebook
+``notes``; a parameter-layer answer is refused while the target node's knobs are
+``exhausted``, naming the higher layers): tunables / executor / card
 (code-as-policy: the model writes a candidate card under ``plugins/candidates/<name>/``,
 checked by scripts/plugin_doctor, dry-instantiated (``dry_run``) and preflighted on
 ONE seed before it is mounted) / patch (exact-snippet ``edits`` -- ``{old, new}`` where
@@ -66,13 +73,14 @@ CANDIDATES_ROOT = Path(os.environ.get("PH_CANDIDATES_ROOT") or PLUGINS_ROOT / "c
 #: The worked example every card answer is shown in full (the one real candidate).
 REFERENCE_CARD = PLUGINS_ROOT / "candidates" / "grasp_geometric_robocasa"
 MAX_LOG_LINES = 60
-#: Prompt bound of call 2 (~24k DeepSeek tokens, measured ~2.5 chars/token on this JSON);
-#: over it the log excerpt goes first, then older rounds' per-seed detail, then the driver
+#: Prompt bound of call 2 (~48k DeepSeek tokens, measured ~2.5 chars/token on this JSON): a
+#: round costs minutes of simulator, so the model gets the whole picture. Trimming order past
+#: it, in this order: the log excerpt, then older rounds' per-seed detail, then the driver
 #: source. The editable modules carry their own bound (``MODULE_CHARS``).
-PROMPT_CHARS = 60_000
+PROMPT_CHARS = 120_000
 #: Bound of ``module_sources`` (the full text of every module a patch may edit): the stage's
 #: own module is always whole, the others fall back to class/function extracts past it.
-MODULE_CHARS = 30_000
+MODULE_CHARS = 60_000
 #: Call-1 bound (the decision brief): the log excerpt goes first, then per_seed of
 #: the 5 detailed rounds (older rounds are counts only, always).
 BRIEF_CHARS = 12_000
@@ -82,6 +90,18 @@ MAX_ATTEMPTS = 3
 MATERIAL_KEYS = ("card_template", "executor_contract", "reference_card", "scripted_driver_source",
                  "module_sources", "primitives", "obs_keys", "action_order")
 KINDS = ("tunables", "executor", "card", "patch", "none")
+#: Zetta's top-down causal ladder, highest layer first: the layer an answer claims to work
+#: at. A higher layer that explains the failure forbids a lower-layer answer; the parameter
+#: layer is refused outright once the target node's knobs are exhausted (``_exhausted``).
+LAYERS = ("evaluation", "plan", "state", "recovery", "parameter")
+LAYER_QUESTION = {
+    "evaluation": "is the predicate / oracle right -- does 'success' mean what we think?",
+    "plan": "is the node graph right -- a missing node (no nav before a place), a wrong order, "
+            "a stage that cannot reach from where the previous one leaves the robot?",
+    "state": "is the target / geometry right -- the point reached for, the dock, the frame?",
+    "recovery": "is the repair right -- does the recovery primitive fire and undo the failure?",
+    "parameter": "LAST RESORT: a knob of the dying driver.",
+}
 _NAME = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 
 #: The exact reply shape (the proposals inbox shape + summary/rationale); ``payload``
@@ -91,7 +111,11 @@ PROPOSAL_SCHEMA = {
     "payload": "<the flat object described by payload_by_kind[decision], e.g. {\"to\": \"alt\"}; "
                "for card / patch you may omit it: the code material then comes in a second message>",
     "summary": "<1-3 sentences: what you saw this round, in Chinese>",
-    "rationale": "<why this try>",
+    "rationale": "<why this try -- the evidence chain: trail -> first missing milestone -> "
+                 "divergence -> the code line>",
+    "layer": "evaluation | plan | state | recovery | parameter: the HIGHEST layer of `layers` "
+             "that explains this failure, chosen top-down",
+    "notes": "<optional 1-3 sentences in Chinese for the lab notebook: what this round taught>",
 }
 PAYLOAD_BY_KIND = {
     "tunables": {"ref": "<tunables.ref>", "path": ["<tunables.path prefix>...", "<knob>"],
@@ -121,6 +145,19 @@ output_schema: exactly ONE of the payload shapes, matching decision. A card or p
 decision may come without payload: you then get the code material (contract, reference \
 card, the dying stage's driver source, the FULL numbered text of every editable module in \
 module_sources, primitives) and write the full payload.
+Diagnose TOP-DOWN before you choose. The layers, highest first: evaluation (is the \
+predicate/oracle right?) -> plan (is the node graph/order right -- a missing node, a stage \
+that cannot reach from where the previous one leaves the robot?) -> state (is the \
+target/geometry right?) -> recovery (is the repair right?) -> parameter (a knob, LAST \
+RESORT). Answer with `layer` = the HIGHEST layer that explains the evidence, and give the \
+evidence chain in rationale (trail -> first missing milestone -> divergence -> the code). \
+IF A HIGHER LAYER EXPLAINS THE FAILURE, NEVER PROPOSE A PARAMETER CHANGE: while the brief \
+carries `exhausted` for the target node, a parameter-layer answer (a tunables decision \
+included) is rejected. Each seed is its MILESTONE CHAIN (trail) with its first missing \
+milestone and, when the campaign has a successful reference, the numeric divergence there; \
+`clusters` groups the seeds by (first missing milestone, failure_mode) and the round targets \
+`target.cluster`. `notebook` is what earlier rounds concluded -- build on it instead of \
+re-deriving it, and add `notes` (1-3 Chinese sentences) with what THIS round taught.
 Allowed answers:
 - tunables: one knob of tunables.values (ref = tunables.ref, path = tunables.path + [knob]) \
 to a new numeric value; do not repeat a (knob, direction) already in history.
@@ -161,6 +198,82 @@ def _log_excerpt(seed: int, rows, dead: str | None, budget: int) -> list[str]:
             out.append(f"seed {seed} {r['kind']} "
                        + json.dumps(r["data"], sort_keys=True, default=str)[:400])
     return out[-budget:]
+
+
+def first_missing(trail) -> str | None:
+    """Zetta's FIRST MISSING MILESTONE: the first node of the seed's milestone chain (its
+    node trail) the seed did not complete -- the earliest observable divergence a failure
+    cluster is indexed by. None when every node passed."""
+    return next((n.get("id") for n in trail or () if n.get("ok") is not True), None)
+
+
+def _metrics(node: dict) -> dict:
+    """The numeric state of one milestone: the node's steps and the scalars of its stall
+    trace's last frame (d_eef_target, d_base_target, step) -- what a divergence compares."""
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    end = ((node.get("trace") or {}).get("end") or {}) if isinstance(node.get("trace"), dict) else {}
+    return {k: v for k, v in ({"steps": node.get("steps")} | dict(end)).items() if num(v)}
+
+
+def _divergence(node: dict, healthy) -> dict:
+    """This seed's numeric divergence from the SUCCESSFUL REFERENCE at that milestone:
+    ``{metric: {seed, reference, delta}}``. ``healthy`` is the campaign's reference index
+    row for the milestone (``doc['reference'][milestone]``, written by the trail/reference
+    side): ``{metric: number}``, or ``{metric: {"mean": number, ...}}`` for a distribution.
+    Empty when there is no reference for it -- the divergence is simply not claimed."""
+    out = {}
+    for k, v in _metrics(node).items():
+        ref = (healthy or {}).get(k)
+        ref = ref.get("mean") if isinstance(ref, dict) else ref
+        if isinstance(ref, (int, float)) and not isinstance(ref, bool):
+            out[k] = {"seed": v, "reference": ref, "delta": round(v - ref, 4)}
+    return out
+
+
+def _seed_row(seed, s: dict, reference: dict) -> dict:
+    """One seed for the brief: its MILESTONE CHAIN (the node trail, the dying node with its
+    stall trace), the first missing milestone, and the divergence from the successful
+    reference there when the campaign has one."""
+    # the first-death row alone carries the causal evidence: the stall trace with its
+    # per-step ``series``, where the target came from (``geometry``) and the segment that
+    # parked the robot there (``upstream``). Dropping them leaves "the base never moved"
+    # a fact with no author and no reach number to compare it against.
+    trail = [{k: n.get(k) for k in ("id", "ok", "steps", "failure_mode")}
+             | ({k: n[k] for k in ("trace", "geometry", "upstream") if n.get(k) is not None}
+                if n.get("id") == s.get("first_death") else {})
+             for n in s.get("trail") or []]
+    ms = first_missing(trail) or s.get("first_death")
+    row = {"seed": int(seed),
+           **{k: s.get(k) for k in ("success", "first_death", "failure_mode", "fault", "keyframes")},
+           "first_missing_milestone": ms, "trail": trail}
+    if div := _divergence(next((n for n in trail if n.get("id") == ms), {}), (reference or {}).get(ms)):
+        row["divergence"] = div
+    return row
+
+
+def clusters(rows: list) -> list[dict]:
+    """The round's FAILURE CLUSTERS: the failing seeds grouped by (first missing milestone,
+    failure_mode) -- earliest observable divergence -- biggest cluster first. The round
+    targets the cluster of its target node (``target.cluster``)."""
+    out: dict = {}
+    for r in rows:
+        if not r.get("success"):
+            out.setdefault((r.get("first_missing_milestone"), r.get("failure_mode")), []).append(r["seed"])
+    return sorted(({"milestone": k[0], "failure_mode": k[1], "seeds": v, "size": len(v)}
+                   for k, v in out.items()), key=lambda c: (-c["size"], str(c["milestone"])))
+
+
+def _notebook(rounds: list) -> list[dict]:
+    """The LAB NOTEBOOK: the last 10 rounds' ``notes`` (what the round taught, the model's
+    own words), so the campaign stops re-deriving the same conclusion every round."""
+    return [{"round": r.get("round"), "notes": r["notes"]} for r in rounds if r.get("notes")][-10:]
+
+
+def _exhausted(proj: dict, untried: list) -> bool:
+    """The brief's ``exhausted`` flag: every (knob, direction) of the target node is tried,
+    so the PARAMETER layer is closed there and the answer must come from a higher one."""
+    return bool(((proj.get("first_death") or {}).get("tunables") or {}).get("values")) \
+        and not any(str(u).startswith("tunables ") for u in untried)
 
 
 def _stage_classes(ref: str, task: str | None) -> list[type]:
@@ -340,6 +453,8 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
     fd = _driver(before, records, emb, arm, binding, evolve._first_death(before, rounds))
     ref = fd.get("tunables", {}).get("ref") or binding["policy"]
     cls = _stage_classes(ref, fd.get("task"))
+    rows = [_seed_row(seed, s, doc.get("reference") or {}) for seed, s in before["seeds"].items()]
+    cl = clusters(rows)
     proj = {
         "task": doc["task"], "embodiment": emb, "seeds": doc["seeds"], "arm": arm,
         "round": int(doc.get("cursor") or 0) + 1,
@@ -353,12 +468,10 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
                                   for s in r.get("after_seeds") or r.get("per_seed") or []]}
                     for r in rounds],
         "this_round": {"count": before["count"], "seeds_total": len(before["seeds"]),
-                       "per_seed": [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode", "fault", "keyframes")},
-                                     "trail": [{k: n.get(k) for k in ("id", "ok", "steps", "failure_mode")}
-                                               | ({"trace": n["trace"]} if n.get("trace") is not None
-                                                  and n.get("id") == s.get("first_death") else {})
-                                               for n in s.get("trail") or []]}
-                                    for seed, s in before["seeds"].items()]},
+                       "per_seed": rows},
+        # the diagnosis discipline: the ladder to answer from, the seeds' failure clusters
+        # (first missing milestone x failure_mode) and what earlier rounds concluded
+        "layers": LAYER_QUESTION, "clusters": cl, "notebook": _notebook(rounds),
         "first_death": fd,
         "proposals_consumed": [{"round": r["round"], **r["proposal"]} for r in rounds if r.get("proposal")],
         "needs": rounds[-1].get("needs") if rounds else [],
@@ -374,6 +487,7 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
         "death_nodes": [{k: d[k] for k in ("node", "seeds", "failure_mode", "rounds_targeted")}
                         for d in deaths],
         "target": {"node": fd.get("node"),
+                   "cluster": next((c for c in cl if c["milestone"] == fd.get("node")), None),
                    "why": ("the least-recently-targeted of the seeds' first-death nodes"
                            if len(deaths) > 1 else "the only first-death node")},
         "stuck_rounds": evolve.STUCK_ROUNDS,
@@ -419,8 +533,10 @@ def brief(proj: dict) -> dict:
                               "kinds": dict(Counter(r["tried"]["kind"] for r in old))}
     b["untried"] = _untried(proj, _tried_pairs(proj))
     fd = proj.get("first_death") or {}
-    if (fd.get("tunables") or {}).get("values") and not any(u.startswith("tunables ") for u in b["untried"]):
-        b["exhausted"] = f"tunables exhausted for {fd.get('node')}: every (knob, direction) is tried"
+    if _exhausted(proj, b["untried"]):
+        b["exhausted"] = (f"tunables exhausted for {fd.get('node')}: every (knob, direction) is tried. "
+                          f"The parameter layer is CLOSED here -- diagnose top-down and answer from "
+                          f"{', '.join(LAYERS[:-1])}.")
     b["log_excerpt"] = list(b.get("log_excerpt") or [])
     size = lambda: len(json.dumps(b, sort_keys=True, default=str))
     while size() > BRIEF_CHARS and b["log_excerpt"]:
@@ -459,6 +575,8 @@ def _parse(text: str) -> dict:
     ans["payload"] = dict(ans.get("payload") or {})
     if set(ans["payload"]) == {ans["kind"]} and isinstance(ans["payload"][ans["kind"]], dict):
         ans["payload"] = dict(ans["payload"][ans["kind"]])   # {"payload": {"executor": {...}}}: seen live
+    if (lay := ans.get("layer")) is not None and lay not in LAYERS:
+        raise ValueError(f"layer must be one of {'|'.join(LAYERS)} (Zetta's ladder, top-down), got {lay!r}")
     ans["rationale"] = str(ans.get("rationale") or "")
     return ans
 
@@ -848,6 +966,22 @@ def _untried(proj: dict, seen: set) -> list[str]:
     return left
 
 
+LOWER = ("the parameter layer is CLOSED on {node}: every (knob, direction) is already tried "
+         "({tried}). Diagnose top-down and answer from a HIGHER layer -- {higher} -- "
+         "{questions} Re-read the trail, the first missing milestone and its divergence, then "
+         "change CODE (patch / card) or target another node of death_nodes.")
+
+
+def _stamp(tried: dict, ans: dict, layer) -> dict:
+    """The round's diagnosis on the try: the layer it claims (``detail.layer``, the round row
+    and rsi_step carry it) and its notebook note (``detail.notes``)."""
+    if layer:
+        tried["detail"]["layer"] = layer
+    if isinstance(ans.get("notes"), str) and ans["notes"].strip():
+        tried["detail"]["notes"] = ans["notes"].strip()[:600]
+    return tried
+
+
 def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: set | None = None,
          last: bool = False) -> dict:
     """One parsed answer -> this round's ``tried``; raises ValueError with the exact
@@ -861,12 +995,20 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
     pay.setdefault("node", (proj.get("first_death") or {}).get("node"))   # the round's target; the model may override
     p = {"id": f"llm:round-{round_no}", "kind": ans["kind"], "payload": pay, "note": ans["rationale"]}
     fd = proj["first_death"]
+    left = _untried(proj, seen)
+    # top-down: a tunables decision IS a parameter-layer answer, whatever it labels itself
+    layer = ans.get("layer") or ("parameter" if ans["kind"] == "tunables" else None)
+    if layer == "parameter" and _exhausted(proj, left):
+        raise ValueError(LOWER.format(
+            node=fd.get("node"), higher=", ".join(LAYERS[:-1]),
+            tried=", ".join(sorted(f"{k[1]} {_DIR[k[2]]}" for k in seen if k[0] == "tunables")) or "-",
+            questions=" ".join(f"{k}: {LAYER_QUESTION[k]}" for k in LAYERS[:-1])))
     if ans["kind"] == "none":
-        if (left := _untried(proj, seen)) and not last:   # none is for a round with nothing left
+        if left and not last:   # none is for a round with nothing left
             raise ValueError("none is only allowed when nothing is left to try, and these are still "
                              f"untried on {fd.get('node')}: {', '.join(left)}. Answer one of them, or "
                              "say in rationale why each of them cannot help.")
-        return _none(f"llm: {ans['rationale'] or 'nothing to try'}", fd.get("node"))
+        return _stamp(_none(f"llm: {ans['rationale'] or 'nothing to try'}", fd.get("node")), ans, layer)
     if ans["kind"] == "tunables":
         if pay.get("ref") != fd.get("tunables", {}).get("ref") or not isinstance(pay.get("to"), (int, float)) \
                 or not (isinstance(pay.get("path"), list) and all(isinstance(x, str) for x in pay["path"])):
@@ -901,7 +1043,7 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
         except Exception as exc:  # noqa: BLE001 -- the executor's own failure, traceback and all
             raise ValueError(f"preflight: the trial raised on seed {before and min(before['seeds'])}:\n"
                              + traceback.format_exc()[-3000:]) from exc
-    return tried
+    return _stamp(tried, ans, layer)
 
 
 def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
