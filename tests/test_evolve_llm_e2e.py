@@ -13,6 +13,7 @@ long before the 6 rounds asked. Every attempt's raw answer is in the audit file.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -459,7 +460,10 @@ def test_the_brief_carries_the_clusters_the_first_missing_milestone_the_divergen
     assert row["first_missing_milestone"] == "drop-can1"
     assert row["divergence"]["d_base_target"] == {"seed": 1.028, "reference": 0.35, "delta": 0.678}
     assert row["divergence"]["d_eef_target"]["delta"] == 0.524   # a distribution row: its mean
-    assert proj["notebook"] == notes[-10:] and len(proj["notebook"]) == 10
+    # a notebook row is 假设+观测：the note plus what the round tried, measured and was judged
+    assert len(proj["notebook"]) == 10 and [n["round"] for n in proj["notebook"]] == list(range(3, 13))
+    assert proj["notebook"][0] == {**notes[2], "tried": "none drop-can1",
+                                   "measured": None, "verdict": None}
     assert proj["layers"]["plan"].startswith("is the node graph right")
     b = evolve_llm.brief(proj)   # call 1 sees all of it
     assert b["clusters"] == proj["clusters"] and b["notebook"] == proj["notebook"]
@@ -511,14 +515,170 @@ def test_the_first_death_row_keeps_its_geometry_and_upstream_for_the_brief():
     """The causal evidence rides the seed row, not only the trace: without ``geometry``
     (d_base_point vs the arm's reach_max) and ``upstream`` (the segment that parked the
     base there) "the base never moved" is a fact with no author and no reach to compare
-    it against. Both are on the first-death row alone."""
+    it against. Both are on the first-death row alone. ``failure_mode`` rides only when
+    the row HAS the key -- a node whose executor sealed none must not read as "no stall"."""
     from scripts.evolve_llm import _seed_row
     geo = {"d_base_point": 1.028, "reach_max": 0.664}
     up = {"node": "carry-can1", "skill": "carry", "steps": 174, "trace_end": {"d_base_target": 0.644}}
     s = {"first_death": "drop-can1", "trail": [
-        {"id": "carry-can1", "ok": True, "steps": 174, "trace_end": {"d_base_target": 0.644}},
+        {"id": "carry-can1", "ok": True, "steps": 174, "failure_mode": None,
+         "trace_end": {"d_base_target": 0.644}},
         {"id": "drop-can1", "ok": False, "steps": 65, "trace": {"end": {}},
          "geometry": geo, "upstream": up}]}
     trail = _seed_row(4243, s, {})["trail"]
     assert set(trail[0]) == {"id", "ok", "steps", "failure_mode"}
+    assert set(trail[1]) == {"id", "ok", "steps", "trace", "geometry", "upstream"}   # no key
     assert trail[1]["geometry"] == geo and trail[1]["upstream"] == up
+
+
+# ── the experiment report: absence is a reading, and the notebook carries observations ──
+
+def _round_131() -> dict:
+    """Round 131 of runs/session-robocasa-rsi/campaigns/evolve-recycle_cans, verbatim
+    (tests/fixtures/evolve_recycle_rounds.json): the candidate ran on 4243 and left NO
+    per-step series (d_eef_min_after null -- 363 of the campaign's 365 trial rows are this),
+    and on 4244 drop-can1 was never reached at all (the seed dies at nav-can1)."""
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "fixtures"
+                       / "evolve_recycle_rounds.json").read_text())["131"]
+
+
+def test_the_trial_line_says_measured_nothing_instead_of_inventing_a_divergence():
+    """378 rounds rendered 14 distinct sentences and not ONE distance number: ``if num(a)``
+    dropped the before value with the missing after one, and ``_divergent`` on an empty
+    after-series returned the baseline's first step -- "第 1 步起与基线不同" in 355 of the
+    365 trial rows, about steps nobody measured. The absence itself is the finding."""
+    from scripts.evolve_llm import _trial_line
+    line = _trial_line(_round_131()["trial_evidence"])
+    a, b = line.split("；")
+    assert "第 1 步起与基线不同" not in line          # nothing was measured to diverge
+    assert "d_eef 最小 基线 0.430 → 本轮测不到" in a  # the before value survives the absence
+    assert "d_base 最小 基线 1.028 → 本轮测不到" in a
+    assert "跑到第 117 步（基线 65 步）" in a and "没留下逐步 trace，是测不到、不是没变化" in a
+    # 4244 never reached drop-can1: 8 rounds told the model its change "had no effect"
+    assert "种子 4244" in b and "根本没执行到" in b and "你的改动没有生效" not in line
+
+
+def test_the_line_leads_with_the_failure_mode_change_and_the_notebook_pairs_it_with_the_note():
+    """A failure_mode transition is a reading only when the after side ANSWERED. With the
+    key present (the candidate executor reported its own None) the line leads with the
+    change; with the key ABSENT (``InprocExecutor.diagnostics`` -> {}) it must say 测不到.
+    Over evolve-recycle_cans' 588 rounds the judged node read None on 364 of the 365
+    candidate trial rows -- 347 at the segment cap -- while the scripted baseline rows
+    carried the stall in 580 rounds, so an unconditional "reach_stall→无" told every
+    candidate round the stall was cured. And a notebook row is a HYPOTHESIS: 10 rounds in a row wrote almost
+    the same sentence with no observation next to it, so each row now carries what was
+    tried, what was measured and how the round was judged."""
+    from scripts.evolve_llm import _notebook, _trial_line
+    diff = {"steps_before": 65, "steps_after": 300, "base_moved": False,
+            "d_eef_min_before": 0.430, "d_eef_min_after": 0.021,
+            "phase_changed": [], "first_divergent_step": 12,
+            "ok_after": False, "failure_mode_before": "reach_stall",
+            "failure_mode_after": None}
+    ev = {"node": "drop-can1", "exception": None, "seeds": [{"seed": 4243, "diff": diff}]}
+    assert _trial_line(ev).startswith("种子 4243 在 drop-can1 failure_mode reach_stall→无，跑到第 300 步")
+    mute = {k: v for k, v in diff.items() if k != "failure_mode_after"}   # nobody answered
+    line = _trial_line({**ev, "seeds": [{"seed": 4243, "diff": mute}]})
+    assert "failure_mode 基线 reach_stall → 本轮测不到" in line and "→无" not in line
+    r = _round_131()
+    rounds = [{"round": 131, "notes": r["notes"], "trial_evidence": r["trial_evidence"],
+               "tried": {"kind": "card", "node": r["tried_node"]},
+               "accepted_reason": r["was"]["reason"]},
+              {"round": 132, "notes": "同一个结论又写了一遍。", "tried": {"kind": "none", "node": None}},
+              {"round": 133, "tried": {"kind": "patch", "node": "nav-can1"}}]   # no note: no row
+    nb = _notebook(rounds)
+    assert [n["round"] for n in nb] == [131, 132]
+    assert nb[0]["tried"] == "card drop-can1" and "根本没执行到" in nb[0]["measured"]
+    assert nb[0]["verdict"] == "regressed: 4243/recover-drop-can1"
+    assert nb[1]["measured"] is None and nb[1]["verdict"] is None
+
+
+def test_the_history_carries_what_the_model_said_and_how_the_round_ended():
+    """573 of 588 rounds had ``parent: 0`` and the history rows named only the knob/path:
+    the model could not see its own earlier answers, so 77 none rounds were refused as
+    "repeated the same rejected answer". ``llm.summary`` and ``outcome`` are already on
+    the index row -- projecting them costs no new storage."""
+    proj, _ = recycle_cans_projection({"rounds": [
+        {"round": 1, "tried": {"kind": "patch", "node": "drop-can1", "detail": {"module": "m"}},
+         "before": 0, "after": 0, "published": False, "outcome": "same",
+         "accepted_reason": "no score change", "llm": {"summary": "把投放点夹进臂展。"}}]})
+    h, = proj["history"]
+    assert h["summary"] == "把投放点夹进臂展。" and h["outcome"] == "same"
+    assert h["verdict"] == "no score change"
+
+
+class _Truncated:
+    """An endpoint whose answer ran out of room mid-string. ``last_finish`` is the endpoint
+    SAYING so; ``last_usage`` at the cap is the approximation for one that does not."""
+    identity, images = "fake:truncated", False
+    last_usage, last_finish = {"prompt": 10, "completion": 4096}, None
+
+    def __init__(self, usage=..., finish=None):
+        if usage is not ...:
+            self.last_usage = usage
+        self.last_finish = finish
+
+    def chat(self, messages, **kw):
+        return '{"kind": "patch", "summary": "夹紧投放点", "payload": {"name": "p", "modu'
+
+
+def test_the_validation_layer_stops_burning_attempts_on_its_own_bookkeeping(tmp_path, monkeypatch):
+    """The five ways a live round lost an attempt to nothing but our own accounting:
+    a patch written before any source was shown (108 attempt-0 refusals, 18.6M tokens),
+    a snippet copied right but pointed at the wrong module (46 of the 136 "occurs nowhere"
+    refusals have their ``old`` sitting exactly once in a sibling module),
+    a missing one-line ``summary`` (22 attempts / 11 rounds), a bookkeeping id in
+    ``stuck.tried`` (~185 of 205 rows), and a reply cut off at ``max_tokens`` (24 rounds)."""
+    from scripts import evolve_llm
+
+    # 1. a patch always gets the material first, however complete its payload looks
+    assert evolve_llm._needs_material({"kind": "patch", "payload": {
+        "name": "p", "module": "m", "edits": [{"old": "a", "new": "b"}]}}) is True
+    assert evolve_llm._needs_material({"kind": "card", "payload": {"name": "c", "files": {}}}) is False
+
+    # 2. the right code, the wrong module -- and retyped, so the exact-once test misses it
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "modhere.py").write_text("def here():\n    return 1\n")
+    (tmp_path / "modthere.py").write_text(
+        "class T:\n    def act(self, obs):\n        self._n += 1\n        return obs\n")
+    importlib.invalidate_caches()
+    fd = {"modules": ["modhere", "modthere"]}
+    retyped = "def act(self, obs):\n  self._n += 1\n  return obs"   # the model's own indentation
+    assert (tmp_path / "modthere.py").read_text().count(retyped) == 0
+    why = evolve_llm._elsewhere([{"old": retyped, "new": "x"}], "modhere", fd)
+    assert "Three consecutive lines" in why and "MAY belong there" in why
+    assert "send `module`: 'modthere'" in why and "def act(self, obs):" in why
+    assert "WITHOUT the `NNNN| ` line-number prefixes" in why   # the text it shows IS numbered
+    assert evolve_llm._elsewhere([{"old": "def nowhere(self):", "new": "x"}], "modhere", fd) == ""
+    # ONE line in common is not evidence of another module: retyped with a tab, so it is
+    # not even a substring of modthere, the old any-single-line fallback named it anyway
+    assert evolve_llm._elsewhere([{"old": "\treturn obs", "new": "x"}], "modhere", fd) == ""
+
+    # 3. a missing summary is filled in, not sent back
+    ans = evolve_llm._parse(json.dumps({"kind": "executor", "payload": {"to": "alt"},
+                                        "rationale": "  换成 geometric 执行器  "}))
+    assert ans["summary"] == "换成 geometric 执行器"
+    assert evolve_llm._parse(json.dumps({"kind": "none", "payload": {}}))["summary"] == "none"
+
+    # 4. stuck.tried keeps the real switches and drops the per-round patch ids
+    rounds = [{"round": i, "before": [0, 0, 0], "after": [0, 0, 0], "published": False,
+               "outcome": "same", "tried": {"kind": "executor", "node": "drop-can1",
+                                            "detail": {"to": to}}}
+              for i, to in enumerate([f"patch_r{n}" for n in range(1, 7)] + ["alt_drop"], 1)]
+    proj, _ = recycle_cans_projection({"rounds": rounds, "cursor": len(rounds)})
+    assert proj["stuck"]["tried"] == ["executor alt_drop"]
+
+    # 5. a reply cut off at the cap says so, instead of "Unterminated string"
+    p2, before = _exhausted_proj()
+    tried, _ = evolve_llm.llm_propose(_Truncated(), p2, before, 3, tmp_path / "llm", max_tokens=4096)
+    audit = json.loads((tmp_path / "llm" / "round-3.json").read_text())
+    assert "被截断" in audit["attempts"][0]["reason"]
+    assert tried["kind"] == "none" and "被截断" in tried["detail"]["reason"]
+    # ...and finish_reason says it even when the endpoint reports no usage at all, which
+    # the token count alone reads as "not truncated"
+    ep = _Truncated(usage=None, finish="length")
+    tried, _ = evolve_llm.llm_propose(ep, p2, before, 4, tmp_path / "llm", max_tokens=4096)
+    assert "被截断" in tried["detail"]["reason"]
+    assert "被截断" not in evolve_llm.llm_propose(
+        _Truncated(usage=None), p2, before, 5, tmp_path / "llm",
+        max_tokens=4096)[0]["detail"]["reason"]

@@ -157,8 +157,17 @@ class KitchenThawDriver(InprocExecutor):
     def segment_diagnostics(self, env) -> dict[str, Any]:
         """``failure_mode`` ("reach_stall" or None) + ``tunables_sha`` + the stage's
         own diagnostics (``trace``) -- what every robocasa segment seals
-        (CompositeStageDriver seals the same)."""
-        return D.stage_diagnostics(self._stage, env)
+        (CompositeStageDriver seals the same, executor merge included).
+
+        With an executor bound the armed stage is never ``act``-ed (see ``act``),
+        so its Trace holds zero samples and dumps {} -- that silence is what handed
+        the evolve proposer ``d_eef_min_after: null`` on 363 of the 365 recycle_cans
+        trial rows, for the very change under test.
+        ``D.merge_executor_diagnostics`` lets the executor's own readings win --
+        and, for ``failure_mode``, lets its silence stay silent."""
+        d = D.stage_diagnostics(self._stage, env)
+        return d if self._executor is None else \
+            D.merge_executor_diagnostics(d, self._executor)
 
 
 class KitchenThawPolicies:

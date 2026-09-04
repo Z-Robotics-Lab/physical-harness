@@ -146,3 +146,46 @@ def test_segment_cap_tunable_overrides_the_stage_table(monkeypatch):
         task = "x"
     drv.enter_segment(object(), _S())
     assert drv._cap == 7
+
+
+def test_executor_diagnostics_ride_the_segment_when_it_took_the_actions():
+    """A bound executor acts INSTEAD of the armed stage, so the stage's Trace stays
+    empty and dumps {} -- 363 of the 365 evolve-recycle_cans trial rows carried
+    ``d_eef_min_after: null`` for exactly that reason. Both composite drivers
+    merge the executor's own non-empty diagnostics over the untouched stage's, and
+    merge ``failure_mode`` by key so the stage's word never stands in for silence."""
+    from plugins.embodiment_robocasa.kitchen_driver import KitchenThawDriver
+
+    class _MuteStage:      # never act-ed: dump() is {} and failure_mode stays "reach_stall"
+        failure_mode = "reach_stall"   # ...from an earlier scripted run, not from this one
+
+        def diagnostics(self, env):
+            return {"phase": "over", "trace": {}}
+
+    series = [{"step": 1, "eef": [1.0, 2.0, 1.0], "cmd": {"mode": "arm"}}]
+
+    class _Executor:
+        def diagnostics(self):
+            return {"trace": {"series": series}, "failure_mode": None}
+
+    class _Mute:           # the InprocExecutor default: reports nothing at all
+        def diagnostics(self):
+            return {}
+
+    for drv in (X.CompositeStageDriver({}, "t"), KitchenThawDriver()):
+        drv._stage = _MuteStage()
+        bare = drv.segment_diagnostics(object())
+        assert bare == D.stage_diagnostics(drv._stage, object())  # no executor: verbatim
+        drv._executor = _Executor()
+        diag = drv.segment_diagnostics(object())
+        assert diag["trace"]["series"] == series and diag["phase"] == "over"
+        # failure_mode merges by KEY: an explicit None from the executor that DID act
+        # beats the armed stage's stale word. Truthiness merging made this "reach_stall"
+        # in every candidate round, which is the fake "the stall is still there"/"cured".
+        assert diag["failure_mode"] is None
+        assert diag["tunables_sha"] == bare["tunables_sha"]
+
+        drv._executor = _Mute()          # nothing measured it -> no key at all,
+        diag = drv.segment_diagnostics(object())   # never the untouched stage's word
+        assert "failure_mode" not in diag
+        assert diag["phase"] == "over"   # the rest of the stage's row still rides

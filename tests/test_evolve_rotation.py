@@ -90,6 +90,45 @@ def test_a_node_stuck_for_stuck_rounds_widens_the_patchable_modules(monkeypatch)
     assert evolve.stuck_on("drop-can1", hist[:2]) == {"node": "drop-can1", "rounds": 2}
 
 
+def test_the_other_death_nodes_material_follows_it_and_is_in_the_brief():
+    """``target.judged`` invites the model to answer on the OTHER death node, and 86 of the
+    live campaign's 568 shard rounds took the invitation (replayed off campaign.json's
+    rotation). Only ``fd`` used to follow: the state_init the prompt's patch checklist points
+    at, the modules write_patch accepts, the source an exact ``old`` is copied out of and the
+    "still untried on X" refusal all described the rotation head -- a DIFFERENT class in a
+    different module (drop-can1 is ClusterDropDriver/PointPlaceDriver, nav-can1 is
+    NavigateDriver/NavToObjectDriver), which is how 4 live rounds died on SelfCheckError."""
+    proj, _ = _proj({"4243": "drop-can1", "4244": "nav-can1"}, [])
+    head = proj["target"]["node"]
+    other = next(n for n in proj["drivers"] if n != head)
+    a, b = proj["drivers"][head], proj["drivers"][other]
+    assert a["state_init"] != b["state_init"] and a["modules"] != b["modules"]
+    assert proj["first_death"] is a and REF.partition(":")[0] in b["modules"] + a["modules"]
+    # the brief carries them per node (``drivers`` is material, not brief): the model picks a
+    # node off death_nodes, so that row has to say what answering there means
+    rows = {r["node"]: r for r in evolve_llm.brief(proj)["death_nodes"]}
+    assert rows[other]["state_init"] == b["state_init"] and rows[other]["modules"] == b["modules"]
+    assert rows[other]["stage_modules"] == b["stage_modules"]
+    # ...and the source material covers BOTH nodes' modules, so `old` is a copy either way
+    assert set(proj["module_sources"]) == set(a["modules"]) | set(b["modules"])
+    # (whole-text vs class/function extract is the shared MODULE_CHARS budget's call; what
+    # matters is that the other node's modules are THERE, numbered, and reported per node)
+    assert set(b["modules_full"]) <= set(b["modules"])
+    assert all(proj["module_sources"][m].startswith("# file: ") for m in b["modules"])
+    # what is left to try is that node's list too (both nodes bind ONE provider here, so the
+    # knobs are shared and the patch targets are not)
+    left = evolve_llm._untried(proj, evolve_llm._tried_pairs(proj, b), b)
+    assert [u for u in left if u.startswith("patch ")] == [f"patch {m}" for m in b["modules"]]
+    assert evolve_llm.brief(proj)["untried"] != left        # the brief's is the head's
+    # a stuck round widens EVERY node's table, not the head's alone: write_patch checks the
+    # modules of payload.node, so widening one node takes the promise back on the other
+    hist = [_round(i, head, knob=f"k{i}") for i in range(evolve.STUCK_ROUNDS)]
+    hist.append(_round(len(hist), other))   # ...so the rotation hands the stuck node back
+    wide, _ = _proj({"4243": "drop-can1", "4244": "nav-can1"}, hist)
+    assert wide["stuck"]["node"] == head == wide["target"]["node"]
+    assert PLANNER in wide["drivers"][head]["modules"] and PLANNER in wide["drivers"][other]["modules"]
+
+
 def test_the_brief_says_tunables_are_exhausted_once_every_pair_is_tried():
     knobs = sorted(mount_params(REF)["tunables"])
     hist = [_round(i, "drop-can1", knob=k, up=up)

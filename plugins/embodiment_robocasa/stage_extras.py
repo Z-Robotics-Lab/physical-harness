@@ -299,8 +299,18 @@ class CompositeStageDriver:
     def segment_diagnostics(self, env) -> dict[str, Any]:
         """Stage-owned terminal details (never used for control) plus the two
         keys every robocasa segment seals: ``failure_mode`` ("reach_stall" or
-        None) and ``tunables_sha`` (the knobs this segment ran under)."""
-        return D.stage_diagnostics(self._stage, env)
+        None) and ``tunables_sha`` (the knobs this segment ran under).
+
+        With an executor bound the armed stage is never ``act``-ed (see ``act``),
+        so its Trace holds zero samples and dumps {} -- that silence is what handed
+        the evolve proposer ``d_eef_min_after: null`` on 363 of the 365 recycle_cans
+        trial rows (343 of the 345 the rounds/ shards keep; the other 20 rounds live
+        as index rows): the after side of every candidate trial, i.e. exactly the change
+        under test. ``D.merge_executor_diagnostics`` lets the executor's own
+        readings win -- and, for ``failure_mode``, lets its silence stay silent."""
+        d = D.stage_diagnostics(self._stage, env)
+        return d if self._executor is None else \
+            D.merge_executor_diagnostics(d, self._executor)
 
 
 class CompositePolicies:

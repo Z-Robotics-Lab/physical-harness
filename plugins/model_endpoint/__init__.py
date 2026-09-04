@@ -109,6 +109,9 @@ class OpenAICompatEndpoint:
         self.images = (bool(images) if images is not None
                        else any(t in (self._model or "").lower() for t in ("vision", "vl")))
         self.last_usage: dict | None = None   # {prompt, completion} tokens of the last chat()
+        # the last reply's OpenAI ``finish_reason`` ("stop" / "length" / ...): the ONLY
+        # honest "the answer was cut off" signal -- a token count only ever approximates it
+        self.last_finish: str | None = None
 
     @property
     def identity(self) -> str:
@@ -146,7 +149,8 @@ class OpenAICompatEndpoint:
         body untouched (temperature, max_tokens, seed, response_format, ...) --
         decode discipline belongs to the consumer, this is a transport. A message
         ``content`` may be a list of OpenAI content parts (text / image_url data
-        URLs) when ``images`` is on; ``last_usage`` holds the reply's token counts."""
+        URLs) when ``images`` is on; ``last_usage`` holds the reply's token counts and
+        ``last_finish`` its ``finish_reason`` ("length" = the model was cut off)."""
         if self._model is None:
             self._model = self._get_json(
                 f"{self._base}/models", self._timeout)["data"][0]["id"]
@@ -159,6 +163,7 @@ class OpenAICompatEndpoint:
         u = reply.get("usage") or {}
         self.last_usage = ({"prompt": u.get("prompt_tokens"), "completion": u.get("completion_tokens")}
                            if u else None)
+        self.last_finish = (reply["choices"][0] or {}).get("finish_reason")
         return reply["choices"][0]["message"]["content"]
 
 

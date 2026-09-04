@@ -211,6 +211,51 @@ def stage_diagnostics(stage, env) -> dict:
     return out
 
 
+def merge_executor_diagnostics(stage_diag: dict, executor) -> dict:
+    """``stage_diagnostics`` overlaid with the EXECUTOR's own, for a segment whose
+    actions an executor took over. Non-empty executor values win; ``failure_mode``
+    merges by KEY, not by truth, and vanishes entirely when the executor reports none.
+
+    With an executor bound the armed stage is never ``act``-ed (see the composite
+    drivers' ``act``), so its Trace never gets a target and ``Trace.dump()`` returns
+    {} -- every reading it seals is the absence of a run, not a run that found
+    nothing. Under the old truthy-only merge the stage's ``failure_mode: None``
+    therefore outranked whatever the executor said: over evolve-recycle_cans' 588
+    rounds the JUDGED node's after row read ``failure_mode: None`` on 364 of the 365
+    candidate trial rows, 347 of them stopped at the segment cap (nav-can1 250 steps
+    x196, drop-can1 300 x151), while the SAME nodes' scripted baseline rows carried the
+    stall in 580 of the 588 rounds (drop-can1 reach_stall, nav-can1 nav_stall) -- every
+    round the candidate rows say "cured". The field tracked "is an
+    executor bound", not what the candidate did, and evolve's trial line read it back
+    to the model as "the stall is cured". (The one exception is round 404 -- seed 4244, nav-can1,
+    nav_stall at 41 steps -- where the executor raised AttributeError ('NavToObjectDriver'
+    object has no attribute '_last_d') on its first act, so the scripted stage ran.)
+
+    Absence is the honest answer for an executor that does not report the key
+    (``InprocExecutor.diagnostics`` returns {}); the caller must render it as "not
+    measured", never as "no stall".
+
+    This merge does NOT explain the missing ``trace``, and nothing here should be read
+    as claiming it does: of the campaign's 365 card trial records (345 in the rounds/
+    shards) exactly ONE carried a trace (round 404 -- the round whose executor raised on
+    its first act), and 347 of the rest are "the judged node IS the first death, it ran, and
+    its after row carries neither trace nor trace_end". Reflection alone (no simulator)
+    shows ``Trace.dump()`` returns a falsy {} whenever the trace never got a target;
+    whether that is the path a running candidate executor takes is UNVERIFIED -- it wants
+    one live episode, not another read of the code."""
+    try:   # the executor here can BE the model's own candidate code: a raise in its
+        ex = (getattr(executor, "diagnostics", lambda: {})() or {})
+    except Exception:   # noqa: BLE001 -- diagnostics must never cost the segment its reading.
+        ex = {}         # The stage's own numbers are what the round is judged and diagnosed
+                        # on; losing them to a candidate's bad __str__ would blind the round.
+    out = {**stage_diag, **{k: v for k, v in ex.items() if v}}
+    if "failure_mode" in ex:
+        out["failure_mode"] = ex["failure_mode"]
+    else:
+        out.pop("failure_mode", None)
+    return out
+
+
 # ---- live-state readers (privileged; scripted-oracle side) -------------------
 
 def _base_pose(env):

@@ -143,7 +143,7 @@ _INDEX_KEYS = ("round", "before", "after", "best", "parent", "layer", "notes", "
                "usage", "proposer", "needs", "confirm", "trial", "stuck", "regression",
                "burned", "suite_sha", "proposal", "ts")
 _TRIED_KEYS = ("skill", "ref", "path", "from", "to", "module", "executor", "reason",
-               "hint", "error", "layer", "needs", "match", "name")
+               "hint", "error", "layer", "needs", "match", "name", "patch_sha")
 _SEED_KEYS = ("seed", "success", "first_death", "failure_mode")
 
 
@@ -168,8 +168,9 @@ def index_row(r: dict, baseline: bool = False) -> dict:
     computed off the trails it drops (``node_rate`` / ``by_task``: board.store._rates,
     the same reading the RSI page's line and heat strip make), so the page can show 500
     rounds without ever opening a shard. ``baseline`` keeps round 1's trails: EVERY round
-    re-reads them (``cluster_seeds`` scores the origin cluster off ``rounds[0]``), and a
-    shard read that silently failed would read as "no cluster" -- 21 KB against that."""
+    re-reads them (``cluster_seeds`` scores the origin cluster off ``rounds[0]``, and falls
+    back to the round's own, weaker cluster when they carry no trail), and a shard read that
+    silently failed would read as "no cluster" -- 21 KB against that."""
     t = r.get("tried") or {}
     out = _clip({k: r[k] for k in _INDEX_KEYS if k in r}, "notes", "accepted_reason")
     nb, tb = bs._rates(r.get("per_seed"))
@@ -539,12 +540,19 @@ def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_roo
             if n["ok"] is None and "success" in r:
                 n["ok"] = bool(r["success"])
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
-            n["failure_mode"] = n["failure_mode"] or diag.get("failure_mode")
+            # ``failure_mode`` only when somebody measured it: an executor that seals none
+            # leaves NO key (D.merge_executor_diagnostics), and that absence has to survive
+            # all the way to _trial_line, which renders it "测不到". A None here reads as
+            # "no stall" -- the fake cure every candidate round used to be told about.
+            if "failure_mode" in diag or n["failure_mode"] is not None:
+                n["failure_mode"] = n["failure_mode"] or diag.get("failure_mode")
+            else:
+                del n["failure_mode"]
             if (diag.get("trace") or {}).get("end"):   # where this segment ENDED, every node:
                 n["trace_end"] = diag["trace"]["end"]  # the reference index + the upstream row
-            if n["id"] == dead and diag.get("trace"):   # the stall geometry (with the per-step
-                n["trace"] = diag["trace"]              # ``series``) and the target's provenance,
-                n["geometry"] = diag.get("geometry")    # first death only
+            if diag.get("trace") and n["id"] == dead:
+                n["trace"] = diag["trace"]   # the stall geometry (with the per-step ``series``)
+                n["geometry"] = diag.get("geometry")   # and the target's provenance.
         _link_upstream(per[str(seed)]["trail"], dead, skills)
         logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
                                         evolve_llm.MAX_LOG_LINES // len(seq))
@@ -658,7 +666,13 @@ def _minimum(series: list, key: str, node: dict, end_key: str):
 
 def _divergent(base: list, trial: list):
     """The first step at which the trial's series stops matching the baseline's (phase,
-    d_eef, d_base); the first extra step when one simply runs longer; None when equal."""
+    d_eef, d_base); the first extra step when one simply runs longer; None when equal.
+    A MISSING series is not a divergence: with an empty after-side the length branch below
+    returned the baseline's first step, so 355 of the recycle_cans campaign's 365 trial
+    rows told the model "第 1 步起与基线不同" (all of them "step 1") when the truth was
+    that nothing was measured."""
+    if not base or not trial:
+        return None
     key = lambda r: (r.get("phase"), r.get("d_eef"), r.get("d_base"))
     for b, a in zip(base, trial):
         if key(b) != key(a):
@@ -672,7 +686,9 @@ def trial_evidence(before: dict, after: dict, node, seeds: list, exc: dict | Non
     and ``geometry`` under the trial (the evidence the baseline already carries) plus the
     ``diff`` against that seed's BASELINE row -- ``{phase_changed (the trial's phase
     sequence when it differs), first_divergent_step, base_moved, d_eef_min_before/after,
-    d_base_min_before/after, steps_before/after}`` -- and the ``exception`` the executor
+    d_base_min_before/after, steps_before/after, ok_after, failure_mode_before/after
+    (each present only when THAT side actually reported one)}``
+    -- and the ``exception`` the executor
     raised (preflight or suite), whole. Without it a round only ever said "0 -> 0"."""
     ev = {"node": node, "exception": exc, "seeds": []}
     for s in seeds:
@@ -692,7 +708,18 @@ def trial_evidence(before: dict, after: dict, node, seeds: list, exc: dict | Non
                      "d_eef_min_after": _minimum(sa, "d_eef", a, "d_eef_target"),
                      "d_base_min_before": _minimum(sb, "d_base", b, "d_base_target"),
                      "d_base_min_after": _minimum(sa, "d_base", a, "d_base_target"),
-                     "steps_before": b.get("steps"), "steps_after": a.get("steps")}})
+                     "steps_before": b.get("steps"), "steps_after": a.get("steps"),
+                     "ok_after": a.get("ok"),
+                     # failure_mode rides ONLY when the row carries the key. An executor
+                     # that reports no failure_mode leaves none (D.merge_executor_
+                     # diagnostics), and "the candidate never answered" must not render as
+                     # "reach_stall→无": over the campaign's 588 rounds the judged node
+                     # read None on 364 of the 365 candidate trial rows, 347 of them at the
+                     # segment cap, while the scripted baseline rows carried the stall in
+                     # 580 of those rounds -- i.e. the old unconditional key said "cured"
+                     # in every candidate round.
+                     **{f"failure_mode_{w}": r["failure_mode"]
+                        for w, r in (("before", b), ("after", a)) if "failure_mode" in r}}})
     return ev
 
 
@@ -880,11 +907,24 @@ def stuck_on(node, history: list | None, rounds: int | None = None) -> dict | No
 
 def cluster_seeds(rounds: list, before: dict, milestone) -> list[int]:
     """The ORIGIN CLUSTER of a milestone: the seeds that shared it as their first missing
-    milestone in the campaign's BASELINE round (round 1's per_seed), else in this round --
-    the cohort a fix has to keep, seeds it has already won included."""
+    milestone in the campaign's BASELINE round (round 1's per_seed) -- the cohort a fix has
+    to keep, seeds it has already won included.
+
+    The fallback below CHANGES that meaning, and only where the origin cluster cannot be
+    read at all: with no trail in round 1 there is no baseline cohort, so this scores the
+    cluster of THIS round instead -- a seed already repaired has left the cluster and stops
+    being guarded against a later round losing it again. Weaker than the origin cluster,
+    stronger than the empty list a baseline-only reading returns."""
     if not milestone:   # nothing died: there is no cluster to regress against
         return []
-    rows = ((rounds[0].get("per_seed") if rounds else None) or per_seed(before))
+    # round 1's rows can EXIST and carry no trail (the live campaign's baseline row is
+    # [{seed: 4243, nodes: []}, {seed: 4244, nodes: []}]), and an empty trail has no first
+    # missing milestone -- so this returned [] for all 588 rounds of evolve-recycle_cans.
+    # That is NOT why the historical regression never ran there: regression() is only
+    # reached under ``if published``, and that campaign published 0 rounds (0 accepted,
+    # best 0). An empty cluster silently skipping the check is a second way to lose it.
+    r0 = (rounds[0].get("per_seed") if rounds else None) or []
+    rows = r0 if any(r.get("nodes") for r in r0) else per_seed(before)
     return sorted(int(r["seed"]) for r in rows
                   if evolve_llm.first_missing(r.get("nodes")) == milestone)
 
@@ -902,6 +942,41 @@ def regression(rounds: list, before: dict, after: dict, milestone) -> dict | Non
     hit = lambda suite: sum(ok(suite, s) for s in cs)
     return {"seeds": cs, "before": hit(before), "after": hit(after),
             "lost": [s for s in cs if ok(before, s) and not ok(after, s)]} if cs else None
+
+
+def verdict(tried: dict, trial_row: dict | None, regs: list, confirm: dict | None,
+            published: bool, bs_score: tuple, as_score: tuple) -> tuple[bool, str]:
+    """ACCEPT, level one: ``(accepted, why)`` for a round that ran -- the score rose and
+    nothing that passed stopped passing. (Level two, the publish, is decided upstream.)
+
+    A FOCUSED trial is judged by the SAME score as a full one. Refusing it outright --
+    "focused trial: <node> passed on no seed of its cluster", without ever reading the
+    score -- ended 347 of the recycle_cans campaign's 588 rounds (nav-can1 196,
+    drop-can1 151); nothing written in those rounds could have been accepted.
+    ``regressions`` already skips the seeds a focused trial never ran (they carry no
+    evidence either way) and the publish still demands scope == "full". What a focused
+    accept CANNOT be is the next round's baseline: its suite is ``_merge(before, done)``,
+    so every seed the trial never ran keeps a row measured under the previous state, and
+    downstream nothing tells those rows from fresh ones (they ride under the round's own
+    ``suite_sha``). ``next_baseline`` drops it instead -- one extra suite for the round
+    after a focused accept, against a stale row that would otherwise propagate forever."""
+    if tried["kind"] == "none" or trial_row is None:
+        return False, "nothing tried"
+    if regs:
+        return False, "regressed: " + ", ".join(f"{g['seed']}/{g['node']}" for g in regs[:4])
+    if confirm and not published:   # the fresh seeds refused it: not a baseline either
+        return False, f"confirm {confirm['before']} -> {confirm['after']}"
+    if as_score > bs_score:
+        return True, f"score {list(bs_score)} -> {list(as_score)}, no node regressed"
+    return False, f"score {list(bs_score)} -> {list(as_score)}"
+
+
+def next_baseline(accepted: bool, trial_row: dict | None, kept: dict) -> dict | None:
+    """The suite the next round starts from -- None means "re-run it". Only a FOCUSED
+    accept returns None: its suite carries baseline rows for every seed the trial never
+    ran (see ``verdict``), so the round after it pays one full retest under the accepted
+    state rather than scoring against rows the accepted change was never run on."""
+    return None if accepted and (trial_row or {}).get("scope") == "focused" else kept
 
 
 # ── score: the gradient. Whole-task success alone is flat (0/2 for 90 rounds) ─────
@@ -1011,13 +1086,15 @@ def take_proposal(session: Path, task: str, round_no: int) -> dict | None:
     return None
 
 
-def from_proposal(p: dict, before: dict) -> dict:
+def from_proposal(p: dict, before: dict, node_default: str | None = None) -> dict:
     """A proposal as this round's ``tried`` -- the same {kind, node, detail} shape the
     built-in proposer emits (so apply/publish need no second path), plus
-    ``detail.proposal`` (id) and ``detail.note``. ``payload.node`` else the commonest
-    first-death node; a node the suite never ran is an honest ``none``."""
+    ``detail.proposal`` (id) and ``detail.note``. ``payload.node`` else ``node_default``
+    (the round's rotated target, handed in so the caller and this do not each compute a
+    first-death node of their own) else the commonest first-death node; a node the suite
+    never ran is an honest ``none``."""
     pay = dict(p["payload"])
-    node = pay.pop("node", None) or _first_death(before)
+    node = pay.pop("node", None) or node_default or _first_death(before)
     runs = [s["nodes"][node] for s in before["seeds"].values() if node in s["nodes"]]
     tag = {"proposal": p["id"], "note": p["note"]}
     if not runs:
@@ -1361,7 +1438,7 @@ def main(argv=None) -> int:
         proposer, llm, tried = "inbox", None, None
         pre.clear()
         if prop:
-            tried = from_proposal(prop, before)
+            tried = from_proposal(prop, before, _first_death(before, doc["rounds"]))
         elif args.proposer == "llm":
             proposer = "llm"
             try:
@@ -1401,7 +1478,15 @@ def main(argv=None) -> int:
                     scope, foc = "focused", run_seeds(focus)
                     target_pass = sum(bool((_ok_map(foc).get(str(x)) or {}).get(tried["node"]))
                                       for x in focus)
-                if scope == "full" or target_pass:
+                # ``set(full) <= ran`` : the preflight seed plus the focus already covered
+                # the whole dev range, so run_seeds(full) below is a no-op and the round is
+                # a full retest under any name -- round 556 ran 4243 in preflight and 4244
+                # in the focus (usage.sim_s 59.8, two whole seeds) and was still filed
+                # "focused". It was not robbed of an accept -- its score stood still
+                # ([0,9,1] -> [0,9,1]) and it is refused on the score either way; what the
+                # old filing cost was the TRUTH of the refusal, which said the node passed
+                # on no seed of its cluster instead of saying the score did not move.
+                if scope == "full" or target_pass or set(full) <= ran:
                     after = run_seeds(full)
                     scope, target_pass = "full", score(after, tried["node"])[2]
                 else:   # the target still does not pass: the rest of the suite is not spent.
@@ -1462,19 +1547,7 @@ def main(argv=None) -> int:
         # baseline; only a whole-task win also publishes evidence into the skill record.
         bs_score, as_score = score(before, tried["node"]), score(after, tried["node"])
         regs = regressions(before, after)
-        if tried["kind"] == "none" or trial_row is None:
-            accepted, why = False, "nothing tried"
-        elif trial_row["scope"] == "focused":
-            accepted, why = False, f"focused trial: {tried['node']} passed on no seed of its cluster"
-        elif regs:
-            accepted = False
-            why = "regressed: " + ", ".join(f"{g['seed']}/{g['node']}" for g in regs[:4])
-        elif confirm and not published:   # the fresh seeds refused it: not a baseline either
-            accepted, why = False, f"confirm {confirm['before']} -> {confirm['after']}"
-        elif as_score > bs_score:
-            accepted, why = True, f"score {list(bs_score)} -> {list(as_score)}, no node regressed"
-        else:
-            accepted, why = False, f"score {list(bs_score)} -> {list(as_score)}"
+        accepted, why = verdict(tried, trial_row, regs, confirm, published, bs_score, as_score)
         if published and not accepted:   # a whole-task win is the accepted state by definition
             accepted, why = True, f"published: {before['count']} -> {after['count']} ({why})"
         if accepted:
@@ -1528,7 +1601,7 @@ def main(argv=None) -> int:
             "trial_evidence": _evidence_summary(evidence)}
         doc["cursor"], doc["applied"] = r, applied
         tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
-        base = kept
+        base = next_baseline(accepted, trial_row, kept)
         if tried["kind"] != "none":
             tries, nones = tries + 1, 0
         elif not tried["detail"].get("needs"):

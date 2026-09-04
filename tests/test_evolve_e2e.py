@@ -270,7 +270,10 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
     assert isinstance(n_steps, int) and n_steps > 0
     kept = [{"seed": s, "success": True, "first_death": None, "failure_mode": None,
              "tunables_sha": None, "elapsed_s": pytest.approx(1, abs=30),
-             "nodes": [{"id": n, "ok": True, "steps": n_steps, "failure_mode": None,
+             # no per-node failure_mode: the fake stage seals none, and a node nobody
+             # measured carries NO key (a None there reads as "no stall" -- see
+             # D.merge_executor_diagnostics). The seed-level one above is a plain default.
+             "nodes": [{"id": n, "ok": True, "steps": n_steps,
                         "after": after, "kind": "segment", "task": n.split("-")[0]}
                        for n, after in (("reach-0", []), ("grab-0", ["reach-0"]))]} for s in (1, 2)]
     assert [s["per_seed"] for s in steps] == [r1["per_seed"], r2["per_seed"]] == [kept, kept]

@@ -18,7 +18,7 @@ from test_evolve_e2e import _CARD as _E2E_CARD
 from test_evolve_patch_e2e import GOOD, MODULE
 from test_mission_e2e import _Runtime
 
-from scripts import evolve
+from scripts import evolve, evolve_llm
 
 # ── trial_evidence: the diff against the baseline seed ────────────────────────────
 
@@ -45,10 +45,38 @@ def test_the_diff_says_what_the_trials_own_code_did_differently():
     assert ev["node"] == "drop-can1" and ev["exception"] is None
     seed, = ev["seeds"]
     assert seed["seed"] == 1 and seed["trace"]["series"] is TRIAL   # the per-step evidence rides along
+    # no failure_mode_* here: neither of these rows CARRIES the key, and a row nobody
+    # measured must not turn into "无" downstream (see the absence test below).
     assert seed["diff"] == {
         "phase_changed": ["approach", "drive"], "first_divergent_step": 4, "base_moved": True,
         "d_eef_min_before": 0.9, "d_eef_min_after": 0.3, "d_base_min_before": 1.03,
-        "d_base_min_after": 0.31, "steps_before": 40, "steps_after": 61}
+        "d_base_min_after": 0.31, "steps_before": 40, "steps_after": 61, "ok_after": False}
+
+
+def test_a_failure_mode_rides_only_when_that_side_actually_reported_one():
+    """``failure_mode_after`` is the causal reading the distances never gave -- and the
+    easiest one to fake. A candidate executor that reports no failure_mode leaves NO key
+    (D.merge_executor_diagnostics), and the absence has to survive to _trial_line, which
+    renders it 测不到. Over evolve-recycle_cans' 588 rounds the judged node read None on
+    364 of the 365 candidate trial rows, 347 of them at the segment cap, while the same
+    two nodes' scripted baseline rows carried the stall in 580 rounds: an unconditional
+    key told the model "failure_mode reach_stall→无" in essentially every candidate round."""
+    def suite(fm):
+        s = _suite(1, "drop-can1", BASE, 40)
+        row = s["seeds"]["1"]["trail"][0]
+        if fm is not ...:
+            row["failure_mode"] = fm
+        return s
+
+    scripted, silent = suite("reach_stall"), suite(...)
+    answered = evolve.trial_evidence(scripted, suite(None), "drop-can1", [1])["seeds"][0]["diff"]
+    assert answered["failure_mode_before"] == "reach_stall"   # an explicit None IS a reading
+    assert "failure_mode_after" in answered and answered["failure_mode_after"] is None
+    mute = evolve.trial_evidence(scripted, silent, "drop-can1", [1])["seeds"][0]["diff"]
+    assert mute["failure_mode_before"] == "reach_stall" and "failure_mode_after" not in mute
+    line = evolve_llm._trial_line({"node": "drop-can1", "exception": None,
+                                   "seeds": [{"seed": 1, "diff": mute}]})
+    assert "本轮测不到（执行器没交回这个读数）" in line and "→无" not in line
 
 
 def test_a_trial_that_changed_nothing_says_so_and_a_missing_node_is_not_invented():
@@ -131,13 +159,19 @@ def _patch(name, new):
                         "edits": [{"old": HIT, "new": new}]}}
 
 
+#: A patch decision with no payload: call 1 of every patch round now, since the brief
+#: carries no source and the answer must be written against the material (call 2).
+_ASK = {"decision": "patch", "summary": "先要源码。", "rationale": "grab never closes"}
+
 CANNED = [
+    _ASK,   # round 1 call 1: the two-step answers with the material, no attempt spent
     # round 1, attempt 1: state the class never initialises -- refused with NO simulator
     _patch("uninit", "        if self._last_d < 0.5:"),
     # attempt 2: passes the doctor and the self-check, then raises inside act on the preflight seed
     _patch("raiser", '        raise RuntimeError("act blew up")\n' + HIT),
     # attempt 3 (the last): an honest none -- the round ends with the raise as its finding
     {"decision": "none", "summary": "先停。", "rationale": "两次都失败了，先停下"},
+    _ASK,   # round 2 call 1
     # round 2: the real fix -- it runs, wins, and the evidence says what it did
     {"decision": "patch", "summary": "把 STOP 调小。", "rationale": "the standoff never closes",
      "payload": {"name": "grab_stop", "module": MODULE, "to": "patched", "edits": GOOD}},
@@ -184,8 +218,9 @@ def test_a_candidate_that_runs_reports_the_before_after_diff(runtime):
     assert ev["exception"] is None and ev["node"] == r2["tried"]["node"]
     assert [s["seed"] for s in ev["seeds"]] == [1, 2]
     for s in ev["seeds"]:   # the fake stage carries no per-step series: the steps still diff
+        # and no failure_mode either side -- it never seals one, so no key is invented
         assert set(s["diff"]) == {"phase_changed", "first_divergent_step", "base_moved",
                                   "d_eef_min_before", "d_eef_min_after", "d_base_min_before",
-                                  "d_base_min_after", "steps_before", "steps_after"}
+                                  "d_base_min_after", "steps_before", "steps_after", "ok_after"}
         assert s["diff"]["steps_before"] and s["diff"]["steps_after"]
     assert doc["last_outcome"]["trial_evidence"]["seeds"][0]["steps_after"]

@@ -322,3 +322,44 @@ def test_the_refused_recycle_cans_rounds_are_accepted_now():
         bs = evolve.score(before, row["tried_node"])
         assert list(bs) == [0, 9, 0] and list(evolve.score(after, row["tried_node"])) == want
         assert evolve.score(after, row["tried_node"]) > bs   # accepted: score up, no regression
+
+
+def test_a_focused_round_is_judged_by_the_score_like_any_other():
+    """Round 556 of the same campaign: 347 of its 588 rounds ended
+    ``focused trial: <node> passed on no seed of its cluster`` (nav-can1 196,
+    drop-can1 151) -- refused before the score was ever read. 556 had in fact run BOTH
+    dev seeds (4243 in preflight, 4244 in the focus: 59.8 sim_s) and still scored the
+    trial away. Judged on the score it is still refused, but for the true reason; and the
+    same judge accepts when the score DOES move -- 389's suites under 556's focused trial
+    row (389 itself ran ``scope: "full"`` and was refused ``regressed:
+    4243/recover-drop-can1``; the pairing is what makes this a focused round that won)."""
+    tie = _rounds()["556"]
+    assert tie["was"] == {"accepted": False,
+                          "reason": "focused trial: nav-can1 passed on no seed of its cluster"}
+    focused = dict(tie["trial"])
+    assert focused["scope"] == "focused"
+    tried = {"kind": "patch", "node": tie["tried_node"], "detail": {}}
+    judge = lambda row, node: evolve.verdict(
+        tried, focused, evolve.regressions(_real(row["per_seed"]), _real(row["after_seeds"])),
+        None, False, evolve.score(_real(row["per_seed"]), node),
+        evolve.score(_real(row["after_seeds"]), node))
+    assert judge(tie, tie["tried_node"]) == (False, "score [0, 9, 1] -> [0, 9, 1]")
+    won = _rounds()["389"]
+    accepted, why = judge(won, won["tried_node"])
+    assert accepted is True and why == "score [0, 9, 0] -> [0, 16, 1], no node regressed"
+
+
+def test_a_focused_accept_does_not_become_the_next_rounds_baseline():
+    """A focused trial's suite is ``_merge(before, done)``: every seed it never ran keeps a
+    row measured under the PREVIOUS state. Round 556's focus was 4244 alone, so accepting it
+    would have carried 4243's baseline row into the next round under a fresh ``suite_sha``,
+    where nothing can tell it from a measured one. ``next_baseline`` returns None and the
+    next round re-runs the suite -- one retest against a stale row that never expires. None
+    of the campaign's 347 focused rounds was accepted, so the cost is entirely future."""
+    kept = _real(_rounds()["556"]["after_seeds"])
+    focused = _rounds()["556"]["trial"]
+    assert focused["scope"] == "focused" and focused["seeds"] == [4244]
+    assert evolve.next_baseline(True, focused, kept) is None      # the one case that re-runs
+    assert evolve.next_baseline(False, focused, kept) is kept     # refused: nothing changed
+    assert evolve.next_baseline(True, {**focused, "scope": "full"}, kept) is kept
+    assert evolve.next_baseline(True, None, kept) is kept         # nothing tried

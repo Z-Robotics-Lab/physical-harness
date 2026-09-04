@@ -39,7 +39,8 @@ class _Server(BaseHTTPRequestHandler):
             "auth": self.headers.get("Authorization"),
             "body": json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
         }
-        self._reply({"choices": [{"message": {"content": "pong"}}]})
+        self._reply({"choices": [{"message": {"content": "pong"},
+                                  "finish_reason": "length"}]})
 
     def _reply(self, payload):
         body = json.dumps(payload).encode()
@@ -94,6 +95,9 @@ def test_chat_speaks_openai_shape_end_to_end(endpoint_url, monkeypatch):
     assert seen["body"]["messages"] == [{"role": "user", "content": "ping"}]
     assert seen["body"]["temperature"] == 0.5  # opts pass through untouched
     assert seen["body"]["max_tokens"] == 8
+    # the reply's own verdict on why it stopped: the evolve proposer reads "length" as
+    # "the answer was cut off", which a completion-token count only ever approximates
+    assert ep.last_finish == "length"
 
 
 def test_named_credential_falls_back_to_dsh_store_without_entering_identity(

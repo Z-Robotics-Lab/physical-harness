@@ -105,6 +105,26 @@ def test_a_500_round_campaign_stays_small_and_every_history_answer_is_unchanged(
     assert doc["rounds"][0]["per_seed"][0]["nodes"] and not doc["rounds"][1]["per_seed"][0].get("nodes")
 
 
+def test_a_baseline_round_with_trail_less_rows_still_has_an_origin_cluster():
+    """The live campaign's round 1 rows ARE there and carry no trail
+    (``[{seed: 4243, nodes: []}, {seed: 4244, nodes: []}]``) -- an empty trail has no first
+    missing milestone, so the cluster came back empty for all 588 rounds. (It was not what
+    kept the historical regression from ever running there: ``regression()`` is only reached
+    under ``if published`` and that campaign published nothing.) The fallback reads THIS
+    round's cluster instead, which is a WEAKER guarantee: a seed already repaired is no
+    longer in the cluster, so a later round losing it again is not caught."""
+    seed = lambda s, dead, upto: {"success": False, "first_death": dead, "nodes": {},
+                                  "trail": _seed_row(s, dead, upto)["nodes"]}
+    suite = {"count": 0, "seeds": {"4243": seed(4243, "drop-can1", 3),
+                                   "4244": seed(4244, "grasp-can1", 1)}}
+    empty = [{"round": 1, "per_seed": [{"seed": 4243, "nodes": []}, {"seed": 4244, "nodes": []}]}]
+    assert evolve.cluster_seeds(empty, suite, "drop-can1") == [4243]
+    assert evolve.cluster_seeds(empty, suite, "grasp-can1") == [4244]
+    # the semantic change the fallback buys: 4243 repaired past drop-can1 leaves its cluster
+    fixed = {**suite, "seeds": {**suite["seeds"], "4243": seed(4243, "grasp-can1", 1)}}
+    assert evolve.cluster_seeds(empty, fixed, "drop-can1") == []
+
+
 def test_the_index_carries_the_chart_and_the_heat_strip_without_the_trails(tmp_path):
     """Item 5: the RSI page must draw 500 rounds off campaign.json alone."""
     doc = _store(tmp_path, _doc(60)).load()
