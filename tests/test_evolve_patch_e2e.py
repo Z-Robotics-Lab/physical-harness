@@ -11,6 +11,7 @@ Plus the pure-Python diff applier's edge cases and the recycle_cans call-1 brief
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
 
@@ -87,7 +88,11 @@ def test_patch_edits_land_on_a_copy_after_two_steps_and_two_repairs(runtime):
     roles = [m["role"] for m in a2["messages"]]
     assert roles == ["system", "user", "user", "assistant", "user"] + ["assistant", "user"] * 2
     assert a2["messages"][1]["content"].startswith("Materials (static):") and "executor_contract" in a2["messages"][1]["content"]
-    assert a2["messages"][2]["content"].startswith("Round input:") and a2["messages"][4]["content"].startswith("You decided patch")
+    assert a2["messages"][4]["content"].startswith("You decided patch")
+    # the brief LEADS with what round 1's knob actually did in the simulator: nothing
+    assert a2["messages"][2]["content"].startswith(
+        "你上一轮的补丁跑了：种子 1 在 grab-0 跑到第 8 步，与基线逐步完全相同＝你的改动没有生效")
+    assert "\n\nRound input:\n" in a2["messages"][2]["content"]
     twice, absent = (a["reason"] for a in a2["attempts"])
     assert twice.startswith("patch:edit 1: `old` occurs 2 times in the module, it must occur exactly once")
     # the rejection carries the WHOLE enclosing function (a +/-6 window is not enough to copy from)
@@ -231,7 +236,7 @@ def test_an_answer_identical_to_a_rejected_one_costs_no_attempt_and_ends_the_rou
     assert len(audit["attempts"]) == 1 and len(audit["repeats"]) == 2   # the repeats are not attempts
     assert audit["repeats"][0]["reason"] == audit["attempts"][0]["reason"]
     nag = audit["messages"][5]["content"]
-    assert nag.startswith("你重复了上一条被拒的回答（ValueError: hover_dz up was already tried")
+    assert nag.startswith("你重复了一条已经被拒的回答（ValueError: hover_dz up was already tried")
     assert "必须换一个做法：改别的地方，或改用 executor/card/patch/none。" in nag
     assert tried["kind"] == "none" and tried["detail"]["reason"] == "llm: repeated the same rejected answer"
     assert tried["detail"]["needs"] == ["proposal", "llm: repeated the same rejected answer"]
@@ -257,3 +262,133 @@ def test_a_patch_written_blind_is_rejected_with_the_module_text_attached(tmp_pat
     assert mat.startswith("Materials (static):") and "  36|     STOP = 0.65" in mat
     assert audit["messages"][4]["content"].startswith("Your proposal was rejected")
     assert tried["kind"] == "executor" and tried["detail"]["to"] == "alt"
+
+
+UNINIT = ("from harness.skill_executor import InprocExecutor\n\n\n"
+          "class _E(InprocExecutor):\n    def bind(self, env, target=None):\n        pass\n\n"
+          "    def act(self, obs):\n        return (0.0,) if self._last_d else (0.1,)\n\n\n"
+          "class _P:\n    def make_driver(self, spec):\n        return _E()\n\n\n"
+          "def provider(**params):\n    return _P()\n")
+
+
+def _preflight(tried):
+    """What scripts/evolve.py's preflight does: the static self-check first (a finding is
+    raised where the doctor's are, so it rides the repair loop), then the seed."""
+    from scripts import evolve
+
+    if why := evolve.self_check(tried):
+        raise evolve.SelfCheckError(why)
+
+
+def _card(name, code, to="llm"):
+    from test_evolve_llm_e2e import MANIFEST
+
+    return {"kind": "card", "payload": {"name": name, "to": to, "ref": f"{name}:provider",
+            "files": {"manifest.toml": MANIFEST.format(to=to, name=name), "__init__.py": code}},
+            "summary": "写一个执行器。", "rationale": "-", "layer": "state"}
+
+
+ELSEWHERE = {"kind": "executor", "payload": {"to": "alt"}, "summary": "换执行器。", "rationale": "-",
+             "layer": "plan"}
+
+
+def test_the_self_check_finding_comes_back_with_the_candidates_own_numbered_source(tmp_path, monkeypatch):
+    """Rounds 104 and 108 wrote code reading state nothing assigns: the finding is what the
+    model must see, together with the line of ITS OWN candidate copy that reads it."""
+    from test_evolve_llm_e2e import _fake, _repeat_proj
+
+    monkeypatch.setattr(evolve_llm, "CANDIDATES_ROOT", tmp_path / "cands")
+    proj, before = _repeat_proj([])
+    ep = _fake(tmp_path, [_card("grab_uninit", UNINIT), ELSEWHERE], name="uninit.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 4, tmp_path / "llm", preflight=_preflight)
+    a4 = json.loads((tmp_path / "llm" / "round-4.json").read_text())
+    why = a4["attempts"][0]["reason"]
+    assert why.startswith("doctor:self-check (static, no sim): __init__.py: _E reads self._last_d")
+    assert "__init__.py -- YOUR OWN code, around line 9 (fix THIS, not the installed source" in why
+    assert "   9|         return (0.0,) if self._last_d else (0.1,)" in why
+    assert why in a4["messages"][4]["content"]      # the repair message, verbatim
+    assert (tried["kind"], tried["detail"]["to"]) == ("executor", "alt")
+    assert a4["attempts"][0]["sha"]                 # remembered for the next rounds
+
+
+def test_the_same_rejected_answer_a_later_round_is_refused_with_the_round_it_failed_in(tmp_path, monkeypatch):
+    """Across ROUNDS, not only within one: round 108 re-sent round 104's patch and the
+    harness paid for it a second time."""
+    from test_evolve_llm_e2e import _fake, _repeat_proj
+
+    monkeypatch.setattr(evolve_llm, "CANDIDATES_ROOT", tmp_path / "cands")
+    proj, before = _repeat_proj([])
+    bad = _card("grab_uninit", UNINIT)
+    evolve_llm.llm_propose(_fake(tmp_path, [bad, ELSEWHERE], name="r4.json"), proj, before, 4,
+                           tmp_path / "llm", preflight=_preflight)
+    tried, _ = evolve_llm.llm_propose(_fake(tmp_path, [bad, bad], name="r5.json"), proj, before, 5,
+                                      tmp_path / "llm", preflight=_preflight)
+    a5 = json.loads((tmp_path / "llm" / "round-5.json").read_text())
+    assert a5["attempts"] == []      # never doctored, never preflighted, no simulator
+    assert a5["repeats"][0]["reason"].startswith("第 4 轮已经提过同一条回答并被拒：doctor:self-check")
+    assert "第 4 轮已经提过同一条回答并被拒" in a5["messages"][3]["content"]
+    assert tried["detail"]["reason"] == evolve_llm.REPEATED
+
+
+def test_a_raising_trial_comes_back_with_the_exception_and_the_candidates_own_numbered_source(tmp_path, monkeypatch):
+    """A trial that raises inside the model's own code: the traceback AND the numbered lines
+    of the candidate copy, so the repair is to that code and not to the installed source."""
+    from test_evolve_llm_e2e import _EXEC, _fake, _repeat_proj
+
+    monkeypatch.setattr(evolve_llm, "CANDIDATES_ROOT", tmp_path / "cands")
+    code = _EXEC.format(act="(0.0,)") + ('\n\ndef boom():\n    d = 0.0\n    raise AttributeError('
+                                         '"\'GrabStage\' object has no attribute \'_last_d\'")\n')
+    proj, before = _repeat_proj([])
+    ep = _fake(tmp_path, [_card("grab_boom", code), ELSEWHERE], name="boom.json")
+    tried, _ = evolve_llm.llm_propose(ep, proj, before, 6, tmp_path / "llm",
+                                      preflight=lambda t: importlib.import_module("grab_boom").boom())
+    why = json.loads((tmp_path / "llm" / "round-6.json").read_text())["attempts"][0]["reason"]
+    assert why.startswith("preflight: the trial raised on seed")
+    assert "AttributeError: 'GrabStage' object has no attribute '_last_d'" in why
+    assert "__init__.py -- YOUR OWN code, around line" in why
+    assert '|     raise AttributeError("\'GrabStage\' object has no attribute \'_last_d\'")' in why
+    assert (tried["kind"], tried["detail"]["to"]) == ("executor", "alt")
+
+
+def test_state_init_names_where_new_state_belongs():
+    """The rules tell a patch to initialise new state in the class's EXISTING constructor /
+    reset: the materials name those methods and what they already set."""
+    from fakes.patch_stage import Driver, GrabStage
+
+    assert evolve_llm._state_init([GrabStage, Driver]) == {
+        f"{MODULE}:GrabStage.__init__": ["target"],
+        f"{MODULE}:Driver.__init__": ["_cap", "_env", "_ex", "_native", "_stage", "n"]}
+
+
+def test_the_brief_leads_with_what_the_last_change_actually_did_in_the_simulator(tmp_path):
+    """The model could not see whether its own patch did anything: trial_evidence is the
+    first thing it reads, and the rules carry the patch checklist."""
+    from test_evolve_llm_e2e import _fake, _repeat_proj
+
+    ev = "种子 4243 在 drop-can1 抛 AttributeError: '_last_d'（recycle_driver.py:212）"
+    line = evolve_llm._trial_evidence({"last_outcome": {"round": 104, "trial_evidence": ev}}, [])
+    assert line == f"你上一轮的补丁跑了：{ev}"
+    assert evolve_llm._trial_evidence({}, [{"trial_evidence": ["跑到第 41 步", "d_eef 最小 0.57→0.55"]}]) \
+        == "你上一轮的补丁跑了：跑到第 41 步；d_eef 最小 0.57→0.55"
+    proj, before = _repeat_proj([])
+    proj["trial_evidence"] = line
+    assert evolve_llm.brief(proj)["trial_evidence"] == line
+    ok = {"kind": "executor", "payload": {"to": "alt"}, "summary": "换。", "rationale": "-"}
+    evolve_llm.llm_propose(_fake(tmp_path, [ok], name="ev.json"), proj, before, 7, tmp_path / "llm")
+    msg = json.loads((tmp_path / "llm" / "round-7.json").read_text())["messages"][1]["content"]
+    assert msg.startswith(line + "\n\nRound input:")
+    for must in ("补丁自检清单", "state_init", "old != new", "最近 5 条**跨轮**记着", "repeat_failure"):
+        assert must in evolve_llm._RULES
+
+
+def test_three_runtime_error_rounds_on_one_node_ask_for_a_smaller_self_contained_change():
+    from test_evolve_llm_e2e import _repeat_proj
+
+    hist = [{"round": r, "tried": {"kind": "card", "node": "grab-0", "detail": {}},
+             "trial_evidence": "种子 1 在 grab-0 抛 AttributeError: '_last_d'"} for r in (1, 2, 3)]
+    proj, _ = _repeat_proj(hist)
+    b = evolve_llm.brief(proj)
+    assert "grab-0 连续 3 轮死在运行时错误" in b["repeat_failure"]
+    assert "一个守卫" in b["repeat_failure"] and "另一个节点" in b["repeat_failure"]
+    proj, _ = _repeat_proj(hist[:2])   # two in a row is not yet a loop
+    assert "repeat_failure" not in evolve_llm.brief(proj)

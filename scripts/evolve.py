@@ -51,12 +51,18 @@ from ``media/<task>/<seed>/index.json``.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
+import importlib
 import importlib.util
+import inspect
 import json
+import math
 import os
 import sys
+import textwrap
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -337,6 +343,215 @@ def per_seed(suite: dict) -> list[dict]:
              "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")
              if s.get("first_death") else None}
             for seed, s in suite["seeds"].items()]
+
+
+# ── the trial's own evidence: what the MODEL'S code did in the simulator ──────────
+
+def _exception(exc: BaseException) -> dict:
+    """A raise inside the trial, kept whole enough to fix: ``{type, message, file, line,
+    traceback}`` (the tail, <= 15 lines). Today a raise leaves only ``repr(exc)``."""
+    fr = (traceback.extract_tb(exc.__traceback__) or [None])[-1]
+    return {"type": type(exc).__name__, "message": str(exc)[:500],
+            "file": fr.filename if fr else None, "line": fr.lineno if fr else None,
+            "traceback": "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)).rstrip().splitlines()[-15:]}
+
+
+def _row(suite: dict, seed, node) -> dict:
+    """One node's trail row on one seed of a suite result ({} when it never ran)."""
+    return next((n for n in ((suite.get("seeds") or {}).get(str(seed)) or {}).get("trail") or []
+                 if n.get("id") == node), {})
+
+
+def _series(node: dict) -> list:
+    tr = node.get("trace")
+    return (tr.get("series") or []) if isinstance(tr, dict) else []
+
+
+def _phases(series: list) -> list[str]:
+    """The phase sequence of a series, consecutive repeats collapsed."""
+    out: list[str] = []
+    for r in series:
+        p = r.get("phase")
+        if p is not None and (not out or out[-1] != str(p)):
+            out.append(str(p))
+    return out
+
+
+def _minimum(series: list, key: str, node: dict, end_key: str):
+    """The closest the segment ever got; without a series, its last frame's distance."""
+    vals = [r[key] for r in series if isinstance(r.get(key), (int, float))]
+    if vals:
+        return min(vals)
+    end = ((node.get("trace") or {}).get("end") if isinstance(node.get("trace"), dict) else None) \
+        or node.get("trace_end") or {}
+    return end.get(end_key)
+
+
+def _divergent(base: list, trial: list):
+    """The first step at which the trial's series stops matching the baseline's (phase,
+    d_eef, d_base); the first extra step when one simply runs longer; None when equal."""
+    key = lambda r: (r.get("phase"), r.get("d_eef"), r.get("d_base"))
+    for b, a in zip(base, trial):
+        if key(b) != key(a):
+            return a.get("step")
+    longer = trial if len(trial) > len(base) else base
+    return longer[min(len(base), len(trial))].get("step") if len(base) != len(trial) else None
+
+
+def trial_evidence(before: dict, after: dict, node, seeds: list, exc: dict | None = None) -> dict:
+    """What the TRIAL'S OWN CODE did, per trial seed: the target node's per-step ``trace``
+    and ``geometry`` under the trial (the evidence the baseline already carries) plus the
+    ``diff`` against that seed's BASELINE row -- ``{phase_changed (the trial's phase
+    sequence when it differs), first_divergent_step, base_moved, d_eef_min_before/after,
+    d_base_min_before/after, steps_before/after}`` -- and the ``exception`` the executor
+    raised (preflight or suite), whole. Without it a round only ever said "0 -> 0"."""
+    ev = {"node": node, "exception": exc, "seeds": []}
+    for s in seeds:
+        b, a = _row(before, s, node), _row(after, s, node)
+        sb, sa = _series(b), _series(a)
+        pb, pa = _phases(sb), _phases(sa)
+        xy = lambda r: ((r.get("base") or [0.0, 0.0]) + [0.0, 0.0])[:2]
+        ev["seeds"].append({
+            "seed": int(s),
+            **{k: a[k] for k in ("trace", "geometry") if a.get(k) is not None},
+            "diff": {"phase_changed": pa if pa != pb else [],
+                     "first_divergent_step": _divergent(sb, sa),
+                     "base_moved": (max(math.hypot(xy(r)[0] - xy(sa[0])[0],
+                                                   xy(r)[1] - xy(sa[0])[1]) for r in sa) > 0.01)
+                                   if sa else None,
+                     "d_eef_min_before": _minimum(sb, "d_eef", b, "d_eef_target"),
+                     "d_eef_min_after": _minimum(sa, "d_eef", a, "d_eef_target"),
+                     "d_base_min_before": _minimum(sb, "d_base", b, "d_base_target"),
+                     "d_base_min_after": _minimum(sa, "d_base", a, "d_base_target"),
+                     "steps_before": b.get("steps"), "steps_after": a.get("steps")}})
+    return ev
+
+
+def _evidence_summary(ev: dict | None) -> dict | None:
+    """``last_outcome``'s copy of it: the numbers and the exception, no per-step series."""
+    return ev and {"node": ev["node"], "exception": ev["exception"],
+                   "seeds": [{"seed": r["seed"], **r["diff"]} for r in ev["seeds"]]}
+
+
+# ── self-check: the candidate's own code, read statically before the simulator ────
+
+class SelfCheckError(Exception):
+    """A static finding about the candidate's code, raised where the doctor's findings
+    are raised (inside the preflight) so it rides the model's repair loop."""
+
+
+def _defs(node: ast.ClassDef) -> tuple[set, set]:
+    """(what the class READS on self, what it ASSIGNS): literal ``self.x`` by context,
+    plus its methods, its class attributes and ``setattr(self, "x", ...)``."""
+    reads, writes = set(), set()
+    for st in node.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            writes.add(st.name)
+        elif isinstance(st, ast.Assign):
+            writes |= {t.id for t in st.targets if isinstance(t, ast.Name)}
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+            writes.add(st.target.id)
+    for n in ast.walk(node):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self":
+            (reads if isinstance(n.ctx, ast.Load) else writes).add(n.attr)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "setattr" \
+                and len(n.args) > 1 and isinstance(n.args[0], ast.Name) and n.args[0].id == "self" \
+                and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str):
+            writes.add(n.args[1].value)
+    return reads, writes
+
+
+def _imports(tree: ast.Module) -> dict:
+    """``name -> object`` for the file's imports; whatever will not import is left out
+    (a base we cannot resolve makes its class unjudgeable, never a finding)."""
+    ns = {}
+    for n in ast.walk(tree):
+        try:
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    ns[a.asname or a.name.split(".")[0]] = importlib.import_module(
+                        a.name if a.asname else a.name.split(".")[0])
+            elif isinstance(n, ast.ImportFrom) and not n.level and n.module:
+                mod = importlib.import_module(n.module)
+                for a in n.names:
+                    if hasattr(mod, a.name):
+                        ns[a.asname or a.name] = getattr(mod, a.name)
+        except Exception:  # noqa: BLE001 -- unimportable: the name is simply unknown
+            continue
+    return ns
+
+
+def _base_names(obj: type) -> set:
+    """What an imported base supplies: its ``dir()`` plus every ``self.x`` its own
+    source assigns (a base's ``__init__`` attributes are invisible to ``dir()``)."""
+    names = set(dir(obj))
+    for c in getattr(obj, "__mro__", ()):
+        try:
+            node = ast.parse(textwrap.dedent(inspect.getsource(c))).body[0]
+        except (OSError, TypeError, SyntaxError, IndentationError):
+            continue   # no source (C, exec'd): its dir() is all we know
+        if isinstance(node, ast.ClassDef):
+            names |= _defs(node)[1]
+    return names
+
+
+def _known(cls: ast.ClassDef, classes: dict, ns: dict, seen: tuple = ()) -> set | None:
+    """Every attribute name the class can legitimately read on self -- its own
+    assignments plus each base's -- or None when a base cannot be resolved."""
+    out = _defs(cls)[1]
+    for b in cls.bases:
+        if isinstance(b, ast.Name) and b.id == "object":
+            continue
+        if isinstance(b, ast.Name) and b.id in classes and b.id not in seen:
+            more = _known(classes[b.id], classes, ns, seen + (cls.name,))
+        else:
+            obj = ns.get(b.id) if isinstance(b, ast.Name) else (
+                getattr(ns.get(b.value.id), b.attr, None)
+                if isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name) else None)
+            more = _base_names(obj) if isinstance(obj, type) else None
+        if more is None:
+            return None
+        out |= more
+    return out
+
+
+def _check_source(src: str, where: str) -> list[str]:
+    tree = ast.parse(src)
+    classes = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    ns, out = _imports(tree), []
+    for cls in classes.values():
+        known = _known(cls, classes, ns)
+        if known is None:
+            continue   # a base we cannot import: nothing is claimed about this class
+        for a in sorted(_defs(cls)[0] - known):
+            out.append(f"{where}: {cls.name} reads self.{a}, which {cls.name} never assigns and no "
+                       f"base of it has -- initialise it (e.g. in __init__) or read what exists")
+    return out
+
+
+def self_check(tried: dict) -> str | None:
+    """The candidate's OWN code, read statically before the simulator runs it: every
+    attribute the new code reads on ``self`` must be assigned somewhere in its class (or
+    come from a resolvable base -- the measured failure is ``self._last_d`` used and never
+    initialised), and no edit may be a no-op. Returns the doctor-shaped refusal text (the
+    repair loop's material) or None.
+
+    Limits -- a cheap AST read, not a type checker: only literal ``self.x`` and
+    ``setattr(self, "x", ...)`` count as assignments (a base that injects attributes
+    dynamically is invisible); a class whose base does not import is skipped rather than
+    guessed at; nothing about types, arguments or control flow is checked."""
+    d = tried.get("detail") or {}
+    for i, e in enumerate(d.get("edits") or (), 1):   # normally caught by apply_edits first
+        if isinstance(e, dict) and e.get("old") == e.get("new"):
+            return f"doctor:self-check: edit {i} changes nothing: old == new"
+    findings: list[str] = []
+    for py in sorted(Path(d["path"]).glob("*.py")) if d.get("path") else ():
+        try:
+            findings += _check_source(py.read_text(), py.name)
+        except SyntaxError as exc:
+            return f"doctor:self-check: {py.name} does not parse: {exc}"
+    return ("doctor:self-check (static, no sim): " + "; ".join(findings[:5])) if findings else None
 
 
 # ── try: the proposals inbox first, then the built-in proposer ────────────────────
@@ -754,9 +969,22 @@ def main(argv=None) -> int:
     def preflight(tried: dict) -> None:
         """A card's trial on the FIRST seed alone, before the suite: an exception inside
         the executor comes back to the model as a repair, not a burned suite. The seed's
-        result is kept and merged into the retest (never run twice)."""
+        result is kept and merged into the retest (never run twice). The static
+        ``self_check`` runs first -- an attribute the class never assigns costs no sim at
+        all -- and either way the raise is kept whole in ``pre["exc"]`` for the round's
+        ``trial_evidence``, not only in the repair text."""
+        pre.pop("exc", None)   # a later attempt's outcome, not the last one's
+        if why := self_check(tried):
+            try:
+                raise SelfCheckError(why)
+            except SelfCheckError as exc:
+                pre["exc"] = _exception(exc)
+                raise
         try:
             pre["out"] = suite([int(seeds[0]), int(seeds[0])], apply(tried, applied))
+        except Exception as exc:  # noqa: BLE001 -- the executor's own failure IS the finding
+            pre["exc"] = _exception(exc)
+            raise
         finally:   # mount_params reads the accepted overlay again, not the trial's
             os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
 
@@ -811,7 +1039,7 @@ def main(argv=None) -> int:
             tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
         tick(tried=tried)
         after, published, confirm, regr, burned = before, False, None, None, []
-        trial_row, saved_s = None, 0.0
+        trial_row, saved_s, trial_exc = None, 0.0, pre.get("exc")
         if tried["kind"] != "none":
             trial = apply(tried, applied)
             tick(phase="retest")
@@ -845,6 +1073,7 @@ def main(argv=None) -> int:
                                     * (len(full) - len(focus)) / len(full), 3)
             except Exception as exc:  # noqa: BLE001 -- the trial's failure is the round's finding
                 tried["detail"]["error"] = repr(exc)
+                trial_exc = _exception(exc)   # type/message/where/traceback tail, not a repr
                 after, scope, target_pass = before, "full", 0
             trial_row = {"scope": scope, "seeds": focus if scope == "focused" else full,
                          "target_pass": target_pass}
@@ -866,6 +1095,7 @@ def main(argv=None) -> int:
                     ca = suite(cs, trial, media=False)["count"]
                 except Exception as exc:  # noqa: BLE001
                     tried["detail"]["error"] = repr(exc)
+                    trial_exc = trial_exc or _exception(exc)
                     ca = -1
                 confirm = {"seeds": cs, "before": cb["count"], "after": ca}
                 published = ca >= cb["count"]
@@ -884,6 +1114,11 @@ def main(argv=None) -> int:
                 tried["detail"]["digest"], d = publish(
                     args.skills_root, records[skill], emb, tried, after)
                 records[skill] = SkillRecordV0.from_dict(d)   # later rounds build on what was published
+        # what the model's own code DID in the simulator: the target node's per-step
+        # evidence under the trial, its diff against the baseline seed, and any raise
+        evidence = trial_evidence(before, after, tried["node"],
+                                  (trial_row or {}).get("seeds") or [], trial_exc) \
+            if (trial_row or trial_exc) else None
         # ── ACCEPT: the two levels. A partial win (the score rose and nothing that passed
         # stopped passing) joins the campaign's accepted state and becomes the next round's
         # baseline; only a whole-task win also publishes evidence into the skill record.
@@ -934,7 +1169,7 @@ def main(argv=None) -> int:
                         else "worse" if as_score < bs_score else "same"),
             "before_score": list(bs_score), "after_score": list(as_score),
             "accepted": accepted, "accepted_reason": why, "trial": trial_row,
-            "confirm": confirm,
+            "trial_evidence": evidence, "confirm": confirm,
             "usage": {"llm_tokens": llm.pop("usage", None) if llm else None,
                       "sim_s": round(live["sim_s"] - sim_s0, 3), "sim_s_saved": saved_s},
             "per_seed": per_seed(kept), "after_seeds": per_seed(after),
@@ -951,7 +1186,8 @@ def main(argv=None) -> int:
                        or f"{tried['kind']} @ {tried['node']}",
             "before_score": list(bs_score), "after_score": list(as_score),
             "outcome": doc["rounds"][-1]["outcome"], "accepted": accepted,
-            "accepted_reason": why, "regressions": regs}
+            "accepted_reason": why, "regressions": regs,
+            "trial_evidence": _evidence_summary(evidence)}
         doc["cursor"], doc["applied"] = r, applied
         tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
         base = kept

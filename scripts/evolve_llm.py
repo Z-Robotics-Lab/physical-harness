@@ -55,6 +55,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 import tomllib
 import traceback
 from collections import Counter
@@ -206,7 +207,17 @@ refused -- build the NEXT change on top.
 summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try.
 Each seed's keyframes are the failure keyframes of its first-death node (first frame, \
 stall / last-progress frame, last frame; 128px); when attached as images they are labelled \
-"seed <n> keyframe <i>" in the same order."""
+"seed <n> keyframe <i>" in the same order.
+`trial_evidence`（brief 的第一行）是你上一轮的改动在仿真里真实跑出来的结果——抛了什么异常、在哪一行，\
+或者种子走到了第几步、距离动没动。先读它：是修自己写的代码，还是这条路本来就不通。
+补丁自检清单（写 patch 前逐条对照，违反的当场驳回，不进仿真）：
+1) 新用到的 self.<属性> 必须在这个类**已有的** __init__ / reset 里初始化（first_death.state_init 列出\
+这些方法和它们已经赋的值）——线上第 104、108 轮就是读了没人赋值的 self._last_d / self._replan；
+2) 只调用这个类自己或基类已经定义的方法，不要凭空 self.<method>()；
+3) old != new：补丁必须真的改变行为，原样返回的编辑会被拒；
+4) 不要重复被拒过的回答：最近 5 条**跨轮**记着，重复会被驳回并告诉你是哪一轮拒的；
+5) 同一节点连续 3 轮死于运行时错误时 brief 会给 `repeat_failure`：改小——一个阶段、一个守卫、\
+不引入新状态——或者换 death_nodes 里的另一个节点。"""
 
 
 def _log_excerpt(seed: int, rows, dead: str | None, budget: int) -> list[str]:
@@ -355,6 +366,41 @@ def _functions(cls: list[type], modules=(), budget: int = FUNCTION_CHARS) -> dic
                 scan(o)
             elif inspect.isfunction(o) and o.__module__ == mod.__name__:
                 add(f"{mod.__name__}:{o.__qualname__}", o)
+    return out
+
+
+def _self_attrs(obj) -> set:
+    """The ``self.<attr>`` names ASSIGNED in a source text / under an AST node."""
+    if isinstance(obj, str):
+        try:
+            obj = ast.parse(textwrap.dedent(obj))
+        except SyntaxError:
+            return set()
+    out = set()
+    for n in ast.walk(obj):
+        tgts = (n.targets if isinstance(n, ast.Assign) else
+                [n.target] if isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.For)) else [])
+        for t in tgts:
+            for x in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]):
+                if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "self":
+                    out.add(x.attr)
+    return out
+
+
+def _state_init(cls: list[type]) -> dict:
+    """Where a patch MUST initialise the state it introduces: ``{"<module>:<Class>.<method>":
+    [the self.<attr> it already sets]}`` for each stage class's constructor / reset methods.
+    Live rounds 104 and 108 read ``self._last_d`` / ``self._replan`` that nobody ever
+    assigned -- the patch applied, the doctor passed, and the trial raised AttributeError."""
+    out = {}
+    for c in cls:
+        for name, fn in vars(c).items():
+            fn = getattr(fn, "__func__", fn)
+            if inspect.isfunction(fn) and (name == "__init__" or "reset" in name):
+                try:
+                    out[f"{c.__module__}:{c.__qualname__}.{name}"] = sorted(_self_attrs(inspect.getsource(fn)))
+                except (OSError, TypeError):
+                    continue
     return out
 
 
@@ -515,6 +561,7 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
     fd = _driver(before, records, emb, arm, binding, evolve._first_death(before, rounds))
     ref = fd.get("tunables", {}).get("ref") or binding["policy"]
     cls = _stage_classes(ref, fd.get("task"))
+    fd["state_init"] = _state_init(cls)   # the constructor / reset a new self.<attr> belongs in
     rows = [_seed_row(seed, s, doc.get("reference") or {}) for seed, s in before["seeds"].items()]
     cl = clusters(rows)
     proj = {
@@ -526,6 +573,7 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
                      | {"detail": {k: v for k, v in r["tried"]["detail"].items()
                                    if k in ("to", "from", "path", "ref", "module", "reason", "error", "hint")}},
                      "before": r["before"], "after": r["after"], "published": r["published"],
+                     **({"trial_evidence": r["trial_evidence"]} if r.get("trial_evidence") else {}),
                      "per_seed": [{k: s.get(k) for k in ("seed", "success", "first_death", "failure_mode")}
                                   for s in r.get("after_seeds") or r.get("per_seed") or []]}
                     for r in rounds],
@@ -540,6 +588,7 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
         "last_outcome": ({**doc["last_outcome"], "says": _last_outcome(rounds)}
                          if isinstance(doc.get("last_outcome"), dict) else _last_outcome(rounds)),
         "score_definition": doc.get("score_definition") or SCORE_DEF,
+        "trial_evidence": _trial_evidence(doc, rounds),
         "accepted_stack": {"note": "已接受的改动（本轮从它们之上出发，它们就是新的 baseline；"
                                    "重复其中任何一条都会被驳回）。",
                            "changes": _accepted(doc, rounds)},
@@ -667,6 +716,78 @@ def _accepted(doc: dict, rounds: list) -> list[dict]:
             for r in rounds if r.get("accepted") or r.get("published")]
 
 
+def _trial_line(ev: dict) -> str:
+    """``scripts.evolve.trial_evidence`` (the round row's, or ``last_outcome``'s flattened
+    copy) as ONE Chinese line: the exception with its file:line, else per seed how far it got,
+    how close it came and -- the point of the whole thing -- whether it diverged from the
+    baseline at all. ``种子 4243 在 drop-can1 抛 AttributeError ...`` / ``种子 4243 在 nav-can1
+    跑到第 41 步，d_eef 最小 0.57→0.55，底盘仍未移动，与基线逐步完全相同＝你的改动没有生效``."""
+    node, exc, out = ev.get("node") or "?", ev.get("exception"), []
+    seeds = [r.get("seed") for r in ev.get("seeds") or ()]
+    if isinstance(exc, dict) and exc.get("type"):
+        where = f"（{Path(exc['file']).name}:{exc.get('line')}）" if exc.get("file") else ""
+        return (f"种子 {seeds[0]} " if seeds else "") + \
+            f"在 {node} 抛 {exc['type']}: {str(exc.get('message') or '')[:200]}{where} —— 这是你自己写的代码"
+    for r in (ev.get("seeds") or ())[:4]:
+        d = r.get("diff") if isinstance(r.get("diff"), dict) else r
+        bits, num = [], lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+        if d.get("steps_after") is not None:
+            bits.append(f"跑到第 {d['steps_after']} 步"
+                        + (f"（基线 {d['steps_before']} 步）" if d.get("steps_before") != d.get("steps_after") else ""))
+        for k in ("d_eef", "d_base"):
+            b, a = d.get(f"{k}_min_before"), d.get(f"{k}_min_after")
+            if num(a):
+                bits.append(f"{k} 最小 {b:.3f}→{a:.3f}" if num(b) else f"{k} 最小 {a:.3f}")
+        if d.get("base_moved") is not None:
+            bits.append("底盘移动了" if d["base_moved"] else "底盘仍未移动")
+        if d.get("phase_changed"):
+            bits.append("阶段序列变为 " + "→".join(str(x) for x in d["phase_changed"]))
+        if d.get("first_divergent_step") is not None:
+            bits.append(f"第 {d['first_divergent_step']} 步起与基线不同")
+        elif d.get("steps_before") == d.get("steps_after"):
+            bits.append("与基线逐步完全相同＝你的改动没有生效")
+        if bits:
+            out.append(f"种子 {r.get('seed')} 在 {node} " + "，".join(bits))
+    return "；".join(out)
+
+
+def _trial_evidence(doc: dict, rounds: list) -> str | None:
+    """What the LAST round's change actually DID in the simulator, as the FIRST line of the
+    brief -- until now the model saw only "score 0 → 0" and could not tell whether its own
+    code ran, crashed or changed nothing. Read off ``scripts/evolve.py``'s measurement:
+    ``last_outcome.trial_evidence`` (flattened) / the last round row's ``trial_evidence``."""
+    lo = doc.get("last_outcome")
+    ev = ((lo.get("trial_evidence") if isinstance(lo, dict) else None)
+          or (rounds[-1].get("trial_evidence") if rounds else None) or doc.get("trial_evidence"))
+    line = (_trial_line(ev) if isinstance(ev, dict) else
+            "；".join(str(x) for x in ev) if isinstance(ev, (list, tuple)) else str(ev or "")).strip()
+    return f"你上一轮的补丁跑了：{line[:900]}" if line else None
+
+
+_RAISED = re.compile(r"Traceback|[A-Za-z]+Error|raised|抛")
+
+
+def _runtime_streak(hist: list, node) -> int:
+    """How many of the LAST rounds in a row targeted ``node`` and ended in a RUNTIME error of
+    the model's own code (``trial_evidence`` / the try's reason). Three in a row means the
+    model is rewriting the same broken idea: the brief asks for a smaller one."""
+    n = 0
+    for r in reversed(hist or ()):
+        t = r.get("tried") or {}
+        ev = r.get("trial_evidence")
+        raised = (bool(ev.get("exception")) if isinstance(ev, dict) else bool(ev and _RAISED.search(str(ev)))) \
+            or bool(_RAISED.search(json.dumps(t.get("detail"), default=str, ensure_ascii=False)))
+        if t.get("node") != node or not raised:
+            break
+        n += 1
+    return n
+
+
+SMALLER = ("{node} 连续 {n} 轮死在运行时错误（你自己写的代码抛异常）。这一轮换个打法：做一个更小、"
+           "自洽的改动——只改一个阶段、加一个守卫，不引入需要初始化的新状态——或者改去 death_nodes "
+           "里的另一个节点。")
+
+
 def brief(proj: dict) -> dict:
     """Call 1's compact brief: the projection minus ``MATERIAL_KEYS``, plus ``untried`` (what
     is left on the first-death node -- the only thing that makes a ``none`` acceptable), the
@@ -680,6 +801,8 @@ def brief(proj: dict) -> dict:
                               "kinds": dict(Counter(r["tried"]["kind"] for r in old))}
     b["untried"] = _untried(proj, _tried_pairs(proj))
     fd = proj.get("first_death") or {}
+    if (n := _runtime_streak(hist, fd.get("node"))) >= 3:
+        b["repeat_failure"] = SMALLER.format(node=fd.get("node"), n=n)
     if _exhausted(proj, b["untried"]):
         b["exhausted"] = (f"tunables exhausted for {fd.get('node')}: every (knob, direction) is tried. "
                           f"The parameter layer is CLOSED here -- diagnose top-down and answer from "
@@ -739,9 +862,10 @@ def _card_package(root: Path) -> str:
     return ""
 
 
-def write_card(pay: dict, root: Path = CANDIDATES_ROOT) -> str | None:
+def write_card(pay: dict, root: Path | None = None) -> str | None:
     """Materialise a ``card`` answer under ``root/<name>/`` and doctor it; fills
     ``pay['path']``. Returns the refusal reason (``doctor:<first finding>``) or None."""
+    root = root or CANDIDATES_ROOT   # read at call time: a test points the root elsewhere
     name, files, ref = pay.get("name"), pay.get("files"), pay.get("ref")
     if not isinstance(name, str) or not _NAME.match(name):
         return f"doctor:card name {name!r} is not [a-z][a-z0-9_]{{2,40}}"
@@ -1035,12 +1159,13 @@ def _elsewhere(edits, module: str, fd: dict) -> str:
     return ""
 
 
-def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_ROOT) -> str | None:
+def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path | None = None) -> str | None:
     """Materialise a ``patch`` answer: the module copied under ``root/<name>/`` with the
     ``edits`` (or ``diff``) applied (imports of the installed package rewritten by ref), the card's
     ``[tunables]`` copied when the module reads its own manifest, a manifest binding
     ``<to>`` and the generated ``PATCH_CARD``; then the card checks (``_doctor``). Fills
     ``pay['path'] / ['ref']``. Returns the refusal (``patch:...`` / ``doctor:...``) or None."""
+    root = root or CANDIDATES_ROOT
     name, module, to = pay.get("name"), pay.get("module"), pay.get("to")
     edits, diff = pay.get("edits"), pay.get("diff")
     if not isinstance(name, str) or not _NAME.match(name):
@@ -1145,11 +1270,57 @@ def _image_parts(proj: dict, session: Path | None) -> tuple[list[dict], list[dic
     return parts, audit
 
 
+_FRAME = re.compile(r'File "([^"]+)", line (\d+)')
+#: scripts.evolve.self_check's finding: "<file>.py: <Class> reads self.<attr>, which ..."
+_FINDING = re.compile(r"([\w.]+\.py): \w+ reads (self\.\w+)")
+
+
+def _own_code(path, why: str, span: int = 8, most: int = 3) -> str:
+    """The offending lines of the model's OWN candidate code, numbered: every traceback frame
+    under ``path``, plus the lines a static self-check finding points at. Without it the model
+    re-reads the INSTALLED source and rewrites its patch from scratch (measured: rounds 104
+    and 108) instead of fixing the code it just wrote."""
+    where: dict[Path, set] = {}
+    for f, ln in _FRAME.findall(why or ""):
+        where.setdefault(Path(f), set()).add(int(ln))
+    for name, expr in _FINDING.findall(why or ""):
+        q = Path(path or ".") / name
+        if q.is_file():
+            where.setdefault(q, set()).update(
+                i for i, line in enumerate(q.read_text().split("\n"), 1) if expr in line)
+    out = []
+    for q, lines in sorted(where.items()):
+        if not path or not str(q).startswith(str(path)) or not q.is_file():
+            continue
+        text = q.read_text().split("\n")
+        out += [f"\n\n{q.name} -- YOUR OWN code, around line {ln} (fix THIS, not the installed source "
+                f"you copied it from):\n" + _numbered(text, ln - 1 - span, ln + span) for ln in sorted(lines)]
+    return "".join(out[:most])
+
+
+def _prior_rejects(audit_dir: Path, keep: int = 5) -> dict:
+    """The last ``keep`` rejected payload hashes of EARLIER rounds (read back off their audit
+    files) -> why they were rejected, with the round. Live rounds 104 and 108 sent the same
+    uninitialised-state patch: within a round it was already refused, across rounds it was not."""
+    out = {}
+    for f in sorted(audit_dir.glob("round-*.json"), key=lambda q: -int(re.sub(r"\D", "", q.name) or 0)):
+        try:
+            a = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for at in reversed(a.get("attempts") or []):
+            if (dig := at.get("sha")) and dig not in out:
+                out[dig] = f"第 {a.get('round')} 轮已经提过同一条回答并被拒：{str(at.get('reason') or '')[:300]}"
+                if len(out) >= keep:
+                    return out
+    return out
+
+
 REPAIR = ("Your proposal was rejected:\n{why}\n\nFix exactly that and output ONLY the corrected "
           "proposal JSON object (same output_schema, same decision unless the error says otherwise).")
 #: A payload byte-identical to one already rejected this round: cheaper to say so than to
 #: re-run the whole rejection, and the second one ends the round honestly.
-REPEAT = ("你重复了上一条被拒的回答（{why}）。必须换一个做法：改别的地方，或改用 {kinds}。\n"
+REPEAT = ("你重复了一条已经被拒的回答（{why}）。必须换一个做法：改别的地方，或改用 {kinds}。\n"
           "只输出修改后的 proposal JSON 对象。")
 REPEATED = "llm: repeated the same rejected answer"
 ASK = ("You decided {kind}: {rationale}\n\nThe code material is above (materials). Output ONLY the full "
@@ -1317,8 +1488,15 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
         try:
             preflight(tried)
         except Exception as exc:  # noqa: BLE001 -- the executor's own failure, traceback and all
-            raise ValueError(f"preflight: the trial raised on seed {before and min(before['seeds'])}:\n"
-                             + traceback.format_exc()[-3000:]) from exc
+            # a SelfCheckError is a STATIC finding (scripts.evolve.self_check), not a crash:
+            # it reads as itself, with the model's own offending lines under it
+            why = (str(exc) if type(exc).__name__ == "SelfCheckError" else
+                   f"preflight: the trial raised on seed {before and min(before['seeds'])}:\n"
+                   + traceback.format_exc()[-3000:])
+            if " reads self." in why:   # name the runtime error the static finding predicts
+                why += (" -- reading it raises AttributeError the moment the trial runs (rounds 104 and "
+                        "108 died exactly there); found statically, no simulator seed spent")
+            raise ValueError(why + _own_code(pay.get("path"), why)) from exc
     return _stamp(tried, ans, layer)
 
 
@@ -1336,7 +1514,9 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
     from scripts.evolve import _none   # noqa: PLC0415 -- evolve imports this module
     b, materials = brief(proj), {k: proj[k] for k in MATERIAL_KEYS if k in proj}
     seen = _tried_pairs(proj)   # grows with this round's answers: no repeat inside the round either
-    text = ("Round input:\n" + json.dumps(b, sort_keys=True, default=str)
+    # what the model's OWN last change did in the simulator comes FIRST, before the round input
+    text = (((b["trial_evidence"] + "\n\n") if b.get("trial_evidence") else "")
+            + "Round input:\n" + json.dumps(b, sort_keys=True, default=str)
             + "\n\nOutput ONLY the proposal JSON object now.")
     images, audit_images = _image_parts(proj, session) if getattr(ep, "images", False) else ([], [])
     messages = [{"role": "system", "content": _RULES},
@@ -1351,7 +1531,9 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
     # the model asked for it by answering without a payload or wrote one blind and was rejected
     mat = {"role": "user", "content": "Materials (static):\n" + json.dumps(materials, sort_keys=True, default=str)}
     tried, why, path, step2 = None, None, None, False
-    rejected = {}   # payload sha -> its rejection; a byte-identical answer is not a new attempt
+    # payload sha -> its rejection; a byte-identical answer is not a new attempt, and the
+    # last 5 of EARLIER rounds count too (the same broken patch came back 4 rounds later)
+    rejected = _prior_rejects(audit_dir)
     while len(audit["attempts"]) < MAX_ATTEMPTS:
         try:
             # ponytail: DeepSeek reasoning tokens count against max_tokens and left content
@@ -1404,7 +1586,7 @@ def llm_propose(ep, proj: dict, before: dict, round_no: int, audit_dir: Path,
             path = (ans or {}).get("payload", {}).get("path") or path   # the files stay for the operator
             if dig is not None:   # hashed BEFORE write_card/write_patch grew the payload
                 rejected[dig] = why
-            audit["attempts"].append({"raw": raw, "usage": usage, "reason": why})
+            audit["attempts"].append({"raw": raw, "usage": usage, "reason": why, "sha": dig})
             repair = {"role": "user", "content": REPAIR.format(why=why[:4000])}
             if not step2 and (ans or {}).get("kind") in _NEED:
                 step2 = True   # it wrote the payload blind (an invented diff/snippet): the
