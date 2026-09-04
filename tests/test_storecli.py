@@ -277,7 +277,8 @@ def test_rsi_campaigns_faces_are_byte_identical(tmp_path, capsys):
     running, finished = lib
     assert running == {"task": "kitchen_thaw", "status": "running", "cursor": 2, "rounds": 2,
                        "best": 1, "seeds": [1, 2], "arm": "auto", "node_rate_best": 0.75,
-                       "published_rounds": [1], "usage": {"llm_tokens": None, "sim_s": 0},
+                       "published_rounds": [1], "accepted_rounds": [],
+                       "usage": {"llm_tokens": None, "sim_s": 0},
                        "updated": running["updated"],
                        "live": {"phase": "baseline", "message": _CAMPAIGN["live"]["message"],
                                 "nodes_done": "1/2"},

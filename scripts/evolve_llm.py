@@ -10,22 +10,24 @@ its FIRST MISSING MILESTONE and the numeric divergence from the campaign's succe
 reference there, the failing seeds grouped into ``clusters`` by (first missing
 milestone, failure_mode) with the one the round targets named on ``target.cluster``,
 the fixed causal ladder ``layers`` to diagnose top-down with, and the ``notebook``
-of the last 10 rounds' notes -- and answers ONE proposal in the
+of the last 10 rounds' notes, the gradient (``last_outcome`` = what the last round did to the
+``score``, ``score_definition``, and the ``accepted_stack`` this round starts from) -- and answers ONE proposal in the
 proposals-inbox shape (``PROPOSAL_SCHEMA``, with the ``layer`` it diagnosed at and an optional notebook
 ``notes``; a parameter-layer answer is refused while the target node's knobs are
 ``exhausted``, naming the higher layers): tunables / executor / card
 (code-as-policy: the model writes a candidate card under ``plugins/candidates/<name>/``,
 checked by scripts/plugin_doctor, dry-instantiated (``dry_run``) and preflighted on
 ONE seed before it is mounted) / patch (exact-snippet ``edits`` -- ``{old, new}`` where
-``old`` is copied verbatim out of the numbered module text in ``module_sources`` and must
-occur exactly once -- against ONE module of the first-death skill's card
+``old`` is copy-pasted out of ``functions`` (the stage classes' methods, verbatim, no line
+numbers; ``module_sources`` is the same code numbered) and must
+occur exactly once (exactly, or leniently: the same lines ignoring indentation) -- against ONE module of the first-death skill's card
 (``first_death.modules``), applied by ``apply_edits`` (a unified ``diff`` through
 ``apply_diff`` is still accepted) to a COPY under the candidate dir, whose generated card (``PATCH_CARD``) instantiates the
 patched stage class as an InprocExecutor through the same native-executor seam; the
 installed card is never touched) / none. Two calls at most: call 1 = the compact brief
 (``brief``, <= ``BRIEF_CHARS``) asking for a decision; a card / patch decision gets call 2,
 the static code material (``MATERIAL_KEYS``: contract, reference card, driver source,
-``module_sources``, primitives) inserted FIRST after the system message (prefix cache) and
+``module_sources``, ``functions``, primitives) inserted FIRST after the system message (prefix cache) and
 the brief last -- when it answered without a payload, and equally when it wrote one BLIND
 and was rejected (the live model invents a snippet on call 1: the material rides its repair). The answer is validated strictly (schema +
 ``scripts.evolve.from_proposal``); a rejected answer (bad JSON, bad payload, a (knob,
@@ -78,6 +80,8 @@ MAX_LOG_LINES = 60
 #: it, in this order: the log excerpt, then older rounds' per-seed detail, then the driver
 #: source. The editable modules carry their own bound (``MODULE_CHARS``).
 PROMPT_CHARS = 120_000
+#: Bound of ``functions`` (the stage classes' methods, verbatim, for copy-paste).
+FUNCTION_CHARS = 30_000
 #: Bound of ``module_sources`` (the full text of every module a patch may edit): the stage's
 #: own module is always whole, the others fall back to class/function extracts past it.
 MODULE_CHARS = 60_000
@@ -88,7 +92,7 @@ BRIEF_CHARS = 12_000
 MAX_ATTEMPTS = 3
 #: The static code material of call 2 (a card / patch decision without its payload).
 MATERIAL_KEYS = ("card_template", "executor_contract", "reference_card", "scripted_driver_source",
-                 "module_sources", "primitives", "obs_keys", "action_order")
+                 "module_sources", "functions", "primitives", "obs_keys", "action_order")
 KINDS = ("tunables", "executor", "card", "patch", "none")
 #: Zetta's top-down causal ladder, highest layer first: the layer an answer claims to work
 #: at. A higher layer that explains the failure forbids a lower-layer answer; the parameter
@@ -125,14 +129,14 @@ PAYLOAD_BY_KIND = {
              "files": {"manifest.toml": "<toml>", "__init__.py": "<python>"},
              "to": "<new executor key>", "ref": "<name>:provider (or <card_package>:provider)",
              "node": "<optional node id>"},
-    "patch": {"name": "<[a-z][a-z0-9_]{2,40}: the candidate dir name>",
+    "patch": {"name": "<optional [a-z][a-z0-9_]{2,40}: the candidate dir name, defaulted for you>",
               "module": "<one of first_death.modules>",
-              "edits": [{"old": "<a snippet COPIED VERBATIM out of module_sources[module] with the "
-                                "'NNNN| ' line-number prefix stripped; it must occur EXACTLY ONCE "
-                                "in that module, whitespace and indentation included>",
+              "edits": [{"old": "<a snippet COPY-PASTED out of functions[<module>:<Class>.<method>] (the SAME "
+                                "code with NO line-number prefix; module_sources is the same text "
+                                "numbered). It must occur EXACTLY ONCE in that module>",
                          "new": "<what replaces it, same indentation>"}],
               "diff": "<optional alternative to edits: a unified diff, @@ hunks with exact context lines>",
-              "to": "<new executor key>", "node": "<optional node id>"},
+              "to": "<optional new executor key, defaulted to `name`>", "node": "<optional node id>"},
     "none": {},
 }
 
@@ -173,17 +177,32 @@ comes back to you verbatim -- fix exactly that and answer again.
 - patch: edit ONE module of first_death.modules (the scripted driver where the stage's \
 constants and methods live). Answer patch with NO payload the first time: the module text \
 comes back in the next message, and you cannot copy a snippet you have not been shown. \
-module_sources[module] is that module's REAL text, every line \
-prefixed "NNNN| " (the 1-based line number); first_death.modules_full says which modules are \
+`functions` is {"<module>:<Class>.<method>": its EXACT source} for every module you may \
+edit -- the key's module is the one to send as `module` -- the SAME \
+code with NO line-number prefix, so `old` is a COPY-PASTE out of it with zero transformation \
+(if a class you want is not there, copy from module_sources and strip the prefix -- never \
+invent a snippet); module_sources[module] is \
+the whole module's text with every line prefixed "NNNN| " (the 1-based line number, for line \
+numbers and context), and first_death.modules_full says which modules are \
 whole and which are class/function extracts. Each edit is {old, new}: `old` is a snippet you \
-COPY VERBATIM out of that text with the "NNNN| " prefix stripped -- never retyped, never \
+COPY out of that material -- never retyped, never \
 invented, never from a file you were not given -- and it must occur EXACTLY ONCE in the \
 module (add surrounding lines to make it unique). The edits are applied to a COPY of the \
 module and the patched stage class drives the first-death node; the installed card is \
 untouched. An `old` found 0 or >1 times comes back to you with the count and the \
-neighbourhood. (A unified diff in "diff" instead of "edits" still works.)
+WHOLE enclosing function -- copy from that. (A retyped snippet whose only error is indentation \
+still applies, but a copy-paste never needs that. A unified diff in "diff" instead of "edits" \
+still works.)
 - none: only when nothing is left to try -- the brief's untried lists what remains; while it \
 is not empty, answer one of those instead (say why in rationale).
+`score` is a tuple compared position by position (`score_definition`): whole-task successes \
+first, then how FAR the seeds got (their milestones). Successes stay 0 for whole campaigns, so \
+the ONLY gradient is the milestone position: PREFER A CHANGE THAT ADVANCES THE FURTHEST-REACHED \
+MILESTONE, and NEVER trade a node that already passes for the target node -- a seed dying \
+EARLIER than before is WORSE even when the success count is unchanged. `last_outcome` says what \
+the last round did to that score. `accepted_stack` is what this campaign already accepted: those \
+changes ARE this round's baseline (the run starts from them), so proposing one of them again is \
+refused -- build the NEXT change on top.
 summary: 1-3 sentences in Chinese on what this round shows. rationale: why this try.
 Each seed's keyframes are the failure keyframes of its first-death node (first frame, \
 stall / last-progress frame, last frame; 128px); when attached as images they are labelled \
@@ -294,6 +313,49 @@ def _stage_source(ref: str, task: str | None) -> str | None:
     """Those classes' source, each under a ``# module <name>`` line (a patch names one)."""
     cls = _stage_classes(ref, task)
     return "\n".join(f"# module {c.__module__}\n" + inspect.getsource(c) for c in cls) if cls else None
+
+
+def _functions(cls: list[type], modules=(), budget: int = FUNCTION_CHARS) -> dict:
+    """``{"<module>:<Class>.<method>": source}`` for the first-death stage classes AND every class / function
+    of the modules a patch may edit -- the SAME text as in ``module_sources`` but with NO
+    ``"NNNN| "`` prefix, so an edit's ``old`` is a copy-paste with zero transformation (4 of 6
+    live rounds died retyping the snippet; a 7th invented one for a class that was not here --
+    it wanted the drop stage while the target node was nav). Smallest module first: the
+    mission's own modules fit before the big shared primitives one."""
+    out: dict[str, str] = {}
+
+    def add(qual: str, fn) -> None:
+        nonlocal budget
+        if qual in out or budget <= 0:
+            return
+        try:
+            out[qual] = src = inspect.getsource(fn)
+        except (OSError, TypeError):   # no source on disk
+            return
+        budget -= len(src)
+
+    def scan(c: type) -> None:
+        for name, fn in vars(c).items():
+            fn = getattr(fn, "__func__", fn)
+            if inspect.isfunction(fn):
+                add(f"{c.__module__}:{c.__qualname__}.{name}", fn)
+
+    mods = []
+    for m in modules:
+        try:
+            mod = importlib.import_module(m)
+            mods.append((len(inspect.getsource(mod)), mod))
+        except Exception:   # noqa: BLE001 -- an unimportable module simply has no source here
+            continue
+    for c in cls:
+        scan(c)
+    for _, mod in sorted(mods, key=lambda kv: kv[0]):
+        for o in vars(mod).values():
+            if inspect.isclass(o) and o.__module__ == mod.__name__:
+                scan(o)
+            elif inspect.isfunction(o) and o.__module__ == mod.__name__:
+                add(f"{mod.__name__}:{o.__qualname__}", o)
+    return out
 
 
 def _numbered(lines: list[str], a: int = 0, b: int | None = None) -> str:
@@ -472,6 +534,15 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
         # the diagnosis discipline: the ladder to answer from, the seeds' failure clusters
         # (first missing milestone x failure_mode) and what earlier rounds concluded
         "layers": LAYER_QUESTION, "clusters": cl, "notebook": _notebook(rounds),
+        # the gradient: what the last round did to the score, and what is already accepted
+        # scripts/evolve.py's structured row ({round, layer, kind, summary, before_score,
+        # after_score, regressions}) plus this module's one-line reading of it
+        "last_outcome": ({**doc["last_outcome"], "says": _last_outcome(rounds)}
+                         if isinstance(doc.get("last_outcome"), dict) else _last_outcome(rounds)),
+        "score_definition": doc.get("score_definition") or SCORE_DEF,
+        "accepted_stack": {"note": "已接受的改动（本轮从它们之上出发，它们就是新的 baseline；"
+                                   "重复其中任何一条都会被驳回）。",
+                           "changes": _accepted(doc, rounds)},
         "first_death": fd,
         "proposals_consumed": [{"round": r["round"], **r["proposal"]} for r in rounds if r.get("proposal")],
         "needs": rounds[-1].get("needs") if rounds else [],
@@ -508,6 +579,8 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
     # every module a patch may edit, numbered, what an exact-snippet `old` is copied out of
     proj["module_sources"], fd["modules_full"] = _module_sources(
         fd.get("modules") or [], cls[-1].__module__ if cls else None)
+    # the same code with no line numbers -- what `old` is copied from, for every editable module
+    proj["functions"] = _functions(cls, fd.get("modules") or [])
     size = lambda: len(json.dumps(proj, sort_keys=True, default=str))
     if size() > PROMPT_CHARS:
         proj["log_excerpt"] = proj["log_excerpt"][-MAX_LOG_LINES // 4:]
@@ -518,6 +591,80 @@ def rsi_projection(doc: dict, before: dict, records: dict, emb: str, arm: str, b
         keep = max(2000, PROMPT_CHARS - size() + len(proj["scripted_driver_source"]))
         proj["scripted_driver_source"] = proj["scripted_driver_source"][:keep]
     return proj
+
+
+def _fmt_score(v) -> str:
+    return "(" + ", ".join(str(x) for x in v) + ")" if isinstance(v, (list, tuple)) else str(v)
+
+
+def _score(r: dict) -> tuple:
+    """A round's score before -> after: the campaign's ``score`` tuple when scripts/evolve.py
+    wrote one, else the bare success counts (which are 0 -> 0 for whole campaigns)."""
+    sc = r.get("score")
+    if isinstance(sc, dict):
+        return sc.get("before"), sc.get("after")
+    return (r.get("before_score", r.get("score_before", r.get("before"))),
+            r.get("after_score", r.get("score_after", r.get("after"))))
+
+
+def _chain(row: dict) -> list:
+    """One seed's node ids in plan order (the milestone chain), off whichever of ``nodes`` /
+    ``trail`` the row carries."""
+    ns = row.get("nodes") or row.get("trail") or []
+    return [n.get("id") for n in ns if isinstance(n, dict)] if isinstance(ns, list) else list(ns)
+
+
+def _moved(r: dict) -> list[str]:
+    """Where each seed's death MOVED between this round's before-suite and its trial suite.
+    Earlier in the chain = the trial lost ground = worse, however flat the success count is."""
+    was = {s.get("seed"): s for s in r.get("per_seed") or []}
+    out = []
+    for row in r.get("after_seeds") or []:
+        seed, b = row.get("seed"), (was.get(row.get("seed")) or {})
+        a, b0 = row.get("first_death"), b.get("first_death")
+        if a == b0:
+            continue
+        ch = _chain(row) or _chain(b)
+        i, j = (ch.index(b0) if b0 in ch else -1), (ch.index(a) if a in ch else -1)
+        way = "前移" if -1 < j < i else "后移" if j > i > -1 else "变为"
+        out.append(f"种子 {seed} 的死亡点从 {b0} {way}到 {a} = "
+                   + {"前移": "变差", "后移": "变好"}.get(way, "存疑"))
+    return out
+
+
+SCORE_DEF = ("score 是逐位比较的元组：第一位是整任务成功的种子数，其后是走到的里程碑数（越远越好）。"
+             "整个战役成功数都是 0 时，唯一的梯度就是里程碑位——优先让最远到达的里程碑再往前一步；"
+             "拿一个已经通过的节点去换目标节点（死亡点前移）算变差。")
+
+
+def _last_outcome(rounds: list) -> str | None:
+    """The last round as ONE line of gradient: layer + kind, the score before -> after, and
+    which way each seed's death moved. Round 86 wrote the right fix, scored 0 -> 0 and was
+    filed "same" -- the movement is the signal the success count cannot carry."""
+    if not rounds:
+        return None
+    r = rounds[-1]
+    t = r.get("tried") or {}
+    b, a = _score(r)
+    moved = _moved(r)
+    return (f"上一轮（第 {r.get('round')} 轮）：{(t.get('detail') or {}).get('layer') or r.get('layer') or '-'} "
+            f"{t.get('kind')}，score {_fmt_score(b)} → {_fmt_score(a)}，"
+            + ("；".join(moved) if moved else "各种子的死亡点不变 = 持平")
+            + ("（已接受，是本轮的 baseline）" if r.get("accepted") or r.get("published")
+               else "（未接受，本轮仍从已接受状态出发）"))
+
+
+def _accepted(doc: dict, rounds: list) -> list[dict]:
+    """The accepted stack: what this campaign has ALREADY accepted (campaign.json ``accepted``
+    when scripts/evolve.py keeps one, else the published rounds). Each is the new baseline."""
+    stack = doc.get("accepted_stack") or doc.get("accepted")
+    if isinstance(stack, list):
+        return stack
+    keep = ("to", "from", "path", "ref", "module", "edits")
+    return [{"round": r.get("round"), "kind": (r.get("tried") or {}).get("kind"),
+             "node": (r.get("tried") or {}).get("node"),
+             **{k: v for k, v in ((r.get("tried") or {}).get("detail") or {}).items() if k in keep}}
+            for r in rounds if r.get("accepted") or r.get("published")]
 
 
 def brief(proj: dict) -> dict:
@@ -678,37 +825,98 @@ def apply_diff(text: str, diff: str) -> str:
     return "\n".join(out + src[pos:])
 
 
+def _enclosing(src: str, line: int) -> tuple[str, int, int] | None:
+    """(what, first, last) of the innermost def / class containing the 1-based ``line``; the
+    class when no function does; None when neither (or the module does not parse)."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    best = None
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and n.lineno <= line <= (n.end_lineno or n.lineno) \
+                and (best is None or n.lineno > best.lineno):
+            best = n
+    if best is None:
+        return None
+    kind = "class" if isinstance(best, ast.ClassDef) else "function"
+    return f"{kind} {best.name}", best.lineno - 1, best.end_lineno
+
+
 def _near(src: str, old: str, limit: int = 2) -> str:
-    """Where the first line of ``old`` that occurs at all does occur: ±6 numbered lines
-    around up to ``limit`` such places, so the model can copy the real snippet."""
+    """Where the first line of ``old`` that occurs at all does occur -- the WHOLE enclosing
+    function (the class when no function encloses it, ±6 lines when neither), numbered, for
+    up to ``limit`` such places: a ±6-line window is not enough text to copy a snippet out of."""
     lines, hits = src.split("\n"), []
     for want in (l.strip() for l in old.split("\n") if l.strip()):
         hits = [i for i, l in enumerate(lines) if l.strip() == want][:limit]
         if hits:
             break
     if not hits:
-        return ("that snippet's first line occurs nowhere in the module -- copy `old` verbatim "
-                "out of module_sources[module] (strip the 'NNNN| ' prefix); do not retype it.")
-    return "\n\n".join("the module around line %d reads:\n%s" % (i + 1, _numbered(lines, i - 6, i + 7))
-                       for i in hits)
+        return ("that snippet's first line occurs nowhere in the module -- copy `old` out of "
+                "functions[\"<module>:<Class>.<method>\"] (its key names the module to patch); "
+                "do not retype it.")
+    out = []
+    for i in hits:
+        span = _enclosing(src, i + 1)
+        head = ("the module around line %d reads:" % (i + 1) if span is None else
+                "line %d is in %s, which reads (copy `old` out of THIS text):" % (i + 1, span[0]))
+        a, b = (i - 6, i + 7) if span is None else (span[1], span[2])
+        out.append(head + "\n" + _numbered(lines, a, b))
+    return "\n\n".join(out)
 
 
-def apply_edits(text: str, edits: list) -> str:
-    """Exact-snippet edits: each ``{old, new}``'s ``old`` must occur EXACTLY ONCE in the
-    source (whitespace included) and is replaced by ``new``. ``ValueError`` names the edit,
-    the occurrence count and the neighbourhood the snippet nearly matched."""
+def _lenient(src: list[str], old: str) -> tuple[int, int, int] | None:
+    """The ONE window of ``src`` whose lines equal ``old``'s once leading indentation and
+    trailing whitespace are ignored -- exactly what a RETYPED snippet gets wrong. Returns
+    (start, length, indent delta) or None when it matches zero or several places."""
+    want, srp = [l.strip() for l in old.split("\n")], [l.strip() for l in src]
+    n = len(want)
+    hits = [i for i in range(len(src) - n + 1) if srp[i:i + n] == want]
+    if len(hits) != 1:
+        return None
+    j = next((k for k in range(n) if want[k]), 0)
+    ind = lambda l: len(l) - len(l.lstrip())
+    return hits[0], n, ind(src[hits[0] + j]) - ind(old.split("\n")[j])
+
+
+def _shift(new: str, delta: int) -> str:
+    """``new`` re-indented by ``delta`` columns, so a lenient match keeps the file's own
+    indentation instead of the model's."""
+    if not delta:
+        return new
+    return "\n".join(l if not l.strip() else " " * delta + l if delta > 0
+                     else l[min(-delta, len(l) - len(l.lstrip())):] for l in new.split("\n"))
+
+
+def apply_edits(text: str, edits: list, modes: list | None = None) -> str:
+    """Exact-snippet edits: each ``{old, new}``'s ``old`` is replaced by ``new`` where it
+    occurs EXACTLY ONCE -- ``"exact"`` (whitespace included) first, then ``"lenient"``: the
+    same lines ignoring leading indentation and trailing whitespace, still exactly one hit,
+    with ``new`` re-indented to the file. ``modes`` collects which mode matched per edit (the
+    round detail records it). ``ValueError`` names the edit, the count and the full enclosing
+    function."""
     for i, e in enumerate(edits, 1):
         old, new = (e or {}).get("old"), (e or {}).get("new")
         if not isinstance(old, str) or not old or not isinstance(new, str):
             raise ValueError(f"edit {i} must be {{old: <non-empty snippet>, new: <replacement>}}, got {e!r}")
-        n = text.count(old)
-        if n != 1:
-            raise ValueError(f"edit {i}: `old` occurs {n} times in the module, it must occur exactly once"
-                             + (" (add the surrounding lines to make it unique)" if n > 1 else "")
-                             + f". You sent:\n{old}\n" + _near(text, old))
         if old == new:
             raise ValueError(f"edit {i} changes nothing: old == new")
-        text = text.replace(old, new, 1)
+        n = text.count(old)
+        span = None if n == 1 else _lenient(text.split("\n"), old)
+        if n != 1 and span is None:
+            raise ValueError(f"edit {i}: `old` occurs {n} times in the module, it must occur exactly once"
+                             + (" (add the surrounding lines to make it unique)" if n > 1 else "")
+                             + " -- not even ignoring indentation and trailing whitespace"
+                             + f". You sent:\n{old}\n" + _near(text, old))
+        if span is None:
+            text = text.replace(old, new, 1)
+        else:
+            src = text.split("\n")
+            text = "\n".join(src[:span[0]] + _shift(new, span[2]).split("\n") + src[span[0] + span[1]:])
+        if modes is not None:
+            modes.append("exact" if span is None else "lenient")
     return text
 
 
@@ -809,6 +1017,24 @@ def provider(**params):
 '''
 
 
+def _elsewhere(edits, module: str, fd: dict) -> str:
+    """Where an unfound snippet actually lives. The model copies the right code out of
+    ``functions`` and names the wrong module (measured: live round 102 sent
+    ``PointPlaceDriver._act`` verbatim against recycle_driver, it lives in stage_extras)."""
+    for e in edits or ():
+        old = (e or {}).get("old")
+        for m in fd.get("modules") or ():
+            if m == module or not isinstance(old, str):
+                continue
+            try:
+                src = Path(inspect.getsourcefile(importlib.import_module(m))).read_text()
+            except Exception:   # noqa: BLE001 -- a module with no source is simply not the answer
+                continue
+            if src.count(old) == 1:
+                return f"\nThat snippet occurs EXACTLY ONCE in {m}: send `module`: {m!r} instead."
+    return ""
+
+
 def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_ROOT) -> str | None:
     """Materialise a ``patch`` answer: the module copied under ``root/<name>/`` with the
     ``edits`` (or ``diff``) applied (imports of the installed package rewritten by ref), the card's
@@ -818,11 +1044,11 @@ def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_
     name, module, to = pay.get("name"), pay.get("module"), pay.get("to")
     edits, diff = pay.get("edits"), pay.get("diff")
     if not isinstance(name, str) or not _NAME.match(name):
-        return f"patch:candidate name {name!r} is not [a-z][a-z0-9_]{{2,40}}"
+        name = pay["name"] = f"patch_r{round_no}"   # bookkeeping ids, never worth an attempt:
+    if not isinstance(to, str) or not to:           # the live model burned 2 of its 3 on these
+        to = pay["to"] = name
     if module not in (fd.get("modules") or []):
         return f"patch:module must be one of first_death.modules {fd.get('modules')}, got {module!r}"
-    if not isinstance(to, str) or not to:
-        return "patch:payload needs an executor key `to`"
     if edits is not None and not (isinstance(edits, list) and edits):
         return "patch:`edits` must be a non-empty list of {old, new} objects"
     if edits is None and not (isinstance(diff, str) and diff.strip()):
@@ -830,10 +1056,11 @@ def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_
                 "module_sources[module] (a unified `diff` is still accepted instead)")
     mod = importlib.import_module(module)
     src = Path(inspect.getsourcefile(mod)).read_text()
+    modes: list = []
     try:
-        new = apply_edits(src, edits) if edits is not None else apply_diff(src, diff)
+        new = apply_edits(src, edits, modes) if edits is not None else apply_diff(src, diff)
     except ValueError as exc:
-        return f"patch:{exc}"
+        return f"patch:{exc}{_elsewhere(edits, module, fd)}"
     if new == src:
         return "patch:the patch changes nothing"
     pkg, base = _card_package(root), module.rpartition(".")[2]
@@ -851,7 +1078,7 @@ def write_patch(pay: dict, fd: dict, round_no: int = 0, root: Path = CANDIDATES_
     (d / "__init__.py").write_text(PATCH_CARD.format(
         name=name, module=module, round=round_no, to=to, skill=fd.get("skill"), ref=ref,
         installed=str(fd.get("tunables", {}).get("ref", "")).partition(":")[0], base=base, task=fd.get("task")))
-    pay["path"], pay["ref"] = str(d), ref
+    pay["path"], pay["ref"], pay["match"] = str(d), ref, modes or ["diff"]
     return _doctor(d, ref, pay)
 
 
@@ -930,6 +1157,27 @@ def _tried_pairs(proj: dict) -> set:
         elif t.get("kind") in ("executor", "card") and t.get("node") == node and d.get("to"):
             out.add(("executor", d["to"], None))
     return out
+
+
+def _edit_key(module, edits) -> tuple:
+    return (module, tuple(sorted((str((e or {}).get("old", "")).strip(),
+                                  str((e or {}).get("new", "")).strip()) for e in edits)))
+
+
+def _accepted_repeat(proj: dict, pay: dict) -> str | None:
+    """An accepted change IS this round's baseline (the run starts from it), so re-proposing
+    it changes nothing. Refuses a patch whose (module, edits) is already in the stack."""
+    if not isinstance(pay.get("edits"), list) or not pay["edits"]:
+        return None
+    key = _edit_key(pay.get("module"), pay["edits"])
+    for c in (proj.get("accepted_stack") or {}).get("changes") or ():
+        d = c.get("detail") if isinstance(c, dict) and isinstance(c.get("detail"), dict) else c
+        if isinstance(d, dict) and isinstance(d.get("edits"), list) \
+                and _edit_key(d.get("module"), d["edits"]) == key:
+            return (f"this edit is ALREADY ACCEPTED (round {c.get('round')}): the accepted stack is "
+                    "this round's baseline, the run already starts from it. Build the NEXT change "
+                    "on top of it, or target another node of death_nodes.")
+    return None
 
 
 def _repeat_why(key: tuple, fd: dict, seen: set) -> str:
@@ -1029,12 +1277,14 @@ def _try(ans: dict, proj: dict, before: dict, round_no: int, preflight, seen: se
         seen.add(("executor", pay["to"], None))
         tried = from_proposal(p, before)
     else:   # card / patch: materialised under the candidates root, then the same card path
+        if why := (_accepted_repeat(proj, pay) if ans["kind"] == "patch" else None):
+            raise ValueError(why)
         if why := (write_card(pay) if ans["kind"] == "card" else write_patch(pay, fd, round_no)):
             raise ValueError(why)
         tried = from_proposal({**p, "kind": "card", "payload": {k: pay[k] for k in ("path", "to", "ref", "params", "node") if k in pay}}, before)
         if ans["kind"] == "patch" and tried["kind"] == "card":
             tried["detail"].update(module=pay["module"],
-                                   **{k: pay[k] for k in ("edits", "diff") if k in pay})
+                                   **{k: pay[k] for k in ("edits", "diff", "match") if k in pay})
     if tried["kind"] == "none":
         raise ValueError(tried["detail"]["reason"])   # from_proposal's refusal: the answer was unusable
     if ans["kind"] in ("card", "patch") and preflight is not None:

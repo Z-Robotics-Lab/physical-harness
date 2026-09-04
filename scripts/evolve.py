@@ -11,7 +11,13 @@ up to 3 times from the exact error -- a card is preflighted on the first seed al
 ``evidence.by_executor`` beats the measured rate) else a one-dimensional +/-20%
 tunables perturbation of that node's driver (its card's mount params, applied via
 ``PH_MOUNT_PARAMS_OVERRIDE``) else nothing, with the honest reason -- re-run the
-same seeds, and publish when the success count improves: the skill record with
+same seeds (the TARGET NODE'S CLUSTER first: a trial that does not make that node
+pass stops there and never spends the rest of the suite), and score the result as
+``(successes, milestones, target_pass)`` (``score``). Two levels follow from it: the
+round is ACCEPTED -- its change joins ``accepted_stack``/``applied`` and becomes the
+next round's baseline -- when the score rose and no node that passed stopped passing
+(``regressions``); it is PUBLISHED, whole-task evidence into the skill record, only
+when the success count itself improves: the skill record with
 the measured ``by_executor`` row folded in goes through the evolution-only skills
 root door (``InMemorySkillGraph.publish``, the same one scripts/publish_plans.py
 uses). Every round lands atomically in ``campaigns/evolve-<task>/campaign.json``
@@ -191,12 +197,14 @@ def _get(budgets, binding: dict, key: str, default):
     return binding.get(key, default) if v is None else v
 
 
-def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path,
+def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_root: Path,
               applied: dict, media_dir: Path | None = None, budgets: dict | None = None,
-              progress=None) -> dict:
+              progress=None, seed_list: list | None = None) -> dict:
     """{count, seeds: {seed: {success, first_death, fault, nodes}}, sha}. ``media_dir``
     (<session>/media) turns on the workload's segment recorder: kept-on-success clips.
-    ``progress(**live)`` is called at every seed boundary and node change."""
+    ``progress(**live)`` is called at every seed boundary and node change.
+    ``seeds`` is the inclusive range [lo, hi]; ``seed_list`` names the seeds explicitly
+    instead (a focused trial's cluster is not contiguous)."""
     os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
     cards = applied.get("cards") or {}
     os.environ[EXTRA_ENV] = ":".join(r for r in (_BASE_EXTRA, *(c["path"] for c in cards.values())) if r)
@@ -216,7 +224,9 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
         brief["media_dir"] = str(media_dir)
     tick = progress or (lambda **kw: None)
     t_suite = time.time()
-    for i, seed in enumerate(range(int(seeds[0]), int(seeds[1]) + 1)):
+    seq = [int(x) for x in seed_list] if seed_list is not None else list(
+        range(int(seeds[0]), int(seeds[1]) + 1))
+    for i, seed in enumerate(seq):
         t_seed = time.time()
         tick(seed_index=i, seed=seed, node=None, nodes=[], seed_started_at=t_seed)
         log = _Tap(lambda nodes: tick(nodes=nodes, node=next(
@@ -263,7 +273,7 @@ def run_suite(task: str, binding: dict, seeds: list, arm: str, skills_root: Path
                 n["geometry"] = diag.get("geometry")    # first death only
         _link_upstream(per[str(seed)]["trail"], dead, skills)
         logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
-                                        evolve_llm.MAX_LOG_LINES // (int(seeds[1]) - int(seeds[0]) + 1))
+                                        evolve_llm.MAX_LOG_LINES // len(seq))
         tick(per_seed_partial=per_seed({"seeds": per}))
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
             "elapsed_s": round(time.time() - t_suite, 3),
@@ -409,6 +419,47 @@ def regression(rounds: list, before: dict, after: dict, milestone) -> dict | Non
     hit = lambda suite: sum(ok(suite, s) for s in cs)
     return {"seeds": cs, "before": hit(before), "after": hit(after),
             "lost": [s for s in cs if ok(before, s) and not ok(after, s)]} if cs else None
+
+
+# ── score: the gradient. Whole-task success alone is flat (0/2 for 90 rounds) ─────
+
+def _ok_map(suite: dict) -> dict[str, dict[str, bool]]:
+    """``{seed: {node: passed?}}`` from each seed's node trail."""
+    return {str(seed): {n["id"]: n.get("ok") is True for n in (s.get("trail") or [])}
+            for seed, s in suite["seeds"].items()}
+
+
+def score(suite: dict, node=None) -> tuple[int, int, int]:
+    """The suite's LEXICOGRAPHIC score ``(successes, milestones, target_pass)``:
+    whole-task wins first, then the furthest-progress signal (nodes passed, summed over
+    seeds), then how many seeds pass the round's TARGET node. Success alone is flat --
+    0/2 on every candidate for 90 rounds -- so a change that moves a death EARLIER
+    scores strictly lower and a change that moves it later scores strictly higher."""
+    oks = _ok_map(suite)
+    return (sum(bool(s.get("success")) for s in suite["seeds"].values()),
+            sum(sum(m.values()) for m in oks.values()),
+            sum(bool(m.get(node)) for m in oks.values()) if node else 0)
+
+
+def regressions(before: dict, after: dict) -> list[dict]:
+    """``[{seed, node, was_ok_now_not}]`` -- every node that PASSED under the accepted
+    state and no longer passes under the trial (a node the trial's plan dropped counts).
+    A non-empty list refuses acceptance, whatever the score did."""
+    a = _ok_map(after)
+    return [{"seed": int(seed), "node": nid, "was_ok_now_not": True}
+            for seed, m in sorted(_ok_map(before).items(), key=lambda kv: int(kv[0]))
+            for nid, ok in m.items() if ok and not (a.get(seed) or {}).get(nid)]
+
+
+def focus_seeds(rounds: list, before: dict, node, seeds: list) -> list[int]:
+    """The FOCUSED trial's scope: the target node's failure cluster (``cluster_seeds``,
+    else the seeds dying there this round), inside the dev range. Empty when it is the
+    whole range -- there is nothing to save by narrowing."""
+    full = list(range(int(seeds[0]), int(seeds[1]) + 1))
+    cs = [s for s in cluster_seeds(rounds, before, node) if s in full] or \
+         sorted(int(s) for s, v in before["seeds"].items()
+                if v.get("first_death") == node and int(s) in full)
+    return cs if 0 < len(cs) < len(full) else []
 
 
 def pipeline_modules(ref: str, binding: dict) -> list[str]:
@@ -682,9 +733,10 @@ def main(argv=None) -> int:
                           "nodes": [], "seed_started_at": None, "proposer": args.proposer,
                           "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in doc["rounds"]), 3)}
 
-    def suite(seed_range, overlay, media=True):
+    def suite(seed_range, overlay, media=True, seed_list=None):
         out = run_suite(args.task, binding, seed_range, arm, args.skills_root, overlay,
-                        media_dir=args.session / "media" if media else None, budgets=budgets, progress=tick)
+                        media_dir=args.session / "media" if media else None, budgets=budgets,
+                        progress=tick, seed_list=seed_list)
         live["sim_s"] = round(live["sim_s"] + out["elapsed_s"], 3)
         return out
 
@@ -759,18 +811,44 @@ def main(argv=None) -> int:
             tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
         tick(tried=tried)
         after, published, confirm, regr, burned = before, False, None, None, []
+        trial_row, saved_s = None, 0.0
         if tried["kind"] != "none":
             trial = apply(tried, applied)
             tick(phase="retest")
+            full = list(range(int(seeds[0]), int(seeds[1]) + 1))
+            focus = focus_seeds(doc["rounds"], before, tried["node"], seeds)
+            done = pre.get("out")   # the preflight seed already ran under this trial
+            ran = {int(x) for x in (done or {"seeds": {}})["seeds"]}
+
+            def run_seeds(want, trial=trial, ran=ran):   # the seeds of ``want`` not already run
+                nonlocal done
+                todo = [x for x in want if x not in ran]
+                if todo:
+                    out = suite(None, trial, seed_list=todo)
+                    done = _merge(done, out) if done else out
+                    ran.update(todo)
+                return done
+
+            scope, target_pass = "full", 0
             try:
-                after = pre.get("out")   # the preflight seed already ran under this trial
-                if after is None or int(seeds[1]) > int(seeds[0]):
-                    more = suite([int(seeds[0]) + (1 if after else 0), int(seeds[1])], trial)
-                    after = _merge(after, more) if after else more
+                if focus:   # NODE-FOCUSED TRIAL: the cluster of the target node first
+                    scope, foc = "focused", run_seeds(focus)
+                    target_pass = sum(bool((_ok_map(foc).get(str(x)) or {}).get(tried["node"]))
+                                      for x in focus)
+                if scope == "full" or target_pass:
+                    after = run_seeds(full)
+                    scope, target_pass = "full", score(after, tried["node"])[2]
+                else:   # the target still does not pass: the rest of the suite is not spent.
+                    # Seeds outside the focus keep their baseline result, so the score compares.
+                    after = _merge(before, done)
+                    saved_s = round((before.get("elapsed_s") or 0.0)
+                                    * (len(full) - len(focus)) / len(full), 3)
             except Exception as exc:  # noqa: BLE001 -- the trial's failure is the round's finding
                 tried["detail"]["error"] = repr(exc)
-                after = before
-            published = after["count"] > before["count"]
+                after, scope, target_pass = before, "full", 0
+            trial_row = {"scope": scope, "seeds": focus if scope == "focused" else full,
+                         "target_pass": target_pass}
+            published = scope == "full" and after["count"] > before["count"]
             if published:   # the whole origin cluster first, then the fresh seeds
                 regr = regression(doc["rounds"], before, after, tried["node"])
                 if regr and regr["lost"]:
@@ -802,12 +880,40 @@ def main(argv=None) -> int:
                     tick(seeds_total=int(seeds[1]) - int(seeds[0]) + 1)
             if published:
                 tick(phase="publish")
-                applied = trial
                 skill = tried["detail"]["skill"]
                 tried["detail"]["digest"], d = publish(
                     args.skills_root, records[skill], emb, tried, after)
                 records[skill] = SkillRecordV0.from_dict(d)   # later rounds build on what was published
-        kept = after if published else before
+        # ── ACCEPT: the two levels. A partial win (the score rose and nothing that passed
+        # stopped passing) joins the campaign's accepted state and becomes the next round's
+        # baseline; only a whole-task win also publishes evidence into the skill record.
+        bs_score, as_score = score(before, tried["node"]), score(after, tried["node"])
+        regs = regressions(before, after)
+        if tried["kind"] == "none" or trial_row is None:
+            accepted, why = False, "nothing tried"
+        elif trial_row["scope"] == "focused":
+            accepted, why = False, f"focused trial: {tried['node']} passed on no seed of its cluster"
+        elif regs:
+            accepted = False
+            why = "regressed: " + ", ".join(f"{g['seed']}/{g['node']}" for g in regs[:4])
+        elif confirm and not published:   # the fresh seeds refused it: not a baseline either
+            accepted, why = False, f"confirm {confirm['before']} -> {confirm['after']}"
+        elif as_score > bs_score:
+            accepted, why = True, f"score {list(bs_score)} -> {list(as_score)}, no node regressed"
+        else:
+            accepted, why = False, f"score {list(bs_score)} -> {list(as_score)}"
+        if published and not accepted:   # a whole-task win is the accepted state by definition
+            accepted, why = True, f"published: {before['count']} -> {after['count']} ({why})"
+        if accepted:
+            applied = trial
+            doc.setdefault("accepted_stack", []).append(
+                {"round": r, "kind": tried["kind"],
+                 "detail": {"node": tried["node"],
+                            **{k: tried["detail"][k] for k in
+                               ("skill", "ref", "path", "from", "to", "module", "edits")
+                               if k in tried["detail"]}},
+                 "score": list(as_score)})
+        kept = after if accepted else before
         doc["best"] = max(int(doc["best"] or 0), kept["count"])
         update_reference(doc, kept, r)   # the successful-reference index, campaign-wide
         doc["rounds"].append({
@@ -820,18 +926,32 @@ def main(argv=None) -> int:
             "regression": regr, "burned": burned,
             "best": doc["best"], "suite_sha": after["sha"], "published": published,
             # the hypothesis tree: which accepted state this try grew from, and how it went
-            "parent": max((x["round"] for x in doc["rounds"] if x["published"]), default=0),
-            "outcome": ("none" if tried["kind"] == "none" else "improved" if after["count"] > before["count"]
-                        else "worse" if after["count"] < before["count"] else "same"),
+            "parent": max((x["round"] for x in doc["rounds"]
+                           if x.get("accepted") or x.get("published")), default=0),
+            # outcome on the SCORE TUPLE, not the success count: a death that moves earlier
+            # is ``worse``, never ``same`` -- that is the gradient
+            "outcome": ("none" if tried["kind"] == "none" else "improved" if as_score > bs_score
+                        else "worse" if as_score < bs_score else "same"),
+            "before_score": list(bs_score), "after_score": list(as_score),
+            "accepted": accepted, "accepted_reason": why, "trial": trial_row,
             "confirm": confirm,
             "usage": {"llm_tokens": llm.pop("usage", None) if llm else None,
-                      "sim_s": round(live["sim_s"] - sim_s0, 3)},
+                      "sim_s": round(live["sim_s"] - sim_s0, 3), "sim_s_saved": saved_s},
             "per_seed": per_seed(kept), "after_seeds": per_seed(after),
             "needs": tried["detail"].get("needs", []) if tried["kind"] == "none" else [],
             "media": _media(args.session, args.task, seeds),
             "media_dropped": _dropped(args.session, args.task, seeds), "ts": time.time(),
             "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
             "proposer": proposer, "llm": llm})
+        # what the model is told plainly next round: what this try did to the score, and
+        # which seed/node it pushed backwards
+        doc["last_outcome"] = {
+            "round": r, "layer": tried["detail"].get("layer"), "kind": tried["kind"],
+            "summary": (llm or {}).get("summary") or tried["detail"].get("reason")
+                       or f"{tried['kind']} @ {tried['node']}",
+            "before_score": list(bs_score), "after_score": list(as_score),
+            "outcome": doc["rounds"][-1]["outcome"], "accepted": accepted,
+            "accepted_reason": why, "regressions": regs}
         doc["cursor"], doc["applied"] = r, applied
         tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
         base = kept

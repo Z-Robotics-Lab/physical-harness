@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pytest
 from test_evolve_e2e import _CARD, EMB, TASK
@@ -198,6 +199,20 @@ def test_recycle_cans_brief_carries_the_drop_driver_source_and_stays_bounded(tmp
     assert proj["primitives"]["constants"]["ADIM"] == 12 and proj["primitives"]["constants"]["GRIP"] == 6
     assert any(k.startswith("_arm_action(env, goal_world, grip") for k in proj["primitives"]["functions"])
     assert proj["obs_keys"][0] == "robot0_base_pos" and "out[6] = a[11]" in proj["action_order"]
+    # `functions` is what an edit's `old` is copied from: every class of every editable
+    # module, not just the target node's stage (the live model invented a snippet for the
+    # drop stage while the target node was nav, because only nav's methods were here)
+    import inspect
+
+    from plugins.embodiment_robocasa import stage_extras
+    fns = proj["functions"]
+    # the key names the module to send as `module` (round 102 sent PointPlaceDriver._act
+    # verbatim against the wrong one), and the source carries no "NNNN| " prefix to strip
+    x = "plugins.embodiment_robocasa.stage_extras:"
+    assert {"plugins.embodiment_robocasa.recycle_driver:ClusterDropDriver._drop_point",
+            x + "PointPlaceDriver.act"} <= set(fns)
+    assert fns[x + "PointPlaceDriver.act"] == inspect.getsource(stage_extras.PointPlaceDriver.act)
+    assert not re.match(r"\s*\d+\| ", fns[x + "PointPlaceDriver.act"])
     assert len(json.dumps(proj, sort_keys=True)) <= evolve_llm.PROMPT_CHARS
 
 
@@ -450,6 +465,38 @@ def test_the_brief_carries_the_clusters_the_first_missing_milestone_the_divergen
     assert b["clusters"] == proj["clusters"] and b["notebook"] == proj["notebook"]
     assert b["this_round"]["per_seed"][0]["divergence"] == row["divergence"]
     assert b["layers"] == proj["layers"] and b["target"]["cluster"] == proj["clusters"][0]
+
+
+def test_the_brief_renders_the_gradient_the_accepted_stack_and_what_score_means():
+    """Round 86 of the live campaign: the model wrote the right structural fix, both seeds
+    then died EARLIER (drop-can1 -> nav-can1), the success count stayed 0/2 and the round was
+    filed "same". Successes are flat for whole campaigns, so the brief now says out loud what
+    moved, what is already accepted, and that milestones are the gradient."""
+    from scripts import evolve_llm
+    chain = [{"id": n} for n in ("nav-can1", "grasp-can1", "carry-can1", "drop-can1")]
+    per = lambda dead: [{"seed": s, "success": False, "first_death": dead, "nodes": chain}
+                        for s in (4243, 4244)]
+    proj, _ = recycle_cans_projection({"rounds": [
+        {"round": 85, "tried": {"kind": "card", "node": "drop-can1", "detail": {"layer": "plan", "to": "fix"}},
+         "before": 0, "after": 0, "published": True, "score": {"before": [0, 9, 0], "after": [0, 11, 0]},
+         "per_seed": per("nav-can1"), "after_seeds": per("drop-can1")},
+        {"round": 86, "tried": {"kind": "patch", "node": "drop-can1", "detail": {"layer": "plan"}},
+         "before": 0, "after": 0, "published": False, "score": {"before": [0, 11, 0], "after": [0, 9, 0]},
+         "per_seed": per("drop-can1"), "after_seeds": per("nav-can1")}]})
+    b = evolve_llm.brief(proj)
+    assert b["last_outcome"] == (
+        "上一轮（第 86 轮）：plan patch，score (0, 11, 0) → (0, 9, 0)，"
+        "种子 4243 的死亡点从 drop-can1 前移到 nav-can1 = 变差；"
+        "种子 4244 的死亡点从 drop-can1 前移到 nav-can1 = 变差（未接受，本轮仍从已接受状态出发）")
+    assert "唯一的梯度就是里程碑位" in b["score_definition"]
+    # the accepted stack: the published round, named as the baseline this round starts from
+    assert b["accepted_stack"]["changes"] == [{"round": 85, "kind": "card", "node": "drop-can1", "to": "fix"}]
+    assert b["accepted_stack"]["note"].startswith("已接受的改动（本轮从它们之上出发")
+    rules = evolve_llm._RULES
+    assert "PREFER A CHANGE THAT ADVANCES THE FURTHEST-REACHED MILESTONE" in rules
+    assert "NEVER trade a node that already passes for the target node" in rules
+    assert "proposing one of them again is refused" in rules and "functions[<module>:<Class>.<method>]" in \
+        evolve_llm.PAYLOAD_BY_KIND["patch"]["edits"][0]["old"] + rules
 
 
 def test_first_missing_milestone_is_the_first_node_not_completed():

@@ -29,8 +29,10 @@ TASK = "e2e_patch"
 
 TWICE = [{"old": "        return (0.0,)", "new": "        return (0.1,)"}]        # 2 places
 ABSENT = [{"old": "class GrabStage:\n    STOP = 0.99", "new": "class GrabStage:\n    STOP = 0.4"}]
-GOOD = [{"old": "    # the loaded standoff: the scripted value never closes the grab\n    STOP = 0.65",
-         "new": "    # patched by the proposer\n    STOP = 0.4"}]
+# RETYPED out of `functions` at the wrong indentation (what the live model does): the lenient
+# match still lands it, and `new` is re-indented to the file's own columns.
+GOOD = [{"old": "# the loaded standoff: the scripted value never closes the grab\nSTOP = 0.65",
+         "new": "# patched by the proposer\nSTOP = 0.4"}]
 DIFF = "--- a/patch_stage.py\n+++ b/patch_stage.py\n@@ -1,3 +1,3 @@\n class GrabStage:\n-    STOP = 0.99\n+    STOP = 0.4\n"
 
 
@@ -88,18 +90,24 @@ def test_patch_edits_land_on_a_copy_after_two_steps_and_two_repairs(runtime):
     assert a2["messages"][2]["content"].startswith("Round input:") and a2["messages"][4]["content"].startswith("You decided patch")
     twice, absent = (a["reason"] for a in a2["attempts"])
     assert twice.startswith("patch:edit 1: `old` occurs 2 times in the module, it must occur exactly once")
-    assert "add the surrounding lines" in twice and "the module around line 28 reads:" in twice
-    assert "  28|         return (0.0,)" in twice and "  44|         return (0.0,)" in twice
+    # the rejection carries the WHOLE enclosing function (a +/-6 window is not enough to copy from)
+    assert "add the surrounding lines" in twice and "line 28 is in function act, which reads" in twice
+    assert "  26|     def act(self, env, obs):\n  27|         env.reached = True\n  28|         return (0.0,)" in twice
+    assert "line 44 is in function act, which reads" in twice
     assert absent.startswith("patch:edit 1: `old` occurs 0 times in the module")
-    assert "the module around line 34 reads:" in absent and "  34| class GrabStage:" in absent
+    assert "line 34 is in class GrabStage, which reads" in absent   # no function encloses a class line
+    assert "  34| class GrabStage:" in absent and "  47|         return bool(getattr(env, \"grabbed\", False))" in absent
     assert twice in a2["messages"][6]["content"] and absent in a2["messages"][8]["content"]
     # the repaired edits: applied on a copy, the installed file untouched, the card bound and published
     assert (r2["proposer"], r2["tried"]["kind"], r2["tried"]["detail"]["to"]) == ("llm", "card", "patched")
     assert r2["tried"]["detail"]["module"] == MODULE and r2["tried"]["detail"]["edits"] == GOOD
+    assert r2["tried"]["detail"]["match"] == ["lenient"]        # the round detail says HOW it matched
     assert (r2["before"], r2["after"], r2["published"]) == (0, 2, True)
     assert runtime.sha[0] == runtime.sha[1] and "STOP = 0.65" in INSTALLED.read_text()
     cand = runtime.runs / "candidates" / "grab_stop"
-    assert r2["tried"]["detail"]["path"] == str(cand) and "STOP = 0.4" in (cand / "patch_stage.py").read_text()
+    assert r2["tried"]["detail"]["path"] == str(cand)
+    copy = (cand / "patch_stage.py").read_text()
+    assert "\n    # patched by the proposer\n    STOP = 0.4\n" in copy   # re-indented to the file, not the answer
     assert 'PATCHED = "fakes.patch_stage"' in (cand / "__init__.py").read_text()
     assert '[executors.patched]\nskill = "grab"' in (cand / "manifest.toml").read_text()
     assert doc["applied"]["cards"]["patched"]["ref"] == "grab_stop:provider"
@@ -140,7 +148,9 @@ def test_recycle_cans_call_1_brief_stays_under_12k_chars():
 
 def test_apply_edits_replaces_an_exact_snippet_and_names_the_count_and_the_neighbourhood():
     src = "a\nb\n\nc = 1\nd\nc = 1\n"
-    assert evolve_llm.apply_edits(src, [{"old": "b\n\nc = 1", "new": "b\n\nc = 2"}]) == "a\nb\n\nc = 2\nd\nc = 1\n"
+    modes = []
+    assert evolve_llm.apply_edits(src, [{"old": "b\n\nc = 1", "new": "b\n\nc = 2"}], modes) == "a\nb\n\nc = 2\nd\nc = 1\n"
+    assert modes == ["exact"]
     with pytest.raises(ValueError, match="edit 1: `old` occurs 2 times"):
         evolve_llm.apply_edits(src, [{"old": "c = 1", "new": "c = 2"}])
     with pytest.raises(ValueError, match="edit 2: `old` occurs 0 times"):
@@ -152,6 +162,50 @@ def test_apply_edits_replaces_an_exact_snippet_and_names_the_count_and_the_neigh
     # the 0-count message points at the first line that DOES occur, with real line numbers
     why = str(pytest.raises(ValueError, evolve_llm.apply_edits, src, [{"old": "b\nq = 9", "new": "x"}]).value)
     assert "the module around line 2 reads:" in why and "   2| b" in why
+
+
+def test_a_retyped_snippet_matches_leniently_exactly_once_and_reports_the_mode(tmp_path):
+    """4 of the last 6 live rounds died on "`old` occurs 0 times": the model retypes the
+    snippet at its own indentation. Exact first, then leading-indent / trailing-space blind --
+    still EXACTLY one hit -- and `new` shifted to the file's columns."""
+    src = "class C:\n    def f(self):\n        x = 1   \n        return x\n"
+    modes = []
+    out = evolve_llm.apply_edits(src, [{"old": "x = 1\nreturn x", "new": "x = 2\nreturn x"}], modes)
+    assert out == "class C:\n    def f(self):\n        x = 2\n        return x\n" and modes == ["lenient"]
+    modes.clear()
+    assert evolve_llm.apply_edits(src, [{"old": "        x = 1   ", "new": "        x = 3"}], modes)
+    assert modes == ["exact"]
+    # two lenient hits are still ambiguous: the count comes back, not a guess
+    two = "def f():\n    x = 1\n\ndef g():\n        x = 1\n"
+    why = str(pytest.raises(ValueError, evolve_llm.apply_edits, two, [{"old": "x = 1", "new": "x = 2"}]).value)
+    assert "occurs 2 times" in why and "not even ignoring indentation" in why
+    # a miss hands back the WHOLE enclosing function, not a +/-6 window
+    why = str(pytest.raises(ValueError, evolve_llm.apply_edits, src, [{"old": "  x = 9", "new": "  x = 8"}]).value)
+    assert "occurs 0 times" in why and 'functions["<module>:<Class>.<method>"]' in why
+    why = str(pytest.raises(ValueError, evolve_llm.apply_edits, src, [{"old": "return x\nq = 9", "new": "z"}]).value)
+    assert "line 4 is in function f, which reads (copy `old` out of THIS text):" in why
+    assert "   2|     def f(self):\n   3|         x = 1   \n   4|         return x" in why
+    # copied out of `functions` but sent against the wrong module (live round 102): the
+    # refusal names the module the snippet is actually in, and the ids default
+    pay = {"module": "scripts.evolve", "edits": [{"old": "SCORE_DEF = (", "new": "SCORE_DEF  = ("}]}
+    why = evolve_llm.write_patch(pay, {"modules": ["scripts.evolve", "scripts.evolve_llm"]}, 7,
+                                 root=tmp_path)
+    assert "occurs 0 times" in why and "occurs EXACTLY ONCE in scripts.evolve_llm" in why
+    assert pay["name"] == pay["to"] == "patch_r7"
+
+
+def test_an_already_accepted_edit_is_refused_because_it_is_this_rounds_baseline(tmp_path):
+    """An accepted change IS the baseline the round starts from: re-proposing it changes
+    nothing. The refusal names the round that accepted it."""
+    from test_evolve_llm_e2e import _repeat_proj
+
+    proj, _ = _repeat_proj([])
+    # scripts/evolve.py keeps the edits under `detail`; a flat row works too
+    proj["accepted_stack"] = {"changes": [{"round": 3, "kind": "card",
+                                           "detail": {"module": MODULE, "edits": GOOD}}]}
+    same = {"name": "again", "module": MODULE, "to": "patched", "edits": [dict(GOOD[0])]}
+    assert evolve_llm._accepted_repeat(proj, same).startswith("this edit is ALREADY ACCEPTED (round 3)")
+    assert evolve_llm._accepted_repeat(proj, {**same, "edits": TWICE}) is None
 
 
 def test_a_unified_diff_is_still_accepted_where_edits_would_go(tmp_path):

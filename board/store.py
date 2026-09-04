@@ -1373,7 +1373,8 @@ def rsi_run(session_dir: str | Path, task: str) -> dict | None:
     """One evolve campaign's state: the campaign.json fields (task, session,
     seeds, arm, best, cursor, status, rounds -- each round carrying ``per_seed``
     and ``needs``) plus ``latest`` (the newest round row, or None before the
-    first lands), ``live`` (scripts/evolve.py's in-flight block: phase, round,
+    first lands; ``accepted_stack`` / ``last_outcome`` ride the doc through),
+    ``live`` (scripts/evolve.py's in-flight block: phase, round,
     seed/seed_index/seeds_total, node, nodes (the seed's node trail), seed_started_at,
     per_seed_partial, tried, message, messages (last 20), timings --
     live state, never sealed; null when the file predates it) and ``open_brief``
@@ -1411,6 +1412,7 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     ``{task, status (``stopped`` when campaign.json still says running but no evolve
     brief is left to drive it), cursor, rounds (count), best, seeds, arm, node_rate_best (the
     series' running-max node pass rate | null), published_rounds: [round numbers],
+    accepted_rounds: [round numbers whose change joined the campaign's accepted state],
     usage: {llm_tokens: {prompt, completion} | null, sim_s} (summed over rounds), updated
     (campaign.json mtime), live: {phase, message, nodes_done "k/n" | null} | null, open_brief}``,
     running first, then newest ``updated`` first."""
@@ -1429,6 +1431,9 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
             "cursor": doc.get("cursor"), "rounds": len(rounds),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
             "published_rounds": [r["round"] for r in rounds if r.get("published")],
+            # the accepted state's stack: rounds whose change became the next baseline
+            # (a partial win accepts without publishing whole-task evidence)
+            "accepted_rounds": [r["round"] for r in rounds if r.get("accepted")],
             "usage": {"llm_tokens": {"prompt": sum(t.get("prompt") or 0 for t in tok),
                                      "completion": sum(t.get("completion") or 0 for t in tok)} if tok else None,
                       "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in rounds), 3)},
