@@ -139,12 +139,13 @@ def _run(tmp_path, monkeypatch, canned, rounds=1) -> tuple[Path, dict]:
 # ── the score tuple, in the small ─────────────────────────────────────────────────
 
 def _suite(rows: dict) -> dict:
-    """A run_suite-shaped result from ``{seed: [(node, ok), ...]}``."""
-    done = lambda ns: all(ok for _, ok in ns)
+    """A run_suite-shaped result from ``{seed: [(node, ok) | (node, ok, kind), ...]}``."""
+    done = lambda ns: all(n[1] for n in ns)
     return {"count": sum(done(ns) for ns in rows.values()), "sha": "-",
             "seeds": {str(s): {"success": done(ns), "nodes": {},
-                               "first_death": next((n for n, ok in ns if not ok), None),
-                               "trail": [{"id": n, "ok": ok} for n, ok in ns]}
+                               "first_death": next((n[0] for n in ns if not n[1]), None),
+                               "trail": [{"id": n[0], "ok": n[1],
+                                          **({"kind": n[2]} if len(n) > 2 else {})} for n in ns]}
                       for s, ns in rows.items()}}
 
 
@@ -212,3 +213,112 @@ def test_a_focused_trial_that_moves_a_death_earlier_is_worse_and_spends_no_full_
                                                    "was_ok_now_not": True}]
     assert doc["last_outcome"]["summary"] == "调闸" and doc["last_outcome"]["outcome"] == "worse"
     assert bs.rsi_campaigns(session)[0]["accepted_rounds"] == []
+
+
+# ── repairs: the node the planner inserts only after a failure ───────────────────
+# A ``recover-<node>`` exists BECAUSE ``<node>`` failed, so a patch that fixes the node
+# makes its repair vanish. Reading that as a lost node refused every measurable win of
+# the recycle_cans campaign (8 rounds, 131..389); counting it as a milestone scored the
+# run that NEEDED a recovery above the run that no longer does.
+
+def test_a_repair_that_vanished_because_its_target_passes_is_not_a_regression():
+    before = _suite({1: [("carry", True), ("recover-drop", True, "recovery"), ("drop", False)]})
+    after = _suite({1: [("carry", True), ("drop", True)]})
+    assert evolve.regressions(before, after) == []
+    # ...and the repair never counted as a milestone, so the win reads as a win
+    assert evolve.score(before, "drop") == (0, 1, 0)
+    assert evolve.score(after, "drop") == (1, 2, 1) > evolve.score(before, "drop")
+
+
+def test_a_repair_that_ran_again_and_failed_is_still_a_regression():
+    before = _suite({1: [("recover-drop", True, "recovery"), ("drop", False)]})
+    after = _suite({1: [("recover-drop", False, "recovery"), ("drop", False)]})
+    assert evolve.regressions(before, after) == [{"seed": 1, "node": "recover-drop",
+                                                  "was_ok_now_not": True}]
+
+
+def test_a_repair_gone_while_its_target_still_fails_is_still_a_regression():
+    """The retry was dropped and the node it retried did not start passing: work lost."""
+    before = _suite({1: [("recover-drop", True, "recovery"), ("drop", False)]})
+    after = _suite({1: [("drop", False)]})
+    assert evolve.regressions(before, after) == [{"seed": 1, "node": "recover-drop",
+                                                  "was_ok_now_not": True}]
+
+
+def test_an_ordinary_node_the_trial_dropped_is_still_a_regression():
+    """Only repairs get the exemption -- a plan that silently drops work is not a win."""
+    before = _suite({1: [("nav", True), ("carry", True), ("drop", False)]})
+    after = _suite({1: [("nav", True), ("drop", False)]})
+    assert evolve.regressions(before, after) == [{"seed": 1, "node": "carry",
+                                                  "was_ok_now_not": True}]
+
+
+def test_a_recovery_kind_known_on_one_side_only_is_still_a_repair():
+    """The kind is read from BOTH suites: the trial replanned and only its trail carries
+    the row (another seed still needs the repair), or only the baseline does. Merging the
+    two trails with either side winning loses the kind and the repair reads as a loss."""
+    # kind known from ``before`` only -- seed 1's repair is gone from the trial
+    before = _suite({1: [("fix-drop", True, "recovery"), ("drop", False)]})
+    after = _suite({1: [("drop", True)]})
+    assert evolve.regressions(before, after) == []
+    # kind known from ``after`` only -- seed 2 still needs the repair, seed 1 no longer does
+    before = _suite({1: [("fix-drop", True), ("drop", False)],
+                     2: [("fix-drop", True), ("drop", False)]})
+    after = _suite({1: [("drop", True)],
+                    2: [("fix-drop", True, "recovery"), ("drop", False)]})
+    assert evolve._recoveries(before, after) == {"fix-drop"}
+    assert evolve.regressions(before, after) == []
+    # neither side kinds it and it is not named ``recover-*``: it is an ordinary node
+    plain = _suite({1: [("fix-drop", True), ("drop", False)]})
+    assert evolve.regressions(plain, _suite({1: [("drop", True)]})) == [
+        {"seed": 1, "node": "fix-drop", "was_ok_now_not": True}]
+
+
+def test_a_seed_the_trial_never_ran_is_not_a_regression():
+    """A focused trial folds the unrun seeds back in from the baseline (``_merge``), but
+    a suite that simply lacks the seed must not read every node it had as lost."""
+    before = _suite({1: [("nav", True), ("drop", False)], 2: [("nav", True), ("drop", False)]})
+    after = _suite({1: [("nav", True), ("drop", True)]})
+    assert evolve.regressions(before, after) == []
+    # a seed that DID run and lost the node is still caught
+    lost = _suite({1: [("nav", False), ("drop", False)], 2: [("nav", True), ("drop", False)]})
+    assert evolve.regressions(before, lost) == [{"seed": 1, "node": "nav",
+                                                 "was_ok_now_not": True}]
+
+
+def test_milestones_do_not_count_repairs_so_needing_a_recovery_never_scores_higher():
+    needed = _suite({1: [("carry", True), ("recover-drop", True, "recovery"), ("drop", False)]})
+    clean = _suite({1: [("carry", True), ("drop", False)]})
+    assert evolve.score(needed) == evolve.score(clean) == (0, 1, 0)
+
+
+# ── the real campaign: the eight rounds that measurably improved and were refused ──
+
+def _rounds() -> dict:
+    return json.loads((Path(__file__).parent / "fixtures"
+                       / "evolve_recycle_rounds.json").read_text())
+
+
+def _real(rows: list) -> dict:
+    """A run_suite-shaped result from a round's trimmed ``per_seed`` / ``after_seeds``."""
+    return {"count": sum(r["success"] for r in rows), "sha": "-",
+            "seeds": {str(r["seed"]): {"success": r["success"], "nodes": {},
+                                       "first_death": r["first_death"], "trail": r["nodes"]}
+                      for r in rows}}
+
+
+def test_the_refused_recycle_cans_rounds_are_accepted_now():
+    """Rounds 131 and 389 of runs/session-robocasa-rsi (recycle_cans, 490 rounds, best 0,
+    accepted_stack empty): both moved seed 4243 from drop-can1 to a later death and made
+    the round's target node pass, and both were refused as
+    ``regressed: 4243/recover-drop-can1`` -- the repair that vanished because drop-can1
+    started passing. Nothing else about them may change silently."""
+    for rnd, want in (("131", [0, 13, 1]), ("389", [0, 16, 1])):
+        row = _rounds()[rnd]
+        before, after = _real(row["per_seed"]), _real(row["after_seeds"])
+        assert row["was"] == {"accepted": False,
+                              "reason": "regressed: 4243/recover-drop-can1"}
+        assert evolve.regressions(before, after) == []
+        bs = evolve.score(before, row["tried_node"])
+        assert list(bs) == [0, 9, 0] and list(evolve.score(after, row["tried_node"])) == want
+        assert evolve.score(after, row["tried_node"]) > bs   # accepted: score up, no regression

@@ -398,6 +398,7 @@ def test_storecli_serve_loop(tmp_path):
         json.dumps({"fn": "nope"}),
         json.dumps({"fn": "runtime_frame", "name": "../session-main"}),
         "not json",
+        "[1, 2]",            # valid JSON, wrong shape -- killed the loop on req.get
         json.dumps({"fn": "runtime_frame", "name": "session-main"}),
     ])
     out = io.StringIO()
@@ -405,10 +406,11 @@ def test_storecli_serve_loop(tmp_path):
                         runs, tmp_path / "S.md", tmp_path / "p.md")
     assert rc == 0
     lines = [json.loads(l) for l in out.getvalue().splitlines()]
-    assert len(lines) == 6, "every request gets exactly one reply line"
+    assert len(lines) == 7, "every request gets exactly one reply line"
     assert lines[0]["ts"] == ts and "jpeg_b64" in lines[0]
     assert lines[1] == {"unchanged": True, "ts": ts, "age_s": lines[1]["age_s"]}
     assert lines[2] == {"error": "unknown fn: nope"}
     assert lines[3] == {"error": "unknown session"}, "safe_child still guards"
     assert "error" in lines[4], "bad JSON replies, never kills the loop"
-    assert "jpeg_b64" in lines[5], "the loop still serves after errors"
+    assert lines[5] == {"error": "request must be a JSON object"}
+    assert "jpeg_b64" in lines[6], "the loop still serves after errors"

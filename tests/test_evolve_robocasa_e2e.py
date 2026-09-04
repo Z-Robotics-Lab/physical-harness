@@ -69,7 +69,8 @@ def test_one_evolve_round_on_the_real_kitchen(tmp_path):
     assert run["latest"]["tried"]["kind"] in ("executor", "tunables", "none")
     # media: every kept clip is a verified segment, under 1 MB, listed by rsi_frames
     frames = bs.rsi_frames(session, TASK, 1)["media"]
-    assert frames == run["latest"]["media"]
+    # `latest` is a COMPACT row now: the media list rides the round in full
+    assert frames == bs.rsi_run(session, TASK, 1)["rounds"][0]["media"]
     for rel in frames:
         f = session / rel
         assert f.is_file() and 0 < f.stat().st_size <= media.MAX_BYTES, rel

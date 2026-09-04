@@ -157,6 +157,10 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     cases = [
         (["rsi_run", "kitchen_thaw"], bs.rsi_run(sd, "kitchen_thaw"),
          ms.rsi_run("kitchen_thaw")),
+        (["rsi_run", "kitchen_thaw", "--round", "1"], bs.rsi_run(sd, "kitchen_thaw", 1),
+         ms.rsi_run("kitchen_thaw", round=1)),
+        (["rsi_run", "kitchen_thaw", "--round", "9"], bs.rsi_run(sd, "kitchen_thaw", 9),
+         ms.rsi_run("kitchen_thaw", round=9)),
         (["rsi_series", "kitchen_thaw"], bs.rsi_series(sd, "kitchen_thaw"),
          ms.rsi_series("kitchen_thaw")),
         (["rsi_frames", "kitchen_thaw", "--round", "1"], bs.rsi_frames(sd, "kitchen_thaw", 1),
@@ -175,23 +179,31 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     # campaign.json says running, but no evolve brief is left to drive it: the READ
     # says stopped (a killed loop must not look alive on the page forever).
     assert run["status"] == "stopped" and run["cursor"] == 2 and run["latest"]["round"] == 2
+    # bounded: compact rows only, and --round serves the ONE round in full
+    assert [r["round"] for r in run["rounds"]] == [1, 2]
+    assert all("per_seed" not in r for r in run["rounds"])
+    assert bs.rsi_run(sd, "kitchen_thaw", 1)["rounds"] == [_CAMPAIGN["rounds"][0]]
+    assert bs.rsi_run(sd, "kitchen_thaw", 9)["rounds"] == []
     assert run["live"] == _CAMPAIGN["live"] and run["live"]["message"]
     assert run["open_brief"] is None
     (camp / "campaign.json").write_text(json.dumps({k: v for k, v in _CAMPAIGN.items() if k != "live"}))
     assert bs.rsi_run(sd, "kitchen_thaw")["live"] is None   # pre-live campaign reads as null
     (camp / "campaign.json").write_text(json.dumps(_CAMPAIGN))
-    r1 = _CAMPAIGN["rounds"][0]
     # node_rate: seed 1 2/2, seed 2 1/2 -> 0.75 (per_seed = before; no after_seeds -> null);
     # by_task: reach passes both seeds, grasp only seed 1; round 2 carries no trail -> nulls,
     # best carries the running max
     assert bs.rsi_series(sd, "kitchen_thaw") == [   # pre-per_seed rounds read as null
-        {"round": 1, "before": 0, "after": 1, "best": 1, "per_seed": r1["per_seed"], "needs": [],
-         "proposer": None, "llm": None,   # pre-LLM / pre-tree rounds read as null
-         "parent": None, "outcome": None, "confirm": None, "usage": None,
+        {"round": 1, "before": 0, "after": 1, "best": 1,
+         "proposer": None,   # pre-LLM / pre-tree rounds read as null
+         "parent": None, "outcome": None, "accepted": None, "published": True, "usage": None,
+         # a pre-dict detail rides through; a dict one keeps only its scalars
+         "tried": {"kind": "executor", "node": "grasp", "detail": "scripted->geometric"},
          "node_rate": {"before": 0.75, "after": None, "best": 0.75},
          "by_task": {"grasp": {"before": 0.5, "after": None}, "reach": {"before": 1.0, "after": None}}},
-        {"round": 2, "before": 1, "after": 1, "best": 1, "per_seed": None, "needs": None,
-         "proposer": None, "llm": None, "parent": None, "outcome": None, "confirm": None, "usage": None, "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
+        {"round": 2, "before": 1, "after": 1, "best": 1,
+         "proposer": None, "parent": None, "outcome": None, "accepted": None, "published": False,
+         "usage": None, "tried": {"kind": "tunables", "node": "grasp", "detail": "hover_z*1.2"},
+         "node_rate": {"before": None, "after": None, "best": 0.75}, "by_task": {}}]
     assert bs.rsi_series(sd, "kitchen_thaw") == ms.rsi_series("kitchen_thaw")
     assert bs.rsi_frames(sd, "kitchen_thaw", 1) == {"media": ["media/kitchen_thaw/1/grasp.gif"], "dropped": {}}
     assert bs.rsi_frames(sd, "kitchen_thaw", 9) == {"media": [], "dropped": {}} and bs.rsi_run(sd, "nope") is None
@@ -202,6 +214,30 @@ def test_rsi_faces_are_byte_identical(tmp_path, capsys):
     assert code == 3 and json.loads(out) == {"error": "unknown session"}
     code, out = _run(capsys, "rsi_run", "--runs", str(runs))
     assert code == 3 and "task" in json.loads(out)["error"]
+
+
+def test_an_oversized_face_is_refused_not_emitted(tmp_path, capsys):
+    """A response past MAX_RESPONSE_BYTES must fail LOUDLY with the fn, the size
+    and the narrowing argument -- never be printed for the bridge to choke on.
+    Synthesised: one campaign round fat enough to blow the limit on its own, so
+    even a bounded face (rsi_run --round, which serves the round in full) trips."""
+    runs, status, progress = _fixture(tmp_path)
+    camp = runs / "session-main" / "campaigns" / "evolve-fat"
+    camp.mkdir(parents=True)
+    fat = {**_CAMPAIGN, "task": "fat", "rounds": [
+        {**_CAMPAIGN["rounds"][0], "trace": ["x" * 1024] * 5000}]}   # ~5 MB of trail
+    (camp / "campaign.json").write_text(json.dumps(fat))
+    base = ["--runs", str(runs), "--session", "session-main"]
+    code, out = _run(capsys, "rsi_run", "fat", "--round", "1", *base)
+    assert code == 0 and json.loads(out) == {
+        "error": "response too large", "fn": "rsi_run",
+        "bytes": len(json.dumps(bs.rsi_run(runs / "session-main", "fat", 1))),
+        "limit": storecli.MAX_RESPONSE_BYTES, "narrow": "--round <n> (one round in full)"}
+    assert json.loads(out)["bytes"] > storecli.MAX_RESPONSE_BYTES
+    # the bounded faces over the SAME fat campaign stay well inside the limit
+    for fn in ("rsi_run", "rsi_series"):
+        code, out = _run(capsys, fn, "fat", *base)
+        assert code == 0 and len(out) < storecli.MAX_RESPONSE_BYTES and "too large" not in out
 
 
 def test_traversal_name_rejected_by_shared_guard(tmp_path, capsys):

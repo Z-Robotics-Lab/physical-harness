@@ -161,14 +161,18 @@ def suite_result(name: str = _DEFAULT_SESSION, sha: str | None = None) -> dict |
 
 
 @mcp.tool()
-def rsi_run(task: str, name: str = _DEFAULT_SESSION) -> dict | None:
+def rsi_run(task: str, name: str = _DEFAULT_SESSION, round: int = 0) -> dict | None:
     """One evolve campaign's state (campaigns/evolve-<task>/campaign.json: task,
-    session, seeds, arm, rounds[] each with per_seed + needs, best, cursor,
-    status) plus ``latest`` round, ``live`` and ``open_brief`` (the intake
-    evolve brief id for this task, cancel_brief-able; null when none).
-    null when the session runs no campaign for that task."""
+    session, seeds, arm, best, cursor, status) plus ``latest`` (the newest
+    compact round row), ``live`` and ``open_brief`` (the intake evolve brief id
+    for this task, cancel_brief-able; null when none). ``rounds`` is BOUNDED:
+    the last 20 rounds in rsi_series' compact shape. ``round=<n>`` swaps that
+    for the ONE named round in FULL (per_seed / after_seeds trails,
+    trial_evidence, llm, media) as a single-element list -- ask for a round by
+    number rather than pulling a whole campaign. null when the session runs no
+    campaign for that task."""
     path = bs.safe_child(_Cfg.runs, name, bs.is_session)
-    return bs.rsi_run(path, task) if path else {"error": "unknown session"}
+    return bs.rsi_run(path, task, round) if path else {"error": "unknown session"}
 
 
 @mcp.tool()
@@ -182,10 +186,11 @@ def rsi_campaigns(session: str = _DEFAULT_SESSION) -> list[dict]:
 
 @mcp.tool()
 def rsi_series(task: str, name: str = _DEFAULT_SESSION) -> list[dict]:
-    """Per-round {round, before, after, best, per_seed, needs} of one evolve
-    campaign (the line-chart feed; per_seed = [{seed, success, first_death,
-    failure_mode}], needs = what would unblock a round that tried nothing);
-    [] when none exists."""
+    """One COMPACT row per round of an evolve campaign (the line-chart feed):
+    {round, before, after, best, parent, proposer, outcome, accepted, published,
+    usage, tried, node_rate, by_task}. Bounded by construction -- per-seed
+    trails, traces and evidence NEVER ride this face; ``rsi_run(task,
+    round=<n>)`` serves them for one round. [] when none exists."""
     path = bs.safe_child(_Cfg.runs, name, bs.is_session)
     return bs.rsi_series(path, task) if path else {"error": "unknown session"}
 

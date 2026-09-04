@@ -1346,11 +1346,16 @@ def suite_result(session_dir: str | Path, sha: str | None = None) -> dict | None
         return None
 
 
+def _campaign_dir(session_dir: str | Path, task: str) -> Path | None:
+    """``<session>/campaigns/evolve-<task>/``, or None. ``task`` rides the shared
+    safe_child guard so a ``../`` task can never read outside the session."""
+    return safe_child(Path(session_dir) / "campaigns", f"evolve-{task}", Path.is_dir)
+
+
 def _campaign(session_dir: str | Path, task: str) -> dict | None:
     """``<session>/campaigns/evolve-<task>/campaign.json`` (scripts/evolve.py's
-    atomic snapshot), or None when absent/unreadable. ``task`` rides the shared
-    safe_child guard so a ``../`` task can never read outside the session."""
-    path = safe_child(Path(session_dir) / "campaigns", f"evolve-{task}", Path.is_dir)
+    atomic snapshot), or None when absent/unreadable."""
+    path = _campaign_dir(session_dir, task)
     if path is None:
         return None
     try:
@@ -1358,6 +1363,27 @@ def _campaign(session_dir: str | Path, task: str) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     return doc if isinstance(doc, dict) else None
+
+
+def _round(session_dir: str | Path, task: str, doc: dict, n: int) -> dict | None:
+    """One round's FULL row, or None when there is no such round.
+
+    scripts/evolve.py keeps only the last rounds whole in campaign.json; an older
+    round stands there as a compact index row (``sharded``) and its bulk -- the
+    per-seed node trails, media, trial_evidence, the model's rationale, the card
+    source -- lives in ``rounds/<n>.json`` beside it. Without this read every
+    round past the window would serve the operator an empty round card and empty
+    keyframes, which is the silent-empty-state failure the bounded faces exist to
+    end. An unreadable shard falls back to the index row: partial beats blank."""
+    row = next((r for r in doc.get("rounds") or [] if r.get("round") == n), None)
+    if row is None or not row.get("sharded"):
+        return row
+    d = _campaign_dir(session_dir, task)
+    try:
+        full = json.loads((d / "rounds" / f"{int(n)}.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return row
+    return full if isinstance(full, dict) else row
 
 
 def _live_status(doc: dict, open_brief: str | None) -> str | None:
@@ -1369,24 +1395,45 @@ def _live_status(doc: dict, open_brief: str | None) -> str | None:
     return "stopped" if st == "running" and open_brief is None else st
 
 
-def rsi_run(session_dir: str | Path, task: str) -> dict | None:
-    """One evolve campaign's state: the campaign.json fields (task, session,
-    seeds, arm, best, cursor, status, rounds -- each round carrying ``per_seed``
-    and ``needs``) plus ``latest`` (the newest round row, or None before the
-    first lands; ``accepted_stack`` / ``last_outcome`` ride the doc through),
-    ``live`` (scripts/evolve.py's in-flight block: phase, round,
-    seed/seed_index/seeds_total, node, nodes (the seed's node trail), seed_started_at,
-    per_seed_partial, tried, message, messages (last 20), timings --
-    live state, never sealed; null when the file predates it) and ``open_brief``
-    (the inbox/processing evolve brief id for this task, so the page can stop it
-    after a restart; null when none). None when no campaign exists."""
+#: How many trailing compact rows rsi_run carries -- enough context beside the
+#: header for a caller that only wants "what just happened". The page's tree and
+#: chart ride rsi_series (every round, still compact); its round card asks
+#: rsi_run(round=<n>) for the one round it is showing.
+RUN_TAIL = 20
+
+
+def rsi_run(session_dir: str | Path, task: str, round: int = 0) -> dict | None:
+    """One evolve campaign's state: the campaign.json header (task, session,
+    seeds, arm, best, cursor, status; ``accepted_stack`` / ``last_outcome`` ride
+    the doc through) plus ``latest`` (the newest COMPACT round row, or None
+    before the first lands), ``live`` (scripts/evolve.py's in-flight block:
+    phase, round, seed/seed_index/seeds_total, node, nodes (the seed's node
+    trail), seed_started_at, per_seed_partial, tried, message, messages (last
+    20), timings -- live state, never sealed; null when the file predates it)
+    and ``open_brief`` (the inbox/processing evolve brief id for this task, so
+    the page can stop it after a restart; null when none).
+
+    ``rounds`` is BOUNDED: the last RUN_TAIL (20) rounds in rsi_series' compact
+    shape, never the whole history and never a per-seed trail -- a 490-round
+    campaign made this face 22 MB, past the console bridge's buffer, and the
+    page silently showed its empty state. ``round=<n>`` swaps that for the ONE
+    named round in FULL (per_seed / after_seeds trails, trial_evidence, llm,
+    media, needs, confirm) as a single-element ``rounds`` list -- what the round
+    card asks for when the operator selects a round -- read out of
+    ``rounds/<n>.json`` when scripts/evolve.py has already sharded that round;
+    [] when there is no such round. None when no campaign exists."""
     doc = _campaign(session_dir, task)
     if doc is None:
         return None
-    rounds = doc.get("rounds") or []
+    series = _series(doc)
+    if round:
+        one = _round(session_dir, task, doc, round)
+        rows = [one] if one else []
+    else:
+        rows = series[-RUN_TAIL:]
     open_brief = _open_brief(Path(session_dir), task)
-    return {**doc, "status": _live_status(doc, open_brief),
-            "latest": rounds[-1] if rounds else None, "live": doc.get("live"),
+    return {**doc, "rounds": rows, "status": _live_status(doc, open_brief),
+            "latest": series[-1] if series else None, "live": doc.get("live"),
             "open_brief": open_brief}
 
 
@@ -1448,65 +1495,108 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
     return out
 
 
+def _repair_node(n) -> bool:
+    """A REPAIR row: the planner inserts ``recover-<node>`` only AFTER ``<node>``
+    failed. Counting one is the same dishonesty scripts/evolve.py's ``score`` had
+    -- a run that NEEDED a recovery scored above the same run that no longer does,
+    so on the two rounds the robot got measurably further the chart painted
+    ``recover`` falling 1.0 -> 0.5 and the fix read as a regression."""
+    return n.get("kind") == "recovery" or str(n.get("id", "")).startswith("recover-")
+
+
 def _rates(rows) -> tuple[float | None, dict]:
     """(mean node pass rate, {task: pass fraction}) over one per_seed list; a task
-    passes for a seed when every node carrying that ``task`` is ok=true. (None, {})
-    when no row carries nodes (rounds older than the trail)."""
-    rows = [r for r in rows or () if r.get("nodes")]
-    if not rows:
+    passes for a seed when every node carrying that ``task`` is ok=true. Repair
+    nodes are excluded from both (``_repair_node``). (None, {}) when no row carries
+    nodes (rounds older than the trail)."""
+    trails = [[n for n in r["nodes"] if not _repair_node(n)] for r in rows or () if r.get("nodes")]
+    trails = [t for t in trails if t]
+    if not trails:
         return None, {}
-    rate = sum(sum(n.get("ok") is True for n in r["nodes"]) / len(r["nodes"]) for r in rows) / len(rows)
+    rate = sum(sum(n.get("ok") is True for n in t) / len(t) for t in trails) / len(trails)
     passes: dict[str, int] = {}
-    for r in rows:
+    for t_ in trails:
         per = {}
-        for n in r["nodes"]:
+        for n in t_:
             if n.get("task"):
                 per[n["task"]] = per.get(n["task"], True) and n.get("ok") is True
         for t, ok in per.items():
             passes[t] = passes.get(t, 0) + ok
-    return round(rate, 4), {t: round(k / len(rows), 4) for t, k in passes.items()}
+    return round(rate, 4), {t: round(k / len(trails), 4) for t, k in passes.items()}
+
+
+# The scalar keys of ``tried.detail`` the page turns into a sentence. Everything
+# else a proposal carries (``edits`` -- whole code patches --, ``note``/``notes``,
+# the module/skill/ref pointers) is bulk that rides the FULL round only.
+_TRIED_DETAIL = ("path", "from", "to", "reason", "error")
+
+
+def _tried(t):
+    """One round's ``tried`` without its bulk: {kind, node, detail: the
+    _TRIED_DETAIL scalars}. A detail that is not a dict (older rounds wrote a
+    bare string) rides through unchanged."""
+    if not isinstance(t, dict):
+        return t
+    d = t.get("detail")
+    return {"kind": t.get("kind"), "node": t.get("node"),
+            "detail": {k: d[k] for k in _TRIED_DETAIL if k in d} if isinstance(d, dict) else d}
 
 
 def _series(doc: dict) -> list[dict]:
+    """The compact round rows -- SCALARS ONLY, by construction. No per-seed
+    trail, no trace, no evidence, no media list ever rides this shape: on a
+    490-round campaign the trails alone were 11 MB, past the console bridge's
+    buffer, and the page silently showed its empty state. Whoever wants a
+    round's trails asks rsi_run(round=<n>) for that ONE round."""
     out, best = [], None
     for r in doc.get("rounds") or []:
-        nb, tb = _rates(r.get("per_seed"))
-        na, ta = _rates(r.get("after_seeds"))
+        if r.get("sharded"):
+            # the trails live in rounds/<n>.json; scripts/evolve.py precomputed these
+            # off them through THIS function, so the numbers are the same reading.
+            pre, per_task = r.get("node_rate") or {}, r.get("by_task") or {}
+            nb, na = pre.get("before"), pre.get("after")
+            tb = {t: v["before"] for t, v in per_task.items() if v.get("before") is not None}
+            ta = {t: v["after"] for t, v in per_task.items() if v.get("after") is not None}
+        else:
+            nb, tb = _rates(r.get("per_seed"))
+            na, ta = _rates(r.get("after_seeds"))
         cur = na if na is not None else nb
         best = cur if best is None or (cur is not None and cur > best) else best
-        out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "per_seed", "needs",
-                                             "proposer", "llm", "parent", "outcome", "confirm", "usage")},
+        out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "parent",
+                                             "proposer", "outcome", "accepted", "published", "usage")},
+                    "tried": _tried(r.get("tried")),
                     "node_rate": {"before": nb, "after": na, "best": best},
                     "by_task": {t: {"before": tb.get(t), "after": ta.get(t)} for t in sorted(set(tb) | set(ta))}})
     return out
 
 
 def rsi_series(session_dir: str | Path, task: str) -> list[dict]:
-    """Per-round {round, before, after, best, per_seed, needs, proposer, llm, parent, outcome,
-    confirm, usage, node_rate, by_task} of one evolve campaign, in order (the line-chart feed;
-    ``parent`` = the last published round this try grew from (0 = baseline), ``outcome`` =
-    improved|same|worse|none on the debug seeds, ``confirm`` = {seeds, before, after} of the
-    scratch-seed check | null, ``usage`` = {llm_tokens, sim_s}; ``per_seed`` = the kept suite's
-    [{seed, success, first_death, failure_mode, nodes}], ``needs`` = what would unblock a
-    round that tried nothing; ``node_rate`` = {before, after, best}: mean over seeds of
-    ok-nodes/nodes (before from per_seed, after from after_seeds, best = running max of
-    after-or-before); ``by_task`` = {task: {before, after}} pass fraction of each sub-task
-    (every node of that task ok). Rounds without nodes read as null / {}). [] when no
-    campaign exists."""
+    """One COMPACT row per round of an evolve campaign, in order (the line-chart
+    feed): {round, before, after, best, parent, proposer, outcome, accepted,
+    published, usage, tried, node_rate, by_task}. ``parent`` = the last accepted
+    round this try grew from (0 = baseline), ``outcome`` = improved|same|worse|none
+    on the debug seeds, ``usage`` = {llm_tokens, sim_s}, ``tried`` = {kind, node,
+    detail} with only the _TRIED_DETAIL scalars kept; ``node_rate`` = {before,
+    after, best}: mean over seeds of ok-nodes/nodes (before from per_seed, after
+    from after_seeds, best = running max of after-or-before); ``by_task`` =
+    {task: {before, after}} pass fraction of each sub-task (every node of that
+    task ok). Rounds without nodes read as null / {}.
+
+    Bounded by construction: per-seed trails, traces, evidence and media never
+    ride this face at any campaign length -- ``rsi_run(task, round=<n>)`` serves
+    them for the ONE round the operator selected. [] when no campaign exists."""
     return _series(_campaign(session_dir, task) or {})
 
 
 def rsi_frames(session_dir: str | Path, task: str, round: int) -> dict:
     """``{media: [kept clip paths], dropped: {"<seed>/<node>": {reason, keyframes: [paths]}}}``
     of one evolve round (session-relative; ``keyframes`` = the dropped segment's failure
-    keyframes). Empty media / dropped when the campaign or round is absent."""
-    doc = _campaign(session_dir, task) or {}
-    for r in doc.get("rounds") or []:
-        if r.get("round") == round:
-            dropped = {k: v if isinstance(v, dict) else {"reason": v, "keyframes": []}
-                       for k, v in (r.get("media_dropped") or {}).items()}
-            return {"media": [m for m in r.get("media") or [] if isinstance(m, str)], "dropped": dropped}
-    return {"media": [], "dropped": {}}
+    keyframes), read out of ``rounds/<n>.json`` once the round is sharded. Empty media /
+    dropped when the campaign or round is absent."""
+    r = _round(session_dir, task, _campaign(session_dir, task) or {}, round) or {}
+    dropped = {k: v if isinstance(v, dict) else {"reason": v, "keyframes": []}
+               for k, v in (r.get("media_dropped") or {}).items()}
+    return {"media": [m for m in r.get("media") or [] if isinstance(m, str)], "dropped": dropped}
 
 
 # --- proposals inbox --------------------------------------------------------

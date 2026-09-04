@@ -22,7 +22,13 @@ the measured ``by_executor`` row folded in goes through the evolution-only skill
 root door (``InMemorySkillGraph.publish``, the same one scripts/publish_plans.py
 uses). Every round lands atomically in ``campaigns/evolve-<task>/campaign.json``
 (rounds[], best, cursor, status, ``reference`` = the last successful pass of every
-plan segment) with the kept suite's per-seed summary
+plan segment) -- BOUNDED: the header plus the last ``ROUNDS_KEPT`` rounds in full,
+every older round written once to ``rounds/<round>.json`` and left in the file as a
+compact ``index_row`` (see ``EvolveStore``). The same bound is kept on the two other
+things that grew without one -- the llm audits (``prune_audits``) and the candidate
+cards (``gc_candidates``, also ``--gc``) -- and a round does not start at all when
+``disk_guard`` says the disk or the campaign dir is over the line (``paused_disk``).
+The round row carries the kept suite's per-seed summary
 (``per_seed``) and, when nothing was tried, ``needs`` -- what would unblock the
 proposer, plus ``stuck`` when the round's node has taken ``STUCK_ROUNDS`` rounds
 without improving (the brief then widens what may be patched there). A trial that
@@ -46,6 +52,7 @@ from ``media/<task>/<seed>/index.json``.
 
     scripts/evolve.py --mode evolution --task kitchen_thaw --session runs/session-x \\
         --skills-root runs/session-x/skills --seeds 1 2 --rounds 3 --arm auto
+    scripts/evolve.py --gc [--dry-run]        # the maintenance pass alone, for the operator
 """
 
 from __future__ import annotations
@@ -59,6 +66,9 @@ import inspect
 import json
 import math
 import os
+import re
+import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -66,7 +76,8 @@ import traceback
 from collections import Counter
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 from harness.config import Mount, Patch, Profile, resolve_plan, sha_json
 from harness.definitions import CAPABILITIES
@@ -108,20 +119,277 @@ NONE_BACKOFF_S = (float(os.environ.get("PH_NONE_BACKOFF_S", "60")), 600.0)
 STUCK_ROUNDS = 6
 
 
+#: Full round rows kept in campaign.json; older rounds live in ``rounds/<round>.json``
+#: and stand in the file as an index row. The live recycle_cans campaign reached 42 MB
+#: over 490 rounds -- 19 MB of it per-seed node trails nothing reads twice.
+ROUNDS_KEPT = 20
+#: ``llm/round-*.json`` kept whole; older audits are rewritten to their summary (never
+#: deleted). 482 files x ~285 KB = 145 MB on the live box.
+AUDITS_KEPT = 50
+#: Model-written candidate cards kept beyond the referenced ones (``gc_candidates``).
+CANDIDATES_KEPT = 20
+#: The loud stop (``disk_guard``): free space on the filesystem holding ``runs/``, and
+#: the size of one campaign directory. Better a named pause than a full disk mid-write.
+MIN_FREE_BYTES = 5 * 1024 ** 3
+MAX_CAMPAIGN_BYTES = 2 * 1024 ** 3
+
+#: What an INDEX row keeps verbatim off a round: everything the round loop, the proposer
+#: and the RSI page read. Dropped: ``per_seed``/``after_seeds`` node trails (the bulk),
+#: ``media``/``media_dropped`` (rsi_frames reads the shard), ``trial_evidence`` (only the
+#: LAST round's is ever read), the card source in ``tried.detail.edits`` and the model's
+#: raw ``rationale`` / prompt shas -- all still in the shard, and in the llm audit.
+_INDEX_KEYS = ("round", "before", "after", "best", "parent", "layer", "notes", "outcome",
+               "accepted", "accepted_reason", "published", "before_score", "after_score",
+               "usage", "proposer", "needs", "confirm", "trial", "stuck", "regression",
+               "burned", "suite_sha", "proposal", "ts")
+_TRIED_KEYS = ("skill", "ref", "path", "from", "to", "module", "executor", "reason",
+               "hint", "error", "layer", "needs", "match", "name")
+_SEED_KEYS = ("seed", "success", "first_death", "failure_mode")
+
+
+#: Free text an index row keeps only a head of (the whole thing stays in the shard and,
+#: for the model's own words, in the llm audit): 500 rounds x a 1500-char refusal reason
+#: is a third of the file on its own.
+_CLIP = 300
+
+
+def _clip(d: dict, *keys) -> dict:
+    return {k: (v[:_CLIP] if k in keys and isinstance(v, str) else v) for k, v in d.items()}
+
+
+def _seeds_index(rows) -> list[dict]:
+    """One round's per-seed summary WITHOUT the node trail: what the proposer's history
+    and the failure clusters read (the trail itself is 19 MB of the live campaign)."""
+    return [{k: s.get(k) for k in _SEED_KEYS} for s in rows or ()]
+
+
+def index_row(r: dict, baseline: bool = False) -> dict:
+    """The compact stand-in for an archived round. Carries the chart's numbers already
+    computed off the trails it drops (``node_rate`` / ``by_task``: board.store._rates,
+    the same reading the RSI page's line and heat strip make), so the page can show 500
+    rounds without ever opening a shard. ``baseline`` keeps round 1's trails: EVERY round
+    re-reads them (``cluster_seeds`` scores the origin cluster off ``rounds[0]``), and a
+    shard read that silently failed would read as "no cluster" -- 21 KB against that."""
+    t = r.get("tried") or {}
+    out = _clip({k: r[k] for k in _INDEX_KEYS if k in r}, "notes", "accepted_reason")
+    nb, tb = bs._rates(r.get("per_seed"))
+    na, ta = bs._rates(r.get("after_seeds"))
+    return {**out, "sharded": True, "tried_kind": t.get("kind"), "node": t.get("node"),
+            "tried": {"kind": t.get("kind"), "node": t.get("node"),
+                      "detail": _clip({k: v for k, v in (t.get("detail") or {}).items()
+                                       if k in _TRIED_KEYS}, "reason", "error")},
+            "llm": _clip({k: v for k, v in (r.get("llm") or {}).items()
+                          if k in ("model", "summary", "reason")}, "summary", "reason") or None,
+            "node_rate": {"before": nb, "after": na},
+            "by_task": {k: {"before": tb.get(k), "after": ta.get(k)} for k in sorted({*tb, *ta})},
+            "per_seed": [{**s, **({"nodes": full.get("nodes") or []} if baseline else {})}
+                         for s, full in zip(_seeds_index(r.get("per_seed")), r.get("per_seed") or ())],
+            "after_seeds": _seeds_index(r.get("after_seeds"))}
+
+
 class EvolveStore:
-    """``campaigns/evolve-<task>/campaign.json``, written atomically (tmp+rename)."""
+    """``campaigns/evolve-<task>/campaign.json``, written atomically (tmp+rename) and
+    BOUNDED: the header plus the last ``ROUNDS_KEPT`` rounds in full. Every older round
+    is written ONCE to ``rounds/<round>.json`` (never rewritten) and stands in
+    campaign.json as an ``index_row`` -- so the file is O(1) in rounds instead of the
+    42 MB / 186 MB the 490-round live campaign reached, and the board's faces fit through
+    the 1 MB pipe the station bridge gives them.
+
+    A legacy (unsharded) file is migrated on the first ``load``: the original is copied
+    to ``campaign.json.bak`` beside it and the sharded shape written atomically over it.
+    The loader reads both shapes and the migration is idempotent (an index row is
+    recognised by ``sharded``)."""
 
     def __init__(self, session: Path, task: str) -> None:
-        self.path = session / "campaigns" / f"evolve-{task}" / "campaign.json"
+        self.dir = session / "campaigns" / f"evolve-{task}"
+        self.path = self.dir / "campaign.json"
+        self.rounds_dir = self.dir / "rounds"
 
     def load(self) -> dict | None:
-        return json.loads(self.path.read_text()) if self.path.exists() else None
+        if not self.path.exists():
+            return None
+        doc = json.loads(self.path.read_text())
+        if any(not r.get("sharded") for r in (doc.get("rounds") or [])[:-ROUNDS_KEPT]):
+            bak = self.path.with_suffix(".json.bak")
+            if not bak.exists():
+                bak.write_bytes(self.path.read_bytes())
+            self.save(doc)   # shards in place, atomically
+        return doc
+
+    def round(self, n: int) -> dict | None:
+        """The archived FULL row of round ``n`` (media list, node trails, card source),
+        or None when it is still inside the window / predates sharding."""
+        try:
+            return json.loads((self.rounds_dir / f"{int(n)}.json").read_text())
+        except (OSError, ValueError):
+            return None
 
     def save(self, doc: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rows = doc.get("rounds") or []
+        for i, r in enumerate(rows[:-ROUNDS_KEPT]):
+            if not r.get("sharded"):
+                rows[i] = self._archive(r, baseline=i == 0)
+        self.dir.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(doc, indent=1, sort_keys=True))
+        # compact: the file is an index the board reads, not one an operator diffs -- and
+        # indent=1 is a 1.65x tax on every one of the hundreds of writes a round makes.
+        tmp.write_text(json.dumps(doc, sort_keys=True, separators=(",", ":")))
         os.replace(tmp, self.path)
+
+    def _archive(self, r: dict, baseline: bool = False) -> dict:
+        self.rounds_dir.mkdir(parents=True, exist_ok=True)
+        p = self.rounds_dir / f"{int(r['round'])}.json"
+        if not p.exists():   # written once, never rewritten
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(r, indent=1, sort_keys=True, default=str))
+            os.replace(tmp, p)
+        return index_row(r, baseline)
+
+
+# ── maintenance: the three things that grow without a bound ──────────────────────
+
+_AUDIT_KEEP = ("round", "model", "prompt_sha", "raw_sha", "summary", "rationale",
+               "reason", "usage", "calls")
+
+
+def _round_no(p: Path) -> int:
+    try:
+        return int(re.sub(r"\D", "", p.stem) or 0)
+    except ValueError:
+        return 0
+
+
+def prune_audits(llm_dir: Path, keep: int = AUDITS_KEPT, dry_run: bool = False) -> list[str]:
+    """``campaigns/<c>/llm/round-<r>.json`` older than the last ``keep``: REWRITTEN to
+    their summary -- round, decision, layer, summary, rationale, reason, usage, the
+    attempt count and every sha (prompt, raw, and each rejected attempt's payload sha with
+    its reason, which is what ``evolve_llm._prior_rejects`` reads back) -- with the raw
+    model text, the whole prompt and the materials dropped. Chosen over gzip because the
+    only thing anything reads out of an old audit IS that summary (~1 KB against ~285 KB
+    whole, ~40 KB gzipped). An audit is NEVER deleted: the row survives, only its bulk
+    goes. Idempotent (``pruned``). Returns one line per file rewritten."""
+    out = []
+    for f in sorted(llm_dir.glob("round-*.json"), key=_round_no)[:-keep or None]:
+        try:
+            a = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(a, dict) or a.get("pruned"):
+            continue
+        t = a.get("tried") or {}
+        small = {k: a[k] for k in _AUDIT_KEEP if k in a}
+        small |= {"pruned": True, "decision": t.get("kind"), "node": t.get("node"),
+                  "layer": (t.get("detail") or {}).get("layer"),
+                  "tried": {"kind": t.get("kind"), "node": t.get("node"),
+                            "detail": {k: v for k, v in (t.get("detail") or {}).items()
+                                       if k in _TRIED_KEYS}},
+                  "attempt_count": len(a.get("attempts") or []),
+                  "attempts": [{k: at.get(k) for k in ("sha", "reason")}
+                               for at in a.get("attempts") or ()]}
+        text = json.dumps(small, indent=1, sort_keys=True, default=str)
+        out.append(f"prune audit {f.name}: {f.stat().st_size} -> {len(text)} bytes")
+        if not dry_run:
+            f.write_text(text)
+    return out
+
+
+def _tracked(root: Path) -> set[str] | None:
+    """The HAND-WRITTEN candidate cards = the ones git tracks (plugins/candidates is
+    git-ignored, so everything else in it is a run artefact). None when git cannot answer:
+    the GC then deletes nothing, because it cannot tell the two apart."""
+    try:
+        p = subprocess.run(["git", "ls-files", "-z", "--", "."], cwd=root, check=False,
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return {q.split("/")[0] for q in p.stdout.split("\0") if q}
+
+
+def _referenced(runs: Path) -> set[str]:
+    """Every candidate card name any campaign under ``runs`` still stands on: the names
+    mentioned by its ``applied`` overlay or its ``accepted_stack`` (a published round is
+    accepted by definition, so an installed skill's binding is never cut). Read as text
+    off both refs (``plugins.candidates.<name>:provider``) and paths
+    (``.../candidates/<name>/...``) -- over-keeping here costs a directory, under-keeping
+    costs a skill record."""
+    names: set[str] = set()
+    for c in sorted(runs.glob("*/campaigns/evolve-*/campaign.json")):
+        try:
+            doc = json.loads(c.read_text())
+        except (OSError, ValueError):
+            continue
+        # accepted_stack is the authority; the accepted/published ROWS are the same
+        # answer for a campaign written before the stack existed (evolve_llm._accepted).
+        # ponytail: campaigns are the index -- a card published by a campaign whose
+        # campaign.json has been deleted is not seen. Scan runs/*/skills if that happens.
+        blob = json.dumps([doc.get("applied"), doc.get("accepted_stack"),
+                           [r for r in doc.get("rounds") or ()
+                            if r.get("accepted") or r.get("published")]], default=str)
+        names |= set(re.findall(r"candidates[./\\]([A-Za-z_]\w*)", blob))
+    return names
+
+
+def gc_candidates(root: Path | None = None, runs: Path | None = None,
+                  keep: int = CANDIDATES_KEPT, dry_run: bool = False) -> list[str]:
+    """Delete model-written candidate cards, OLDEST FIRST, keeping: every git-tracked
+    (hand-written) card, every card a campaign under ``runs`` still references
+    (``_referenced``), and the newest ``keep`` of the rest by mtime. 318 dirs / 17 MB on
+    the live box. Returns one line per deletion (the whole log in ``dry_run``)."""
+    root = Path(root or evolve_llm.CANDIDATES_ROOT)
+    runs = Path(runs if runs is not None else REPO_ROOT / "runs")
+    if not root.is_dir():
+        return []
+    tracked = _tracked(root)
+    if tracked is None:
+        return [f"gc: {root} is not a readable git checkout -- nothing deleted"]
+    pinned = tracked | _referenced(runs)
+    cards = sorted((d for d in root.iterdir()
+                    if d.is_dir() and d.name not in pinned and not d.name.startswith(("_", "."))),
+                   key=lambda d: d.stat().st_mtime)
+    out = []
+    for d in cards[:-keep or None]:
+        out.append(f"gc candidate {d.name} (mtime {int(d.stat().st_mtime)}, "
+                   f"{sum(f.stat().st_size for f in d.rglob('*') if f.is_file())} bytes)")
+        if not dry_run:
+            shutil.rmtree(d, ignore_errors=True)
+    return out
+
+
+def _bytes(d: Path) -> int:
+    return sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.is_dir() else 0
+
+
+def disk_guard(session: Path, campaign_dir: Path) -> str | None:
+    """The operator message when the next round must NOT start -- the filesystem holding
+    ``runs/`` is under ``MIN_FREE_BYTES``, or this campaign's directory is over
+    ``MAX_CAMPAIGN_BYTES`` -- else None. Both numbers are named in the message: 26 GB of
+    593 GB left with a 186 MB campaign dir on 2026-09-04 is how close this got."""
+    free = shutil.disk_usage(session).free
+    if free < MIN_FREE_BYTES:
+        return (f"磁盘只剩 {free / 1e9:.1f} GB（下限 {MIN_FREE_BYTES / 1e9:.0f} GB），"
+                f"本轮不开始：status=paused_disk")
+    if (used := _bytes(campaign_dir)) > MAX_CAMPAIGN_BYTES:
+        return (f"战役目录 {campaign_dir.name} 已 {used / 1e9:.1f} GB"
+                f"（上限 {MAX_CAMPAIGN_BYTES / 1e9:.0f} GB），本轮不开始：status=paused_disk")
+    return None
+
+
+def maintain(store: EvolveStore, session: Path, dry_run: bool = False) -> list[str]:
+    """One round's housekeeping, run BEFORE the round: prune this campaign's audits and
+    GC the candidate cards. Cheap -- a glob and a stat walk plus the campaign headers.
+
+    The GC runs ONLY when this loop's session sits in the repo's own ``runs/`` and the
+    cards sit in the repo's own ``plugins/candidates``: the card store is repo-global
+    while the reference set is read out of campaigns, so a loop pointed at a scratch
+    ``runs/`` (every e2e test) would judge the repo's cards against campaigns it cannot
+    see. Anything but that exact pairing and it deletes nothing."""
+    out = prune_audits(store.dir / "llm", dry_run=dry_run)
+    runs, root = REPO_ROOT / "runs", Path(evolve_llm.CANDIDATES_ROOT)
+    if session.parent.resolve() == runs.resolve() and root.resolve() == (REPO_ROOT / "plugins" / "candidates").resolve():
+        out += gc_candidates(root, runs, dry_run=dry_run)
+    return out
 
 
 # ── the executor-switch seam: a planner wrapper that stamps node.executor ────────
@@ -644,26 +912,64 @@ def _ok_map(suite: dict) -> dict[str, dict[str, bool]]:
             for seed, s in suite["seeds"].items()}
 
 
+def _recoveries(*suites: dict) -> set[str]:
+    """The node ids that are REPAIRS: the planner inserts a ``recover-<node>`` only after
+    ``<node>`` failed. Read from EVERY suite given, so a kind known on one side only (the
+    trial replanned, the baseline did not) is still known."""
+    return {n["id"] for su in suites for s in (su.get("seeds") or {}).values()
+            for n in (s.get("trail") or []) if n.get("kind") == "recovery"}
+
+
+def _repair(nid: str, rec: set) -> bool:
+    """Is this node a repair -- ``recover-<node>`` by the planner's naming, or a trail
+    row the task validator kinded ``recovery`` (``_recoveries``)?"""
+    return nid.startswith("recover-") or nid in rec
+
+
 def score(suite: dict, node=None) -> tuple[int, int, int]:
     """The suite's LEXICOGRAPHIC score ``(successes, milestones, target_pass)``:
     whole-task wins first, then the furthest-progress signal (nodes passed, summed over
     seeds), then how many seeds pass the round's TARGET node. Success alone is flat --
     0/2 on every candidate for 90 rounds -- so a change that moves a death EARLIER
-    scores strictly lower and a change that moves it later scores strictly higher."""
-    oks = _ok_map(suite)
+    scores strictly lower and a change that moves it later scores strictly higher.
+
+    REPAIR nodes do not count as milestones: a recovery exists only because something
+    failed, so counting it scored a run that NEEDED a recovery above the same run that
+    no longer needs one -- and paid a patch for inserting repairs."""
+    oks, rec = _ok_map(suite), _recoveries(suite)
     return (sum(bool(s.get("success")) for s in suite["seeds"].values()),
-            sum(sum(m.values()) for m in oks.values()),
+            sum(sum(ok for nid, ok in m.items() if not _repair(nid, rec)) for m in oks.values()),
             sum(bool(m.get(node)) for m in oks.values()) if node else 0)
 
 
 def regressions(before: dict, after: dict) -> list[dict]:
     """``[{seed, node, was_ok_now_not}]`` -- every node that PASSED under the accepted
-    state and no longer passes under the trial (a node the trial's plan dropped counts).
-    A non-empty list refuses acceptance, whatever the score did."""
-    a = _ok_map(after)
-    return [{"seed": int(seed), "node": nid, "was_ok_now_not": True}
-            for seed, m in sorted(_ok_map(before).items(), key=lambda kv: int(kv[0]))
-            for nid, ok in m.items() if ok and not (a.get(seed) or {}).get(nid)]
+    state and no longer passes under the trial. A non-empty list refuses acceptance,
+    whatever the score did.
+
+    Two things are NOT regressions. A seed the trial never ran (a focused scope keeps
+    the baseline's rows for the rest) carries no evidence either way. And a REPAIR that
+    is gone from the trial's plan BECAUSE THE NODE IT REPAIRS NOW PASSES: the planner
+    inserts ``recover-<node>`` only after ``<node>`` failed, so the fix working makes the
+    repair vanish -- reading that as a loss refused eight measurably improving rounds of
+    the recycle_cans campaign (131..389, milestones 9 -> 13..18, target_pass 0 -> 1).
+
+    Everything else still counts: a repair that RAN AGAIN and failed, a repair whose
+    target still fails, and any ordinary node the trial's plan dropped -- a plan that
+    silently drops work is not a win."""
+    a, rec, out = _ok_map(after), _recoveries(before, after), []
+    for seed, m in sorted(_ok_map(before).items(), key=lambda kv: int(kv[0])):
+        now = a.get(seed)
+        if now is None:
+            continue        # the trial never ran this seed: it says nothing about its nodes
+        for nid, ok in m.items():
+            if not ok or now.get(nid):
+                continue
+            if nid not in now and _repair(nid, rec) \
+                    and now.get(nid.removeprefix("recover-"), True):
+                continue    # the repair is gone because its target passes -- that is the win
+            out.append({"seed": int(seed), "node": nid, "was_ok_now_not": True})
+    return out
 
 
 def focus_seeds(rounds: list, before: dict, node, seeds: list) -> list[int]:
@@ -867,12 +1173,15 @@ def _dropped(session: Path, task: str, seeds: list) -> dict[str, dict]:
 # ── the round loop ────────────────────────────────────────────────────────────────
 
 _ZH = {"idle": "等待", "baseline": "基线评测", "propose": "选试验", "retest": "同种子复测",
-       "confirm": "新种子确认", "publish": "发布", "done": "完成", "cancelled": "已取消"}
+       "confirm": "新种子确认", "publish": "发布", "done": "完成", "cancelled": "已取消",
+       "paused_disk": "磁盘不足，已暂停"}
 
 
 def _message(live: dict) -> str:
     """One short operator sentence for the live block (the page shows it verbatim)."""
     head = f"第 {live['round']} 轮 {_ZH.get(live['phase'], live['phase'])}"
+    if live["phase"] == "paused_disk":
+        return live.get("disk") or head
     if live["phase"] == "propose" and live.get("proposer") == "llm":
         head = f"LLM 分析第 {live['round']} 轮…"
     if live["phase"] == "done":
@@ -895,9 +1204,13 @@ def _message(live: dict) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mode", choices=MODES, default="execution")
-    ap.add_argument("--task", required=True)
-    ap.add_argument("--session", type=Path, required=True)
-    ap.add_argument("--skills-root", type=Path, required=True)
+    ap.add_argument("--task")
+    ap.add_argument("--gc", action="store_true",
+                    help="run the maintenance pass alone (prune audits + GC candidate cards) "
+                         "and exit; --dry-run prints what it would do and changes nothing")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--session", type=Path)
+    ap.add_argument("--skills-root", type=Path)
     ap.add_argument("--seeds", type=int, nargs=2, default=None)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--arm", default="auto")
@@ -911,6 +1224,17 @@ def main(argv=None) -> int:
                     help="llm: the model_endpoint card reads the round and answers the try "
                          "(rules fallback when unreachable/invalid); rules: the built-in proposer only")
     args = ap.parse_args(argv)
+    if args.gc:   # the operator's door: no task, no session, no round
+        log = gc_candidates(runs=(args.session.parent if args.session else REPO_ROOT / "runs"),
+                            dry_run=args.dry_run)
+        if args.session and args.task:
+            log = prune_audits(EvolveStore(args.session, args.task).dir / "llm",
+                               dry_run=args.dry_run) + log
+        print("\n".join(log) or "gc: nothing to do")
+        return 0
+    if missing := [f"--{k}" for k in ("task", "session", "skills_root")
+                   if getattr(args, k) is None]:
+        ap.error("the following arguments are required: " + ", ".join(missing))
     budgets = {"max_replans": args.max_replans, "max_actuations": args.max_actuations}
     if args.mode != "evolution":
         print(json.dumps({"error": f"evolve writes a skills root: refused in mode "
@@ -1001,6 +1325,20 @@ def main(argv=None) -> int:
             doc["status"] = "cancelled"
             tick(phase="cancelled")
             return 3
+        # bounded growth, checked before anything is spent: the loud stop first, then the
+        # cheap housekeeping (this campaign's old audits, the candidate cards nothing needs)
+        if msg := disk_guard(args.session, store.dir):
+            doc["status"] = "paused_disk"
+            doc["rounds"].append(
+                {"round": r + 1, "tried": _none(msg, None, needs=("disk",)), "before": doc["best"],
+                 "after": doc["best"], "best": doc["best"], "outcome": "none", "accepted": False,
+                 "published": False, "accepted_reason": "paused_disk", "paused_disk": msg,
+                 "needs": ["disk"], "per_seed": [], "ts": time.time()})
+            tick(phase="paused_disk", round=r + 1, disk=msg)
+            print(msg, file=sys.stderr)
+            return 4
+        for line in maintain(store, args.session):
+            print(line, file=sys.stderr)
         if unbounded and nones:
             # Throttle, never stop: an empty round costs one model call and no sim.
             wait = min(NONE_BACKOFF_S[0] * 2 ** (nones - 1), NONE_BACKOFF_S[1])

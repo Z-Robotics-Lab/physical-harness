@@ -285,12 +285,14 @@ def test_two_rounds_land_in_campaign_json_and_the_chain(runtime, two_rounds):
 
 def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
     """rsi_run / rsi_series / rsi_frames byte-equal across library, CLI and MCP on
-    the campaign.json the real run wrote (not a fixture)."""
+    the campaign.json the real run wrote (not a fixture) -- rsi_run with and
+    without the --round argument."""
     sd = runtime.session
     ms.configure(runtime.runs)
     base = ["--runs", str(runtime.runs), "--session", SESSION]
     cases = [
         (["rsi_run", TASK], bs.rsi_run(sd, TASK), ms.rsi_run(TASK)),
+        (["rsi_run", TASK, "--round", "1"], bs.rsi_run(sd, TASK, 1), ms.rsi_run(TASK, round=1)),
         (["rsi_series", TASK], bs.rsi_series(sd, TASK), ms.rsi_series(TASK)),
         (["rsi_frames", TASK, "--round", "1"], bs.rsi_frames(sd, TASK, 1), ms.rsi_frames(TASK, 1)),
     ]
@@ -299,10 +301,16 @@ def test_three_faces_agree_on_the_real_campaign(runtime, two_rounds, capsys):
         out = capsys.readouterr().out.rstrip("\n")
         assert code == 0 and out == json.dumps(lib) == json.dumps(mcp), argv
     doc = _doc(runtime)
-    assert bs.rsi_run(sd, TASK) == {**doc, "latest": doc["rounds"][-1], "open_brief": None}
-    assert [s["after"] for s in bs.rsi_series(sd, TASK)] == [2, 2]
-    assert [(s["per_seed"], s["needs"]) for s in bs.rsi_series(sd, TASK)] == \
-        [(r["per_seed"], r["needs"]) for r in doc["rounds"]]
+    series = bs.rsi_series(sd, TASK)
+    run = bs.rsi_run(sd, TASK)
+    # bounded by construction: the header, compact rows, and NO per-seed trail
+    assert run == {**doc, "rounds": series[-bs.RUN_TAIL:], "latest": series[-1], "open_brief": None}
+    assert all("per_seed" not in row and "after_seeds" not in row for row in series)
+    # ... and --round hands back that ONE round in full, trails and all
+    one = bs.rsi_run(sd, TASK, 1)["rounds"]
+    assert one == [doc["rounds"][0]] and one[0]["per_seed"]
+    assert bs.rsi_run(sd, TASK, 999)["rounds"] == []
+    assert [s["after"] for s in series] == [2, 2]
     # sub-task rates from the trails: the kept suite (= the published trial) verified every
     # node of every seed, so node_rate and both stage groups (reach, grab) read 1.0
     assert [(s["node_rate"], s["by_task"]) for s in bs.rsi_series(sd, TASK)] == [

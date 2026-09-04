@@ -50,6 +50,11 @@ forwards verbatim, so the cockpit's 演进 panel shows where the chain is.
 Name-addressed reads (store/heldout/session) go through board.store.safe_child,
 the one audited traversal guard, so a ``../`` name can never escape runs_dir.
 
+Every answer leaves through ``_emit``, which REFUSES a body over
+``MAX_RESPONSE_BYTES`` with ``{error, fn, bytes, limit, narrow}`` rather than
+printing it: the bridge reads stdout into a buffer, and a face that outgrew it
+must fail loudly instead of leaving the page on its empty state forever.
+
     python -m board.storecli list_stores --runs runs/     # -> JSON on stdout
     python -m board.storecli store stack-g1 --runs runs/   # name-addressed
 """
@@ -67,6 +72,34 @@ from board import cards as bc
 from board import planning as bp
 from board import store as bs
 from board import vault as bv
+
+
+#: The largest body any face may emit. The console bridge reads stdout into a
+#: fixed buffer; past it the call dies and the page falls back to its empty
+#: state, so an oversized answer must fail LOUDLY here instead. 4 MB leaves the
+#: bridge's 64 MB buffer an order of magnitude of headroom.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+#: Per fn, the argument that narrows an oversized answer -- named in the refusal
+#: so the caller is told what to do, not just that it failed.
+_NARROW = {
+    "rsi_run": "--round <n> (one round in full)",
+    "rsi_frames": "--round <n>",
+    "runtime_events": "--after <seq>",
+    "runtime_keyframes": "--after <seq>",
+}
+
+
+def _emit(fn: str, result, stdout=None) -> None:
+    """The ONE exit of every face: print the JSON body, or refuse it with a
+    structured {error, fn, bytes, limit, narrow} when it is over
+    MAX_RESPONSE_BYTES. json.dumps is ASCII-escaped, so len() IS the byte
+    count."""
+    body = json.dumps(result)
+    if len(body) > MAX_RESPONSE_BYTES:
+        body = json.dumps({"error": "response too large", "fn": fn, "bytes": len(body),
+                           "limit": MAX_RESPONSE_BYTES, "narrow": _NARROW.get(fn)})
+    print(body, file=stdout or sys.stdout, flush=True)
 
 
 def _read(path: Path) -> str:
@@ -147,7 +180,7 @@ def dispatch(fn: str, name: str | None, runs: Path, status: Path, progress: Path
         if not name:
             raise ValueError(f"{fn} needs a task as the name argument")
         if fn == "rsi_run":
-            return bs.rsi_run(path, name)
+            return bs.rsi_run(path, name, round)
         if fn == "rsi_series":
             return bs.rsi_series(path, name)
         return bs.rsi_frames(path, name, round)
@@ -288,8 +321,12 @@ def serve(stdin, stdout, runs: Path, status: Path, progress: Path) -> int:
         line = line.strip()
         if not line:
             continue
+        req = {}   # bound before the try: a malformed line must still reply, not crash the loop
         try:
             req = json.loads(line)
+            if not isinstance(req, dict):   # valid JSON, wrong shape -- reply, keep serving
+                req = {}
+                raise ValueError("request must be a JSON object")
             result = dispatch(req.get("fn", ""), req.get("name"), runs, status, progress,
                               int(req.get("after", 0)), req.get("relation"),
                               float(req.get("after_ts", 0.0)), int(req.get("wait_ms", 0)),
@@ -306,7 +343,7 @@ def serve(stdin, stdout, runs: Path, status: Path, progress: Path) -> int:
             result = {"error": f"unknown fn: {req.get('fn', '')}"}
         except Exception as exc:  # bad JSON / rejected name / anything: reply, keep serving
             result = {"error": str(exc)}
-        print(json.dumps(result), file=stdout, flush=True)
+        _emit(req.get("fn", ""), result, stdout)
     return 0
 
 
@@ -332,7 +369,7 @@ def main(argv=None) -> int:
     parser.add_argument("--wait-ms", type=int, default=0, help="long poll: runtime_frame blocks up to WAIT_MS for the frame to change past --after-ts, brief_status for the brief's STATE to change; either way the answer is the current state, never a timeout error (capped board-side)")
     parser.add_argument("--seq", type=int, default=0, help="runtime_keyframe: the runtime_events seq whose pinned still to fetch")
     parser.add_argument("--sha", default=None, help="suite_result: the suite artifact sha to read (default: the session's newest suite.sealed row)")
-    parser.add_argument("--round", type=int, default=0, help="rsi_frames: the evolve round whose kept media paths to list")
+    parser.add_argument("--round", type=int, default=0, help="rsi_frames: the evolve round whose kept media paths to list; rsi_run: fetch that ONE round in full (trails, trial_evidence) instead of the bounded tail")
     parser.add_argument("--checkpoint", default=None, help="policy_server start: checkpoint dir (default: PH_POLICY_CHECKPOINT, then the board constant)")
     parser.add_argument("--out", type=Path, default=None, help="trajectories: write <OUT>/dev.jsonl and heldout.jsonl (split by burned block role) and print the counts")
     args = parser.parse_args(argv)
@@ -353,7 +390,7 @@ def main(argv=None) -> int:
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}))
         return 3
-    print(json.dumps(result))
+    _emit(args.fn, result)
     return 0
 
 

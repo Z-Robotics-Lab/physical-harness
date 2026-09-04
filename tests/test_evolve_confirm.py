@@ -152,7 +152,8 @@ def test_win_on_debug_seeds_that_holds_on_confirm_seeds_is_published(tmp_path, m
     text = audit["messages"][1]["content"]
     assert all(f"media/{TASK}/{seed}/grab-0.fail-{i}.jpg" in text for seed in (1, 2) for i in range(3))
     assert "keyframes" in text and "first frame" in audit["messages"][0]["content"]
-    assert bs.rsi_series(session, TASK)[0]["confirm"] == r["confirm"]
+    # confirm is round detail, not a series row: it rides the ONE round rsi_run(round=1) serves
+    assert bs.rsi_run(session, TASK, 1)["rounds"][0]["confirm"] == r["confirm"]
     c = bs.rsi_campaigns(session)[0]
     assert c["published_rounds"] == [1] and c["usage"] == {"llm_tokens": None, "sim_s": r["usage"]["sim_s"]}
 
