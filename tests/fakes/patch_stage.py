@@ -25,7 +25,7 @@ SEGMENT_SPECS = segment_specs({k: protocol.SkillRecordV0.from_dict(v) for k, v i
 class ReachStage:
     def act(self, env, obs):
         env.reached = True
-        return (0.0,)
+        return (1.0,)
 
     def done(self, env):
         return bool(getattr(env, "reached", False))
@@ -40,11 +40,11 @@ class GrabStage:
 
     def act(self, env, obs):
         if self.STOP < 0.5:
-            env.grabbed = True
+            return (2.0,)
         return (0.0,)
 
     def done(self, env):
-        return bool(getattr(env, "grabbed", False))
+        return "grab" in env.achieved
 
 
 _STAGES = {"reach": (lambda: ReachStage(), 8), "grab": (lambda: GrabStage("cube"), 8)}

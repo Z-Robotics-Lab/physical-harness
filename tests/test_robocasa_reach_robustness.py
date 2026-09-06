@@ -130,7 +130,7 @@ def test_stalled_place_stage_fails_segment_early_with_reach_stall(monkeypatch):
     assert drv.segment_success(object()) is False
     # the stall geometry rides the diagnostics: eef / drop point / base + distances
     tr = diag["trace"]
-    assert set(tr) == {"start", "stall", "end", "series"} and tr["start"]["step"] == 1
+    assert set(tr) == {"start", "stall", "end", "series", "groups", "sampling"} and tr["start"]["step"] == 1
     assert tr["stall"]["step"] == steps == tr["end"]["step"]
     assert tr["stall"]["eef"] == [1.0, 2.0, 1.0] and tr["stall"]["base"] == [0.0, 0.0, 0.0]
     assert tr["stall"]["target"] == [3.0, 3.0, 1.0 + D.tunables()["drop_over_dz"]]

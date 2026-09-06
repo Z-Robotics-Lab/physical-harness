@@ -21,4 +21,13 @@ ref = "plugins.model_endpoint:provider"
 # enter the plan sha, so WHICH endpoint answered is configuration identity --
 # the api key rides an env var name, never a value, keeping secrets out of the
 # hash chain.
-params = { preset = "deepseek", model = "deepseek-v4-flash-vision-exp" }
+[mounts."model.endpoint".params]
+preset = "deepseek"
+model = "deepseek-v4-flash-vision-exp"
+
+# Supported request options for this deployment; the RSI picker reads these.
+[mounts."model.endpoint".params.reasoning_efforts]
+off = { thinking = { type = "disabled" } }
+low = { thinking = { type = "enabled" }, reasoning_effort = "low" }
+high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
+max = { thinking = { type = "enabled" }, reasoning_effort = "max" }

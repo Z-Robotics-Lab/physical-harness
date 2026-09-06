@@ -13,7 +13,7 @@ from plugins.model_endpoint import fake_provider
 from plugins.planner_library import provider as library_provider
 from plugins.planner_vlm import provider as vlm_provider
 from plugins.task import workload
-from plugins.task.planner_stack import CATALOGUE, ORACLES, SKILL_RECORDS, StackPlanner
+from plugins.task.planner_stack import CATALOGUE, ORACLES, StackPlanner
 from plugins.task.validate import validate_plan
 from scripts.harness_runtime import _compose, task_brief
 from test_task_seam import _CountingPlanner, _RolloutFake, _task_kernel
@@ -144,8 +144,8 @@ def test_composed_graph_with_real_goals_passes_covered_and_a_missing_ensures_fai
     problems = workload._graph_problems(bad, None, (), brief, CATALOGUE, 1)
     assert problems == ["covered: task 'ct' goal on(can,milk) is ensured by none of its nodes"]
     # graph_sha ignores provenance keys only
-    assert workload._graph_sha(good) == workload._graph_sha({**good, "planner": {"x": 1}})
-    assert workload._graph_sha(good) != workload._graph_sha(bad)
+    assert workload.protocol.graph_sha(good) == workload.protocol.graph_sha({**good, "planner": {"x": 1}})
+    assert workload.protocol.graph_sha(good) != workload.protocol.graph_sha(bad)
 
 
 def test_validate_plan_refuses_a_malformed_tasks_block_and_an_unknown_node_task():
@@ -169,5 +169,5 @@ def test_workload_runs_a_composed_graph_without_asking_the_planner(monkeypatch):
     assert out["success"] is True and planner.briefs == []
     row = next(r["data"] for r in log.rows() if r["kind"] == "task.plan")
     assert row["legal"] is True and row["planner"] == {"provider": "mission"}
-    assert row["graph_sha"] == workload._graph_sha(brief["graph"])
+    assert row["graph_sha"] == workload.protocol.graph_sha(brief["graph"])
     assert sorted(out["nodes"]) == ["ct.pick-can", "ct.pick-milk"]

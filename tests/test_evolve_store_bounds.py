@@ -12,16 +12,29 @@ import subprocess
 
 import pytest
 
+from board import store as bs
+from plugins.rsi import evaluation, experience
 from scripts import evolve
 
 NODES = ("nav-can1", "grasp-can1", "carry-can1", "drop-can1")
+_CHECK = {"id": "checked", "kind": "verify", "skill": "placed", "args": {}}
+_CONTRACT = evaluation.compile_contract({"nodes": [_CHECK]}, task="recycle_cans",
+                                        predicates={"placed": "fixture:placed"}, terminal_ref="fixture:env")
 
 
-def _seed_row(seed: int, dead: str, ok_upto: int) -> dict:
+def _reading(checkpoint=True):
+    return evaluation.evaluate(_CONTRACT, [{"node": _CHECK, "authority": "predicate",
+                                           "evidence_policy": "world-dependencies-v1", "blocked_reads": [],
+                                           "source": "fixture:placed", "success": checkpoint}],
+                               {"authority": "embodiment.terminal_success", "source": "fixture:env",
+                                "success": False})
+
+
+def _seed_row(seed: int, dead: str, ok_upto: int, checkpoint=True) -> dict:
     """One per_seed row in the real shape -- the ``nodes`` trail is the bulk (19 MB of
     the live 42 MB) and the one thing an index row drops."""
     return {"seed": seed, "success": False, "first_death": dead, "failure_mode": "reach_stall",
-            "elapsed_s": 12.5, "tunables_sha": "a" * 64,
+            "elapsed_s": 12.5, "tunables_sha": "a" * 64, "evaluation": _reading(checkpoint),
             "nodes": [{"id": n, "ok": i < ok_upto, "steps": 100, "task": "recycle_cans",
                        "failure_mode": None if i < ok_upto else "reach_stall",
                        "after": {"pose": [0.1] * 7}, "kind": "segment",
@@ -30,20 +43,33 @@ def _seed_row(seed: int, dead: str, ok_upto: int) -> dict:
 
 
 def _round(no: int, node: str = "drop-can1", accepted: bool = False) -> dict:
-    rows = [_seed_row(4243, node, 3), _seed_row(4244, node, 3)]
+    rows = [_seed_row(4243, node, 3, not accepted), _seed_row(4244, node, 3, not accepted)]
+    after_rows = [_seed_row(4243, node, 3), _seed_row(4244, node, 3)]
+    suite = lambda values: {"seeds": {str(row["seed"]): row for row in values}}
+    checked = evaluation.compare(suite(rows), suite(after_rows), _CONTRACT)
     return {"round": no, "tried": {"kind": "tunables", "node": node,
                                    "detail": {"skill": "drop_can1", "ref": "m:provider",
                                               "path": ["tunables", "hover_dz"], "from": 1.0,
                                               "to": 1.3, "layer": "parameter",
                                               "reason": "x" * 2000, "edits": ["y" * 4000]}},
             "before": 0, "after": 0, "best": 0, "parent": 0, "layer": "parameter",
-            "notes": "z" * 900, "outcome": "same", "accepted": accepted, "published": False,
-            "accepted_reason": "score [0, 11, 0] -> [0, 11, 0]", "before_score": [0, 11, 0],
-            "after_score": [0, 11, 0], "usage": {"llm_tokens": None, "sim_s": 30.0},
+            "notes": "z" * 900, "outcome": "improved" if accepted else "same",
+            "accepted": accepted, "published": False,
+            "accepted_reason": checked["reason"], "before_score": [0, checked["before"]["progress"]],
+            "after_score": [0, checked["after"]["progress"]],
+            "evaluation": {"protocol_id": evaluation.VERSION, "objective_id": _CONTRACT["sha"],
+                           "before": checked["before"], "after": checked["after"],
+                           "acceptance": {"accepted": accepted, "reason": checked["reason"]},
+                           "installation": {"status": "not_evaluated"}},
+            "experiments": {"before": f"before-{no}", "after": f"after-{no}"},
+            "diagnosis": {"fingerprint": ["control:inactive", "response:stalled"]},
+            "experience": {"retrieved": [], "recorded": None},
+            "transfer": {"prior_tasks": 0, "first_accepted_round": 7 if no >= 7 else None,
+                         "total_trials": no, "censored": no < 7}, "usage": {"llm_tokens": None, "sim_s": 30.0},
             "proposer": "llm", "needs": [], "confirm": None, "trial": None, "stuck": None,
             "regression": None, "burned": [], "suite_sha": "b" * 64, "proposal": None,
             "trial_evidence": {"node": node, "seeds": [{"seed": 4243, "diff": {}}]},
-            "ts": 1.0 * no, "per_seed": rows, "after_seeds": rows,
+            "ts": 1.0 * no, "per_seed": rows, "after_seeds": after_rows,
             "media": [f"media/recycle_cans/4243/r{no}.mp4"],
             "media_dropped": {f"4243/{node}": {"reason": "no clip", "keyframes": []}},
             "llm": {"model": "deepseek", "prompt_sha": "c" * 64, "raw_sha": "d" * 64,
@@ -53,7 +79,7 @@ def _round(no: int, node: str = "drop-can1", accepted: bool = False) -> dict:
 def _doc(n: int) -> dict:
     return {"task": "recycle_cans", "session": "s", "seeds": [4243, 4244], "arm": "scripted",
             "rounds": [_round(i, accepted=i == 7) for i in range(1, n + 1)],
-            "best": 0, "cursor": n, "status": "running",
+            "best": 0, "cursor": n, "status": "running", "evaluation_contract": _CONTRACT,
             "applied": {"executors": {}, "tunables": {}, "cards": {}}, "accepted_stack": []}
 
 
@@ -62,6 +88,29 @@ def _store(tmp_path, doc: dict) -> evolve.EvolveStore:
     st.dir.mkdir(parents=True)
     st.path.write_text(json.dumps(doc, indent=1, sort_keys=True))
     return st
+
+
+def test_continuous_budget_and_cycle_outcome_survive_sharding(tmp_path):
+    doc = _doc(evolve.ROUNDS_KEPT + 2)
+    doc.update(continuous=True, stop_reason=None)
+    for row in doc['rounds']:
+        row['cycle_budget'] = {'scope': 'learning_cycle', 'limits': {'model_calls': 8},
+                               'used': {'model_calls': 5}}
+        row['run_budget'] = {'scope': 'submitted_brief', 'limits': {'model_calls': None},
+                            'used': {'model_calls': row['round'] * 5}}
+        row['cycle_outcome'] = 'updated' if row['accepted'] else 'no_update'
+    doc['cycle_budget'] = doc['rounds'][-1]['cycle_budget']
+    doc['run_budget'] = doc['rounds'][-1]['run_budget']
+    stored = _store(tmp_path, doc).load()
+    assert stored['rounds'][0]['sharded']
+    summaries = bs.rsi_series(tmp_path, 'recycle_cans')
+    for original, summary in zip(doc['rounds'], summaries):
+        for key in ('cycle_budget', 'run_budget', 'cycle_outcome'):
+            assert summary[key] == original[key]
+    header = bs.rsi_campaigns(tmp_path)[0]
+    assert header['continuous'] and header['stop_reason'] is None
+    assert header['run_budget'] == doc['run_budget']
+    assert bs.rsi_run(tmp_path, 'recycle_cans', 1)['rounds'][0]['cycle_budget'] == doc['cycle_budget']
 
 
 # ── 1. sharding: small file, same answers ────────────────────────────────────────
@@ -84,13 +133,7 @@ def test_a_500_round_campaign_stays_small_and_every_history_answer_is_unchanged(
     # every function that reads history, off the index instead of the whole rounds list
     assert evolve.death_nodes(suite, hist) == evolve.death_nodes(suite, hist0)
     assert evolve._first_death(suite, hist) == evolve._first_death(suite, hist0)
-    assert evolve.stuck_on("drop-can1", hist) == evolve.stuck_on("drop-can1", hist0)
-    assert evolve.cluster_seeds(hist, suite, "drop-can1") == evolve.cluster_seeds(hist0, suite, "drop-can1")
-    assert evolve.focus_seeds(hist, suite, "drop-can1", [4243, 4244]) \
-        == evolve.focus_seeds(hist0, suite, "drop-can1", [4243, 4244])
-    assert evolve.regression(hist, suite, suite, "drop-can1") == evolve.regression(hist0, suite, suite, "drop-can1")
-    # scripts.evolve.propose's two history reads: executors already tried on the node,
-    # and the (knob, direction) tunables steps already spent
+    # The sealed history retains executed executor identities and parameter values.
     spent = lambda h: ({r["tried"]["detail"].get("to") for r in h
                         if r["tried"]["kind"] in ("executor", "card")},
                        {(r["tried"]["detail"]["path"][-1], r["tried"]["detail"]["to"] > r["tried"]["detail"]["from"])
@@ -100,29 +143,33 @@ def test_a_500_round_campaign_stays_small_and_every_history_answer_is_unchanged(
     assert sum(r["tried"]["kind"] != "none" for r in hist) == 500
     assert max((x["round"] for x in hist if x.get("accepted") or x.get("published")), default=0) == 7
     assert sum((r.get("usage") or {}).get("sim_s") or 0 for r in hist) == 15000.0
-    # the origin cluster is scored off round 1's trails EVERY round: they stay inline
-    assert evolve.cluster_seeds(hist, suite, "drop-can1") == [4243, 4244]
-    assert doc["rounds"][0]["per_seed"][0]["nodes"] and not doc["rounds"][1]["per_seed"][0].get("nodes")
+    # Progress and acceptance remain the frozen evaluator's measurements in the
+    # compact history; the frontier does not reconstruct a score from node trails.
+    assert [r["evaluation"] for r in hist] == [r["evaluation"] for r in hist0]
+    assert [r["transfer"] for r in hist] == [r["transfer"] for r in hist0]
 
 
-def test_a_baseline_round_with_trail_less_rows_still_has_an_origin_cluster():
-    """The live campaign's round 1 rows ARE there and carry no trail
-    (``[{seed: 4243, nodes: []}, {seed: 4244, nodes: []}]``) -- an empty trail has no first
-    missing milestone, so the cluster came back empty for all 588 rounds. (It was not what
-    kept the historical regression from ever running there: ``regression()`` is only reached
-    under ``if published`` and that campaign published nothing.) The fallback reads THIS
-    round's cluster instead, which is a WEAKER guarantee: a seed already repaired is no
-    longer in the cluster, so a later round losing it again is not caught."""
-    seed = lambda s, dead, upto: {"success": False, "first_death": dead, "nodes": {},
-                                  "trail": _seed_row(s, dead, upto)["nodes"]}
-    suite = {"count": 0, "seeds": {"4243": seed(4243, "drop-can1", 3),
-                                   "4244": seed(4244, "grasp-can1", 1)}}
-    empty = [{"round": 1, "per_seed": [{"seed": 4243, "nodes": []}, {"seed": 4244, "nodes": []}]}]
-    assert evolve.cluster_seeds(empty, suite, "drop-can1") == [4243]
-    assert evolve.cluster_seeds(empty, suite, "grasp-can1") == [4244]
-    # the semantic change the fallback buys: 4243 repaired past drop-can1 leaves its cluster
-    fixed = {**suite, "seeds": {**suite["seeds"], "4243": seed(4243, "grasp-can1", 1)}}
-    assert evolve.cluster_seeds(empty, fixed, "drop-can1") == []
+def test_sharding_preserves_evaluator_evidence_and_the_cross_task_memory_reference(tmp_path):
+    st = _store(tmp_path, _doc(60))
+    full = st.load()
+    row = st.round(7)
+    assert row["evaluation"]["acceptance"]["accepted"]
+    suite = lambda values: {"seeds": {str(seed["seed"]): seed for seed in values}}
+    assert evaluation.compare(suite(row["per_seed"]), suite(row["after_seeds"]),
+                              full["evaluation_contract"])["accepted"]
+    memory = tmp_path / "rsi-experience.json"
+    saved = experience.record_experience(memory, task="recycle_cans", diagnosis=row["diagnosis"],
+        intervention={"kind": row["tried"]["kind"], "scope": row["layer"],
+                      "summary": "Test a different control response", "reference": "s/recycle_cans/7"},
+        accepted=True, evidence={"before_sha": row["experiments"]["before"],
+                                 "after_sha": row["experiments"]["after"],
+                                 "round": 7, "session": "s", "suite_scope": "full"})
+    found = experience.retrieve_experiences(memory, task="unseen_task", diagnosis=row["diagnosis"],
+                                            before_sequence=saved["sequence"] + 1)
+    assert len(found) == 1 and found[0]["evidence"]["round"] == row["round"]
+    assert found[0]["intervention"]["reference"] == "s/recycle_cans/7"
+    assert experience.retrieve_experiences(memory, task="unseen_task", diagnosis=row["diagnosis"],
+                                          before_sequence=saved["sequence"]) == []
 
 
 def test_the_index_carries_the_chart_and_the_heat_strip_without_the_trails(tmp_path):
@@ -130,7 +177,7 @@ def test_the_index_carries_the_chart_and_the_heat_strip_without_the_trails(tmp_p
     doc = _store(tmp_path, _doc(60)).load()
     r = doc["rounds"][5]
     assert r["sharded"] and (r["tried_kind"], r["node"]) == ("tunables", "drop-can1")
-    assert (r["before_score"], r["after_score"], r["outcome"]) == ([0, 11, 0], [0, 11, 0], "same")
+    assert (r["before_score"], r["after_score"], r["outcome"]) == ([0, 0.5], [0, 0.5], "same")
     assert (r["accepted"], r["published"]) == (False, False) and r["usage"]["sim_s"] == 30.0
     assert r["node_rate"] == {"before": 0.75, "after": 0.75}       # 3 of 4 nodes ok
     assert r["by_task"] == {"recycle_cans": {"before": 0.0, "after": 0.0}}
@@ -248,6 +295,21 @@ def test_the_gc_dry_run_never_touches_a_tracked_or_referenced_card(cards):
     assert evolve.gc_candidates(root, runs) == []           # nothing left to take
 
 
+def test_gc_retains_unaccepted_working_ancestor_until_workspace_releases_it(cards):
+    root, runs = cards
+    campaign = next(runs.glob('*/campaigns/evolve-*/campaign.json'))
+    doc = json.loads(campaign.read_text())
+    doc['working_candidates'] = [{'kind': 'card', 'node': 'move',
+                                  'detail': {'path': str(root / 'patch_r0')}}]
+    campaign.write_text(json.dumps(doc))
+    evolve.gc_candidates(root, runs, keep=0)
+    assert (root / 'patch_r0').exists()
+    doc['working_candidates'] = []
+    campaign.write_text(json.dumps(doc))
+    evolve.gc_candidates(root, runs, keep=0)
+    assert not (root / 'patch_r0').exists()
+
+
 def test_the_gc_deletes_nothing_when_git_cannot_say_what_is_hand_written(tmp_path):
     root = tmp_path / "candidates"
     (root / "patch_r1").mkdir(parents=True)
@@ -301,6 +363,13 @@ def test_the_loop_stops_at_paused_disk_before_it_spends_a_single_seed(tmp_path, 
     assert (r["round"], r["tried"]["kind"], r["accepted_reason"]) == (1, "none", "paused_disk")
     assert "paused_disk" in r["paused_disk"] and r["needs"] == ["disk"]
     assert doc["live"]["phase"] == "paused_disk" and doc["live"]["message"] == r["paused_disk"]
+    assert doc["cursor"] == doc["live"]["round"] == 1
+    # A repeated pause must never overwrite a round that may already be sealed.
+    assert evolve.main(["--mode", "evolution", "--task", "recycle_cans", "--session", str(tmp_path),
+                        "--skills-root", str(tmp_path / "skills"), "--rounds", "1"]) == 4
+    resumed = evolve.EvolveStore(tmp_path, "recycle_cans").load()
+    assert [row["round"] for row in resumed["rounds"]] == [1, 2]
+    assert resumed["cursor"] == 2
 
 
 # ── 6. the faces over a SHARDED campaign ─────────────────────────────────────────
@@ -318,7 +387,7 @@ def test_the_faces_still_serve_a_round_the_store_sharded(tmp_path):
     # the chart: same numbers for every round, sharded or not -- not a run of nulls
     sharded, plain = bs.rsi_series(tmp_path, "recycle_cans"), bs.rsi_series(raw, "recycle_cans")
     assert len(sharded) == len(plain) == 60
-    keys = ("round", "node_rate", "by_task", "before", "after", "accepted", "usage")
+    keys = ("round", "node_rate", "by_task", "before", "after", "accepted", "usage", "evaluation")
     assert [{k: r[k] for k in keys} for r in sharded] == [{k: r[k] for k in keys} for r in plain]
     assert all(r["node_rate"]["before"] == 0.75 and r["by_task"] for r in sharded)
 
@@ -338,7 +407,8 @@ def test_the_faces_still_serve_a_round_the_store_sharded(tmp_path):
 def test_a_repair_node_never_counts_toward_the_chart():
     """A ``recover-<node>`` exists only because <node> failed: counting it made the
     chart paint a fix as a fall (by_task['recover'] 1.0 -> 0.5) on precisely the
-    rounds the robot got further -- the same dishonesty evolve.score had."""
+    rounds the robot got further. These chart rates describe execution only;
+    acceptance uses the independent evaluator vector."""
     import board.store as bs
 
     def trail(*rows):

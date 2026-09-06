@@ -21,6 +21,7 @@ model_qwen precedent, verbatim.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import urllib.request
@@ -39,6 +40,17 @@ PRESETS: dict[str, dict[str, str | None]] = {
     "deepseek": {"base_url": "https://api.deepseek.com/v1",
                  "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
 }
+
+
+def reasoning_options(effort: str, declared: dict | None = None) -> dict:
+    """Resolve a declared effort to wire options; never silently downgrade it."""
+    choices = declared if declared is not None else {"off": {"thinking": {"type": "disabled"}}}
+    if not isinstance(effort, str) or effort not in choices:
+        raise ValueError(f"unsupported RSI effort; choose one of {list(choices)}")
+    options = choices[effort]
+    if not isinstance(options, dict) or set(options) - {"thinking", "reasoning_effort"}:
+        raise ValueError("reasoning options may only configure thinking and reasoning_effort")
+    return copy.deepcopy(options)
 
 
 def _credential_ref(name: str | None) -> str | None:
@@ -91,7 +103,8 @@ class OpenAICompatEndpoint:
 
     def __init__(self, *, preset: str | None = None, base_url: str | None = None,
                  api_key_env: str | None = None, model: str | None = None,
-                 timeout: float = 60.0, images: bool | None = None) -> None:
+                 timeout: float = 60.0, images: bool | None = None,
+                 reasoning_efforts: dict | None = None) -> None:
         cfg: dict[str, str | None] = dict(PRESETS[preset]) if preset else {}
         if base_url is not None:
             cfg["base_url"] = base_url
@@ -105,6 +118,12 @@ class OpenAICompatEndpoint:
         self._key_env = cfg.get("api_key_env")
         self._model = cfg.get("model")
         self._timeout = timeout
+        self.reasoning_efforts = copy.deepcopy(reasoning_efforts) if reasoning_efforts is not None else {
+            "off": {"thinking": {"type": "disabled"}}}
+        if not isinstance(self.reasoning_efforts, dict) or "off" not in self.reasoning_efforts:
+            raise ValueError("reasoning_efforts must declare the default off option")
+        for effort in self.reasoning_efforts:
+            reasoning_options(effort, self.reasoning_efforts)
         # ponytail: images inferred from the model name; set images=true|false in params to override
         self.images = (bool(images) if images is not None
                        else any(t in (self._model or "").lower() for t in ("vision", "vl")))
@@ -143,6 +162,20 @@ class OpenAICompatEndpoint:
             return True
         except OSError:
             return False
+
+    def model_catalog(self) -> dict:
+        """Discover names without generating tokens or exposing endpoint credentials."""
+        result = {"default_model": self._model, "default_effort": "off",
+                  "efforts": list(self.reasoning_efforts), "models": []}
+        ids = {self._model} if self._model else set()
+        try:
+            data = self._get_json(f"{self._base}/models", 3.0)
+            ids.update(row["id"] for row in data["data"]
+                       if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result["error"] = f"Model discovery failed ({type(exc).__name__})"
+        result["models"] = [{"id": name} for name in sorted(ids)]
+        return result
 
     def chat(self, messages: Sequence[Mapping], **opts: Any) -> str:
         """POST /chat/completions, OpenAI shape; ``opts`` pass through to the

@@ -125,6 +125,76 @@ def test_replan_monotone():
     assert P.replan_monotone(GOOD, GOOD, ["g"]) == (True, [])
 
 
+def test_replan_cannot_credit_completed_restore_after_a_future_clobber():
+    records = {
+        "restore": P.SkillRecordV0(id="restore", name="restore", ensures=("ready()",)),
+        "clear": P.SkillRecordV0(id="clear", name="clear", clobbers=("ready()",)),
+        "consume": P.SkillRecordV0(id="consume", name="consume", requires=("ready()",)),
+    }
+    restore = {"id": "a", "task": "t", "skill": "restore", "after": []}
+    clear = {"id": "b", "task": "t", "skill": "clear", "after": ["a"]}
+    old = graph([restore, clear], goal=())
+    new = graph([{**clear, "after": []}, {**restore, "after": ["b"]},
+                 {"id": "c", "task": "t", "skill": "consume", "after": ["a"]}], goal=())
+    assert P.validate_graph(old, records, (), ()) == (True, [])
+    assert P.validate_graph(new, records, (), ()) == (True, [])
+    # a already succeeded; replay would skip it and run clear directly before consume.
+    ok, problems = P.replan_monotone(old, new, {"a"})
+    assert not ok and any("ordered prefix" in p for p in problems)
+
+
+@pytest.mark.parametrize("order", [("b", "a", "c"), ("c", "a", "b")])
+def test_replan_preserves_completed_order_even_without_dependency_edges(order):
+    nodes = {nid: {"id": nid, "task": "t", "skill": "s", "after": []}
+             for nid in ("a", "b", "c")}
+    old = graph(list(nodes.values()), goal=())
+    new = graph([nodes[nid] for nid in order], goal=())
+    assert P.validate_graph(new, {"s": P.SkillRecordV0(id="s", name="s")}, (), ()) == (True, [])
+    ok, problems = P.replan_monotone(old, new, {"a", "b"})
+    assert not ok and any("ordered prefix" in p for p in problems)
+
+
+def test_replan_completed_prefix_cannot_depend_on_later_unfinished_work():
+    old = graph([{"id": nid, "task": "t", "skill": "s", "after": []}
+                 for nid in ("a", "b")], goal=())
+    new = graph([{**old["nodes"][0], "after": ["b"]}, old["nodes"][1]], goal=())
+    ok, problems = P.replan_monotone(old, new, {"a"})
+    assert not ok and any("depends on unfinished" in p for p in problems)
+
+
+@pytest.mark.parametrize("field,value", [("kind", "verify"), ("task", "other"),
+                                          ("executor", "replacement")])
+def test_replan_freezes_completed_execution_identity(field, value):
+    old = graph([{"id": "a", "task": "t", "skill": "s", "kind": "segment",
+                  "executor": "original", "after": []}], goal=())
+    new = graph([{**old["nodes"][0], field: value}], goal=())
+    # Both raw mappings and converted graphs must retain the dispatch kind.
+    for before, after in ((old, new), (P.ExecutionGraph.from_dict(old),
+                                      P.ExecutionGraph.from_dict(new))):
+        ok, problems = P.replan_monotone(before, after, {"a"})
+        assert not ok and any("execution identity" in p for p in problems)
+
+
+def test_replan_can_replace_unfinished_suffix_after_completed_prefix():
+    old = graph([{"id": nid, "task": "t", "skill": "s", "after": []}
+                 for nid in ("a", "b", "c")], goal=())
+    new = graph([*old["nodes"][:2], {"id": "repair", "task": "t", "skill": "repair",
+                                   "kind": "recovery", "after": ["b"]},
+                 {**old["nodes"][2], "after": ["repair"]}], goal=())
+    assert P.replan_monotone(old, new, {"b", "a"}) == (True, [])
+
+
+def test_default_node_serialization_preserves_existing_graph_identity():
+    default = P.Node(id="n", task="t", skill="s")
+    previous = {"id": "n", "task": "t", "skill": "s", "args": {}, "after": [],
+                "on_fail": {}, "executor": None}
+    assert P.to_plain(default) == previous
+    assert P.content_id(default) == P.content_id(previous)
+    segment = P.Node(id="n", task="t", skill="s", kind="segment")
+    assert P.to_plain(segment) == {**previous, "kind": "segment"}
+    assert P.content_id(segment) != P.content_id(default)
+
+
 def test_content_id_stable():
     g = P.ExecutionGraph.from_dict(GOOD)
     assert P.content_id(g) == P.content_id(P.ExecutionGraph.from_dict(GOOD))

@@ -1437,6 +1437,64 @@ def rsi_run(session_dir: str | Path, task: str, round: int = 0) -> dict | None:
             "open_brief": open_brief}
 
 
+def rsi_model_options() -> dict:
+    """Public model IDs and declared efforts for the installed RSI endpoint."""
+    from scripts.evolve_llm import ENDPOINT_REF, model_request_config
+    from harness.registry import load_provider
+    params, _ = model_request_config()
+    return load_provider(ENDPOINT_REF, params).model_catalog()
+
+
+def rsi_command_summary(session_dir: str | Path, task: str, round: int = 0) -> dict | None:
+    """Bounded command/error counts without prompts, source pages or trajectories.
+
+    New rows carry sealed decision_flow. Older rows can be explained by their
+    matching audit; this is explicitly a diagnostic projection, never reward or
+    acceptance evidence. Missing/pruned request phases remain unknown.
+    """
+    doc = _campaign(session_dir, task)
+    directory = _campaign_dir(session_dir, task)
+    if doc is None or directory is None:
+        return None
+    number = int(round or doc.get('cursor', 0))
+    row = _round(session_dir, task, doc, number) or {}
+    llm = row.get('llm') or {}
+    if llm.get('decision_flow') is not None:
+        return {'round': number, 'source': 'sealed_row', **llm['decision_flow']}
+    path = directory / 'llm' / f'round-{number}.json'
+    try:
+        if path.stat().st_size > 2_000_000:
+            return None
+        audit = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not llm.get('prompt_sha') or any(audit.get(k) != llm.get(k) for k in ('prompt_sha', 'raw_sha')):
+        return None
+    requested, errors, phases = {}, {}, []
+    for event in audit.get('events') or []:
+        if event.get('type') == 'command':
+            op = (event.get('command') or {}).get('op')
+            if op in ('inspect', 'trial', 'choose', 'stop'):
+                requested[op] = requested.get(op, 0) + 1
+        if event.get('view') == 'error' and isinstance(event.get('result'), dict):
+            result = event['result']
+            error = result.get('error') or {}
+            key = ((result.get('previous_command') or {}).get('op'), error.get('type'),
+                   str(error.get('message') or '').split('\n')[0][:240])
+            errors[key] = errors.get(key, 0) + 1
+    for request in audit.get('requests') or []:
+        try:
+            message = next(m for m in request['messages'] if m['role'] == 'user')
+            phases.append(json.loads(message['content']).get('phase') == 'selection')
+        except (KeyError, StopIteration, ValueError, TypeError):
+            phases.append(None)
+    common = sorted(errors.items(), key=lambda item: -item[1])
+    return {'round': number, 'source': 'audit_summary', 'requested': requested,
+            'selection_calls': sum(phases) if phases and None not in phases else None,
+            'errors': [{'op': k[0], 'type': k[1], 'message': k[2], 'count': v} for k, v in common[:8]],
+            'other_errors': sum(v for _, v in common[8:])}
+
+
 def _open_brief(session_dir: Path, task: str) -> str | None:
     """The brief id (intake filename) of the evolve brief still driving ``task``
     -- ``processing/`` first, then ``inbox/`` -- or None. Read from the intake
@@ -1475,6 +1533,7 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
         open_brief = _open_brief(session_dir, task)
         out.append({
             "task": doc.get("task", task), "status": _live_status(doc, open_brief),
+            **{k: doc[k] for k in ("continuous", "stop_reason", "run_budget", "cycle_budget", "llm_config") if k in doc},
             "cursor": doc.get("cursor"), "rounds": len(rounds),
             "best": doc.get("best"), "seeds": doc.get("seeds"), "arm": doc.get("arm"),
             "published_rounds": [r["round"] for r in rounds if r.get("published")],
@@ -1564,6 +1623,8 @@ def _series(doc: dict) -> list[dict]:
         best = cur if best is None or (cur is not None and cur > best) else best
         out.append({**{k: r.get(k) for k in ("round", "before", "after", "best", "parent",
                                              "proposer", "outcome", "accepted", "published", "usage")},
+                    **{k: r[k] for k in ("evaluation", "transfer", "policy", "run_budget",
+                                       "cycle_budget", "cycle_outcome") if k in r},
                     "tried": _tried(r.get("tried")),
                     "node_rate": {"before": nb, "after": na, "best": best},
                     "by_task": {t: {"before": tb.get(t), "after": ta.get(t)} for t in sorted(set(tb) | set(ta))}})
@@ -1606,7 +1667,7 @@ def rsi_frames(session_dir: str | Path, task: str, round: int) -> dict:
 # ``{task, kind, payload, note}``; scripts/evolve.py consumes the oldest pending
 # one for its task at the start of each round and stamps ``applied`` in place.
 
-PROPOSAL_KINDS = ("tunables", "executor", "card")
+PROPOSAL_KINDS = ("tunables", "executor", "card", "plan")
 
 
 def _proposal_error(doc) -> str | None:

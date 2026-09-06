@@ -100,7 +100,7 @@ def test_recycle_cans_4243_never_retries_as_is_twice_stalls_early_and_recovers(t
     for e in stalled:
         tr = e["diagnostics"]["trace"]
         print("trace", e["node"], tr)
-        assert set(tr) == {"start", "stall", "end", "series"}, (e["node"], tr)
+        assert set(tr) == {"start", "stall", "end", "series", "groups", "sampling"}, (e["node"], tr)
         assert tr["stall"]["d_eef_target"] > D.tunables()["reach_tol"], (e["node"], tr["stall"])
         assert 0 < tr["stall"]["step"] <= tr["end"]["step"], (e["node"], tr)
     nudged = [e for e in events if e.get("kind") == "actuation_end"

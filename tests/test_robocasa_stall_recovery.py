@@ -60,17 +60,12 @@ def test_mounted_tunables_refuse_unknown_keys():
         D.mount_tunables(None)
 
 
-def test_card_tunable_hints_reach_the_proposer_through_mount_params():
-    hints = tomllib.loads(
-        (REPO / "plugins/embodiment_robocasa/manifest.toml").read_text())["tunable_hints"]
+def test_declared_card_parameters_reach_the_driver_through_mount_params():
     params = mount_params("plugins.embodiment_robocasa.recycle_driver:provider")
-    assert params["tunable_hints"] == hints
-    # the base-reach knobs lead: an out-of-reach drop point is fixed by parking closer
-    assert hints["reach_stall"][:4] == ["carry_stop", "nudge_max", "drop_edge_margin", "drop_over_dz"]
-    assert hints["nav_stall"][0] == "carry_stop"
-    assert set(sum(hints.values(), [])) <= set(MANIFEST_TUNABLES)
-    for k in ("drop_over_dz", "drop_edge_margin", "drop_spread", "drop_dz"):
-        assert isinstance(MANIFEST_TUNABLES[k], float), k
+    assert params["tunables"] == MANIFEST_TUNABLES
+    assert "tunable_hints" not in params
+    for key in ("drop_over_dz", "drop_edge_margin", "drop_spread", "drop_dz"):
+        assert isinstance(params["tunables"][key], float), key
 
 
 @pytest.mark.parametrize("task, node, mode, strategy", [
@@ -136,8 +131,8 @@ def test_unloaded_leg_that_stops_approaching_fails_with_nav_stall(monkeypatch):
     k = D.tunables()["stall_k"]
     for make in (lambda: D.NavigateDriver("stove"), lambda: X.NavToObjectDriver("stove", "can1")):
         base = [3.0, 0.0]
-        monkeypatch.setattr(D, "_base_pose", lambda env: (np.asarray(base, float), 0.0))
-        monkeypatch.setattr(D, "_eef", lambda env: np.array([base[0] + 0.4, base[1], 1.0]))
+        monkeypatch.setattr(D, "_base_pose", lambda env, base=base: (np.asarray(base, float), 0.0))
+        monkeypatch.setattr(D, "_eef", lambda env, base=base: np.array([base[0] + 0.4, base[1], 1.0]))
         monkeypatch.setattr(D, "_base_action", lambda env, gxy, yaw, grip: np.zeros(D.ADIM))
         nav = make()
         nav._goal = (np.zeros(2), 0.0)

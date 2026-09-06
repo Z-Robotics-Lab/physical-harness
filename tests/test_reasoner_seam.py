@@ -1,18 +1,7 @@
-"""R7: the reasoner seam is LIVE, model identity is content, the card degrades.
+"""The mounted LLM reasoner owns proposals; no implicit search path exists.
 
-Until R7 ``run_campaign`` hard-called ``propose_rule`` and the mounted
-``reasoner.proposer`` was never consulted -- a dead seam. This pins the fix:
-
-* a mounted reasoner is actually invoked by ``run_campaign`` and sees the brief;
-* the default (reasoner=None) path is byte-identical to the old direct call, so
-  every sealed campaign still rebuilds;
-* a reasoner's ``identity`` (the qwen card) enters the prereg content hash,
-  closing the QWEN38_MODEL/QWEN38_BASE_URL env-var smuggling;
-* a prereg that predates the ``reasoner`` field rebuilds byte-identical (fold);
-* the qwen card is doctorable (Tier A shape) and SKIPs loudly (Tier B) when its
-  endpoint is down -- exactly how scripts/round25_rerun degrades its qwen arm;
-* the enabled=false qwen card sits beside plugins/reasoner without tripping the
-  duplicate-capability guard, and does not move the base plan sha.
+Tests use the same registered fake endpoint as model-backed runtime tests and
+keep the real parser, campaign gates, artifact store, and workload wiring.
 """
 
 from __future__ import annotations
@@ -20,21 +9,29 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import json
+import pytest
 
-from harness.config import resolve_plan
 from harness.manifest import discover
 from plugins.rsi import gate
 from plugins.rsi.campaign import (
     CampaignStore,
     Preregistration,
-    propose_rule,
     run_campaign,
 )
-from profiles import base_profile
 from scripts.plugin_doctor import check
 
 _REPO = Path(__file__).resolve().parent.parent
-_SEALED_BASE_SHA = "b905a5119415de325c8c1d13f7c8a552eb3b2e8565e0a8af4ef7ca9c5f4c1a7c"
+_PROPOSAL = {"feature": "observable.finger_gap", "op": "lt", "threshold": 0.02,
+             "dwell": 1, "arm_after": 10, "reducer": "value", "recovery": "regrasp"}
+
+
+@pytest.fixture(autouse=True)
+def model_reply(tmp_path, monkeypatch):
+    path = tmp_path / "model-reply.json"
+    path.write_text(json.dumps(_PROPOSAL))
+    monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(path))
+    return path
 
 
 class _SerialExecutor:
@@ -71,21 +68,17 @@ def _prereg(**kw):
 
 
 class _RecordingReasoner:
-    """Records every brief it is handed, then defers to the deterministic
-    proposer so the campaign behaves exactly as the default would."""
+    """Record the live seam brief and delegate to the actual model adapter."""
 
     def __init__(self, identity=None):
+        from plugins.reasoner import provider
+        self.inner = provider()
         self.briefs = []
-        if identity is not None:
-            self.identity = identity
+        self.identity = identity or self.inner.identity
 
     def propose(self, brief):
         self.briefs.append(brief)
-        return {"rule": propose_rule(
-            brief["traces"], brief["labels"], generation=brief["generation"],
-            prereg=brief["prereg"], dev_specs=brief["dev_specs"],
-            executor=brief["executor"], workers=brief["workers"],
-            parent=brief["parent"], store=brief["store"])}
+        return self.inner.propose(brief)
 
 
 # --- (1) the seam is live: the mounted reasoner is invoked with the brief ----
@@ -104,27 +97,29 @@ def test_run_campaign_invokes_the_mounted_reasoner_with_the_brief(tmp_path, monk
     assert len(brief["traces"]) == len(brief["labels"]) == 40
 
 
-# --- (2) parity: the default seam path == the old direct propose_rule call ----
-
-def test_default_reasoner_is_byte_identical_to_the_old_direct_call(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate, "_run", _fake_run)
-    a = run_campaign(_prereg(), CampaignStore(tmp_path / "a"), workers=1,
-                     verbose=False, executor=_SerialExecutor())
-    b = run_campaign(_prereg(), CampaignStore(tmp_path / "b"), workers=1, verbose=False,
-                     executor=_SerialExecutor(), reasoner=_RecordingReasoner())
-    assert a["final_sha"] == b["final_sha"]
-    assert a["preregistration_sha"] == b["preregistration_sha"]
-    assert a["rules"] == b["rules"] and a["promoted"] == b["promoted"]
+def test_campaign_requires_an_explicit_reasoner_before_any_experiment(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_run", lambda _: pytest.fail("experiment must not run"))
+    with pytest.raises(ValueError, match="explicit LLM reasoner"):
+        run_campaign(_prereg(), CampaignStore(tmp_path / "a"), verbose=False)
 
 
-# --- (2b) the wired production path: rsi_run resolves+drives the mount ---------
-#
-# T3 completes what R7 left half-wired: plugins.rsi.workload.run (rsi_run) now
-# RESOLVES reasoner.proposer through the kernel and passes it to run_campaign, so
-# a mounted card is actually consulted in production and the base's audit trail
-# records the dependency. These two tests pin both halves end to end on a tiny
-# fake campaign: parity when the deterministic reference is mounted, and the seam
-# going LIVE when an identity-bearing card is mounted.
+def test_campaign_refuses_search_recovery_before_model_or_experiments(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_run", lambda _: pytest.fail("experiment must not run"))
+    reasoner = _RecordingReasoner()
+    with pytest.raises(ValueError, match="search_recovery.*LLM-only"):
+        run_campaign(_prereg(search_recovery=True), CampaignStore(tmp_path / "a"),
+                     verbose=False, reasoner=reasoner)
+    assert reasoner.briefs == []
+
+
+@pytest.mark.parametrize("identity", [None, "", "   "])
+def test_campaign_refuses_unattributed_reasoners_before_experiments(identity, tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_run", lambda _: pytest.fail("experiment must not run"))
+    reasoner = _RecordingReasoner()
+    reasoner.identity = identity
+    with pytest.raises(ValueError, match="non-empty reasoner.identity"):
+        run_campaign(_prereg(), CampaignStore(tmp_path / "a"), verbose=False, reasoner=reasoner)
+
 
 class _Env:
     def make_env(self, spec):
@@ -171,33 +166,21 @@ def _store_artifacts(root):
     return [(r["kind"], r["sha"]) for r in rows]
 
 
-def test_rsi_run_with_the_default_reasoner_card_is_byte_identical(tmp_path, monkeypatch):
-    """rsi_run with the DETERMINISTIC reference mounted (plugins.reasoner, no model
-    identity) must produce byte-identical store artifacts to run_campaign's
-    internal default -- i.e. wiring reasoner.proposer into the production path
-    moved no sealed artifact. Tiny fake campaign, no simulator."""
+def test_workload_and_direct_campaign_use_the_same_explicit_model(tmp_path, monkeypatch):
     import dataclasses
-
     from plugins.reasoner import provider as reasoner_provider
     from plugins.rsi import workload
 
     monkeypatch.setattr(gate, "_run", _fake_run)
-
-    kernel = _workload_kernel(reasoner_provider(top_k=3), "plugins.reasoner:provider")
+    kernel = _workload_kernel(reasoner_provider(), "plugins.reasoner:provider")
     workload.run(_prereg(), tmp_path / "wired", kernel, workers=1, verbose=False)
-
-    # the "before the wiring" baseline: run_campaign's internal default, driven
-    # with the SAME provider refs rsi_run stamps onto the preregistration.
     stamped = dataclasses.replace(
-        _prereg(),
-        env_provider=kernel.provider_ref("embodiment.env"),
+        _prereg(), env_provider=kernel.provider_ref("embodiment.env"),
         policy_provider=kernel.provider_ref("policy.driver"),
         percept_provider=kernel.provider_ref("percept.model"))
     run_campaign(stamped, CampaignStore(tmp_path / "base"), workers=1,
-                 verbose=False, executor=_SerialExecutor())  # reasoner=None default
-
-    assert _store_artifacts(tmp_path / "wired") == _store_artifacts(tmp_path / "base"), \
-        "wiring reasoner.proposer into rsi_run moved a sealed store artifact"
+                 verbose=False, executor=_SerialExecutor(), reasoner=reasoner_provider())
+    assert _store_artifacts(tmp_path / "wired") == _store_artifacts(tmp_path / "base")
 
 
 def test_rsi_run_drives_a_mounted_reasoner_that_declares_an_identity(tmp_path, monkeypatch):
@@ -233,9 +216,10 @@ def test_run_campaign_stamps_the_reasoner_identity_into_the_seal(tmp_path, monke
                        executor=_SerialExecutor(), reasoner=_RecordingReasoner(ident))
     prereg_art = store.read(res["preregistration_sha"])
     assert prereg_art["reasoner"] == ident
-    # and it actually moved the sha off the default-reasoner run's
+    # Different explicit model identities define different preregistrations.
     default = run_campaign(_prereg(), CampaignStore(tmp_path / "d"), workers=1,
-                           verbose=False, executor=_SerialExecutor())
+                           verbose=False, executor=_SerialExecutor(),
+                           reasoner=_RecordingReasoner("other-model"))
     assert res["preregistration_sha"] != default["preregistration_sha"]
 
 
@@ -277,15 +261,13 @@ def test_doctor_skips_the_qwen_reasoner_when_the_endpoint_is_down(tmp_path):
     assert b and b[0].status == "SKIP" and "unreachable" in b[0].detail
 
 
-def test_enabled_false_qwen_card_is_unfolded_and_sha_neutral():
-    """The committed card claims reasoner.proposer (plugins/reasoner owns it), yet
-    discover() does not raise and the incumbent still owns the seam -- because the
-    card is enabled=false. The base plan sha is untouched."""
+def test_enabled_false_qwen_card_leaves_the_llm_endpoint_adapter_mounted():
     reg = discover()                              # would raise on a folded duplicate
     reasoner_mounts = [m for m in reg.mounts if m.capability == "reasoner.proposer"]
     assert len(reasoner_mounts) == 1
     assert reasoner_mounts[0].provider == "plugins.reasoner:provider"
-    assert resolve_plan(base_profile()).sha() == _SEALED_BASE_SHA
+    assert reasoner_mounts[0].params["endpoint"] == "plugins.model_endpoint:provider"
+    assert "top_k" not in reasoner_mounts[0].params
 
 
 def test_qwen_provider_reports_a_model_identity():
@@ -296,3 +278,108 @@ def test_qwen_provider_reports_a_model_identity():
                       {"model": "qwen3-8b", "base_url": "http://h:30000/v1"})
     assert isinstance(p, Reasoner)
     assert "qwen3-8b" in p.identity and "h:30000" in p.identity
+
+
+def _model_artifact(store):
+    rows = [json.loads(line) for line in (store.root / "index.jsonl").read_text().splitlines()]
+    return store.read(next(r["sha"] for r in rows if r["kind"] == "model_proposal"))
+
+
+def test_endpoint_adapter_seals_raw_request_usage_and_validated_candidate(tmp_path, monkeypatch):
+    from plugins.reasoner import provider
+    monkeypatch.setattr(gate, "_run", _fake_run)
+    store = CampaignStore(tmp_path / "c")
+    reasoner = provider()
+    reasoner._ep.last_usage = {"prompt": 17, "completion": 9}
+    run_campaign(_prereg(), store, workers=1, verbose=False,
+                 executor=_SerialExecutor(), reasoner=reasoner)
+    audit = _model_artifact(store)
+    assert audit["status"] == "proposed"
+    assert audit["attempts"][0]["usage"] == {"prompt": 17, "completion": 9}
+    assert json.loads(audit["attempts"][0]["raw"]) == _PROPOSAL
+    prompt = json.loads(audit["attempts"][0]["messages"][1]["content"])
+    assert "regrasp" in prompt["recovery_strategies"]
+    values = prompt["observed_values"]["observable.finger_gap"]
+    assert values["success"]["quantiles_0_25_50_75_100"] == [0.04] * 5
+    assert values["failure"]["quantiles_0_25_50_75_100"][0] < 0.006
+    assert values["failure"]["samples"] == 1200
+    assert audit["identity"] == reasoner.identity
+
+
+@pytest.mark.parametrize("response,status", [
+    ({"kind": "none", "reason": "no supported change"}, "abstained"),
+    ({"feature": "invented"}, "rejected"),
+])
+def test_none_and_validation_exhaustion_leave_audited_nulls(response, status, model_reply, tmp_path, monkeypatch):
+    from plugins.reasoner import provider
+    model_reply.write_text(json.dumps(response))
+    monkeypatch.setattr(gate, "_run", _fake_run)
+    store = CampaignStore(tmp_path / "c")
+    result = run_campaign(_prereg(), store, workers=1, verbose=False,
+                          executor=_SerialExecutor(), reasoner=provider())
+    audit = _model_artifact(store)
+    assert audit["status"] == status
+    assert result["rules"] == [] and result["promoted"] == 0
+    assert len(audit["attempts"]) == (1 if status == "abstained" else 2)
+
+
+def test_model_error_is_sealed_then_raised_without_substitute(tmp_path, monkeypatch):
+    from plugins.reasoner import provider
+    monkeypatch.setattr(gate, "_run", _fake_run)
+    reasoner = provider()
+    def fail(*args, **kwargs):
+        raise OSError("endpoint unavailable")
+    monkeypatch.setattr(reasoner._ep, "chat", fail)
+    store = CampaignStore(tmp_path / "c")
+    with pytest.raises(OSError, match="endpoint unavailable"):
+        run_campaign(_prereg(), store, workers=1, verbose=False,
+                     executor=_SerialExecutor(), reasoner=reasoner)
+    audit = _model_artifact(store)
+    assert audit["status"] == "error"
+    assert audit["error"] == {"type": "OSError", "message": "endpoint unavailable", "stage": "request"}
+    assert len(audit["attempts"]) == 1 and audit["attempts"][0]["raw"] is None
+
+
+def test_registered_but_unobserved_feature_is_not_an_admissible_proposal(model_reply, tmp_path, monkeypatch):
+    from plugins.reasoner import provider
+    model_reply.write_text(json.dumps({**_PROPOSAL, "feature": "privileged.object_z"}))
+    monkeypatch.setattr(gate, "_run", _fake_run)
+    store = CampaignStore(tmp_path / "c")
+    result = run_campaign(_prereg(critic_budget=1), store, workers=1, verbose=False,
+                          executor=_SerialExecutor(), reasoner=provider())
+    audit = _model_artifact(store)
+    assert audit["status"] == "rejected" and result["rules"] == []
+    assert audit["rejections"] == ["feature is not in the observed catalog"] * 2
+
+
+def test_recovery_catalog_is_scoped_to_the_executing_embodiment(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_run", _fake_run)
+    reasoner = _RecordingReasoner()
+    store = CampaignStore(tmp_path / "c")
+    result = run_campaign(_prereg(env_provider="plugins.embodiment_robocasa:provider"),
+        store, workers=1, verbose=False, executor=_SerialExecutor(), reasoner=reasoner)
+    assert "regrasp_kitchen" in reasoner.briefs[0]["strategies"]
+    assert "regrasp" not in reasoner.briefs[0]["strategies"]
+    assert result["rules"] == []
+    assert _model_artifact(store)["status"] == "rejected"
+
+
+def test_default_card_doctor_never_calls_a_model_without_traces(monkeypatch):
+    from plugins.reasoner import provider
+    reasoner = provider()
+    monkeypatch.setattr(reasoner._ep, "chat", lambda *_args, **_kwargs: pytest.fail("no network for shape"))
+    assert reasoner.propose({"task": "shape-only"})["status"] == "not_evaluated"
+    assert check(_REPO / "plugins" / "reasoner").green
+
+
+def test_endpoint_params_follow_the_installed_manifest(monkeypatch):
+    import plugins.reasoner as module
+    seen = []
+    class Endpoint:
+        identity = "test-model"
+    monkeypatch.delenv("PH_MODEL_ENDPOINT_FAKE")
+    monkeypatch.setattr(module, "mount_params", lambda ref: {"model": "installed-model"})
+    monkeypatch.setattr(module, "load_provider", lambda ref, params: seen.append((ref, params)) or Endpoint())
+    reasoner = module.provider()
+    assert seen == [("plugins.model_endpoint:provider", {"model": "installed-model"})]
+    assert "installed-model" in reasoner.identity

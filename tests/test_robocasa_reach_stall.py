@@ -40,7 +40,7 @@ def test_unreachable_drop_stalls_early_and_recovers(monkeypatch):
         assert diag["failure_mode"] == "reach_stall"
         tr = diag["trace"]   # the numeric stall geometry a proposer reads
         print("trace", tr)
-        assert set(tr) == {"start", "stall", "end", "series"} and 0 < tr["stall"]["step"] <= steps
+        assert set(tr) == {"start", "stall", "end", "series", "groups", "sampling"} and 0 < tr["stall"]["step"] <= steps
         assert tr["stall"]["d_eef_target"] > 2.5 and tr["stall"]["target"][0] == pytest.approx(far[0], abs=1e-3)
         assert len(tr["stall"]["base"]) == 3 and len(tr["stall"]["eef"]) == 3
         # the per-step series: a place stage commands the ARM only, so the base pose it

@@ -242,7 +242,12 @@ def test_run_campaign_grows_a_generation_onto_the_seeded_parent(tmp_path, monkey
     place = _place_prereg(tmp_path / "stack", child.sha(), critic_budget=0)
     store = CampaignStore(tmp_path / "place")
     seeded = _seed_from_parent(place, verbose=False)  # what run_campaign starts from
-    run_campaign(place, store, workers=1, verbose=False, executor=_SerialExecutor())
+    from plugins.reasoner import provider
+    response = tmp_path / "model-reply.json"
+    response.write_text(json.dumps({"feature": "observable.finger_gap", "op": "lt", "threshold": 0.02,
+                                    "dwell": 1, "arm_after": 10, "reducer": "value", "recovery": "replace"}))
+    monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(response))
+    run_campaign(place, store, workers=1, verbose=False, executor=_SerialExecutor(), reasoner=provider())
 
     index = [json.loads(line) for line in store.index_path.open()]
     gen = next(store.read(r["sha"]) for r in index if r["kind"] == "generation")

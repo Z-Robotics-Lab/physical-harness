@@ -318,12 +318,10 @@ class CompositePolicies:
     driver armed with the owning mission's stage table."""
 
     def __init__(self, stages: dict[str, tuple[Any, int]], identity: str,
-                 tunables: dict | None = None, tunable_hints: dict | None = None) -> None:
+                 tunables: dict | None = None) -> None:
         self._stages = stages
         self._identity = identity
         D.mount_tunables(tunables)  # the card's [tunables] (+ an evolve trial's overlay)
-        # tunable_hints rides the same mount (manifest.mount_params); only evolve's
-        # proposer reads it -- accepted so the card's mount shape stays one dict.
 
     def make_driver(self, spec: Any) -> CompositeStageDriver:
         return CompositeStageDriver(self._stages, self._identity)

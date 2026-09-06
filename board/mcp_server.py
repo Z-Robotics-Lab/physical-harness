@@ -207,14 +207,16 @@ def rsi_frames(task: str, round: int, name: str = _DEFAULT_SESSION) -> dict:
 @mcp.tool()
 def submit_proposal(proposal: dict, session: str = _DEFAULT_SESSION) -> dict:
     """Drop one proposal for the lightweight evolve loop into
-    ``runs/<session>/proposals/``: ``{"task": <task>, "kind": "tunables"|"executor"|"card",
+    ``runs/<session>/proposals/``: ``{"task": <task>, "kind": "tunables"|"executor"|"card"|"plan",
     "payload": {...}, "note": <why>}``. scripts/evolve.py consumes the oldest pending
     one for its task at the start of each round (sealed as ``rsi_proposal_applied``)
-    and tries it INSTEAD of its built-in proposer; it still publishes only when the
-    same-seed success count improves. Payloads: tunables ``{ref, path:[...], to,
-    node?}``; executor ``{to, node?}``; card ``{path: plugins/candidates/<name>, to:
-    <executor key>, ref: "module:attr", params?, node?}``. ``node`` defaults to the
-    suite's commonest first-death node. Records are never written here."""
+    and evaluates it instead of asking the LLM for a candidate that round. It uses
+    the same installed capability validation and fixed paired verification vector;
+    development acceptance never installs a skill. Payloads: tunables
+    ``{ref, path:[...], to, node}``; executor ``{to, node}``; card
+    ``{path: plugins/candidates/<name>, to: <executor key>, ref: "module:attr", params?, node}``;
+    plan ``{graph: <full graph>}``. Action candidates require an explicit observed
+    node; there is no automatic target or rule-based fallback."""
     path = bs.safe_child(_Cfg.runs, session, bs.is_session)
     return bs.submit_proposal(path, json.dumps(proposal)) if path else {"error": "unknown session"}
 

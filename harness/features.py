@@ -75,11 +75,6 @@ def register(feature: Feature) -> Feature:
     return feature
 
 
-def observable_names() -> list[str]:
-    """Catalog entries a zero-privilege critic may read."""
-    return sorted(n for n, f in REGISTRY.items() if f.privilege is Privilege.OBSERVABLE)
-
-
 def privilege_cost(names) -> int:
     """Budget consumed by a critic reading `names`.
 

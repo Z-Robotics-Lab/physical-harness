@@ -18,6 +18,7 @@ import pytest
 
 from harness import Kernel
 from harness.definitions import CAPABILITIES
+from harness.events import SessionLog
 from plugins.graphs import InMemorySkillGraph
 from plugins.rsi import governed
 from plugins.task import workload
@@ -199,8 +200,8 @@ class _FakeExecutor:
         return [fn(item) for item in items]
 
 
-def _kernel(skill_graph=None) -> Kernel:
-    k = Kernel(CAPABILITIES)
+def _kernel(skill_graph=None, log=None) -> Kernel:
+    k = Kernel(CAPABILITIES, log=log)
     k.provide("task.planner", _EpisodicPlanner(), ref="tests.fakes:planner")
     k.provide("graph.scene", _FakeScene(), ref="tests.fakes:scene")
     k.provide("graph.skill", skill_graph or InMemorySkillGraph(),
@@ -561,3 +562,129 @@ def test_segment_retry_reuses_valid_graph_without_calling_planner(monkeypatch):
     assert out["replans"] == 0 and planner.calls == 1
     assert HET_DRIVER.entered == ["go", "pick", "pick"]
     assert out["faults"][0]["node"] == "grab"
+
+
+def test_replanner_observes_the_world_left_by_failed_sampling(monkeypatch):
+    _fresh()
+    _PLACE_ON_ATTEMPT['b'] = 2
+    seen = []
+    original_plan = _EpisodicPlanner.plan
+
+    def drive(*args, **kwargs):
+        result = _fake_drive(*args, **kwargs)
+        WORLD.obs['placed'] = sorted(WORLD.placed)
+        return result
+
+    def snapshot(self, obs):
+        return {'frame': 'world', 'nodes': [], 'relations': [],
+                'has_observation': 'a_pos' in obs, 'placed': list(obs.get('placed', []))}
+
+    def plan(self, brief):
+        seen.append(json.loads(json.dumps(brief['scene'])))
+        return original_plan(self, brief)
+
+    monkeypatch.setattr(governed, 'governed_segment', drive)
+    monkeypatch.setattr(_FakeScene, 'snapshot', snapshot)
+    monkeypatch.setattr(_EpisodicPlanner, 'plan', plan)
+    out = workload.run(_brief(), _kernel(), seed=42, max_replans=2, max_actuations=20)
+    assert out['success'] is True
+    assert [scene['has_observation'] for scene in seen] == [True, True]
+    assert [scene['placed'] for scene in seen] == [[], ['a']]
+    assert WORLD.resets == WORLD.closes == 1
+    assert _ATTEMPTS == {'a': 1, 'b': 2}
+
+
+@pytest.mark.parametrize('phase', ['scene', 'planner', 'dispatch', 'verify_seal', 'terminal_seal'])
+def test_persistent_episode_closes_on_each_raising_execution_path(monkeypatch, phase):
+    _fresh()
+    monkeypatch.setattr(governed, 'governed_segment', _fake_drive)
+    error = RuntimeError(f'fixture {phase}')
+
+    def fail(*args, **kwargs):
+        raise error
+
+    kernel_log = SessionLog()
+    kernel = _kernel(log=kernel_log)
+    if phase == 'scene':
+        monkeypatch.setattr(_FakeScene, 'snapshot', fail)
+    elif phase == 'planner':
+        monkeypatch.setattr(_EpisodicPlanner, 'plan', fail)
+    elif phase == 'dispatch':
+        monkeypatch.setitem(workload._KIND_HANDLERS, 'segment', fail)
+    else:
+        original = kernel.note
+        def note(kind, data):
+            if kind == ('task.verify' if phase == 'verify_seal' else 'task.terminal_observation'):
+                raise error
+            return original(kind, data)
+        monkeypatch.setattr(kernel, 'note', note)
+    with pytest.raises(RuntimeError) as raised:
+        workload.run(_brief(), kernel, seed=42, max_actuations=20)
+    assert raised.value is error
+    assert WORLD.closes == 1
+    assert not any(r['kind'] == 'task.plan_complete' for r in kernel_log.rows())
+
+
+def test_cleanup_attempts_every_factory_without_hiding_the_execution_error(monkeypatch):
+    from types import SimpleNamespace
+    _fresh()
+    closed, contexts = [], []
+    error = RuntimeError('fixture executor failed')
+
+    def close_env():
+        WORLD.closes += 1
+        closed.append('env')
+        raise OSError('fixture environment close failed')
+
+    def close_first():
+        closed.append('first')
+        raise OSError('fixture factory close failed')
+
+    def dispatch(node, ctx):
+        contexts.append(ctx.episode)
+        ctx.episode.factories.update(first=SimpleNamespace(close=close_first),
+                                     second=SimpleNamespace(close=lambda: closed.append('second')))
+        raise error
+
+    monkeypatch.setattr(WORLD, 'close', close_env)
+    monkeypatch.setitem(workload._KIND_HANDLERS, 'segment', dispatch)
+    with pytest.raises(RuntimeError) as raised:
+        workload.run(_brief(), _kernel(), seed=42)
+    assert raised.value is error
+    assert 'cleanup also failed' in str(error.__notes__)
+    assert closed == ['env', 'first', 'second']
+    contexts[0].close()
+    assert WORLD.closes == 1 and closed == ['env', 'first', 'second']
+
+
+def test_cleanup_error_on_success_is_not_sealed_as_a_completed_plan(monkeypatch):
+    _fresh()
+    monkeypatch.setattr(governed, 'governed_segment', _fake_drive)
+    def fail_close():
+        WORLD.closes += 1
+        raise OSError('fixture close failed')
+    monkeypatch.setattr(WORLD, 'close', fail_close)
+    kernel_log = SessionLog()
+    kernel = _kernel(log=kernel_log)
+    with pytest.raises(OSError, match='fixture close failed'):
+        workload.run(_brief(), kernel, seed=42, max_actuations=20)
+    assert WORLD.closes == 1
+    assert not any(r['kind'] == 'task.plan_complete' for r in kernel_log.rows())
+
+
+@pytest.mark.parametrize('phase', ['reset', 'driver', 'observe'])
+def test_episode_initialization_failure_releases_its_acquired_environment(monkeypatch, phase):
+    _fresh()
+    error = RuntimeError(f'fixture {phase} initialization failed')
+    def fail(*args, **kwargs):
+        raise error
+    if phase == 'reset':
+        monkeypatch.setattr(WORLD, 'reset', fail)
+    elif phase == 'driver':
+        monkeypatch.setattr(governed, 'make_driver', fail)
+    else:
+        monkeypatch.setattr(DRIVER, 'observe_once', fail)
+    with pytest.raises(RuntimeError) as raised:
+        workload.run(_brief(), _kernel(), seed=42)
+    assert raised.value is error
+    assert EMB.makes == WORLD.closes == 1

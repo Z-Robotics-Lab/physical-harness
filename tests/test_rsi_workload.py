@@ -82,8 +82,7 @@ def _kernel_with_fakes() -> Kernel:
     k.provide("percept.model", _FakePercept(), ref="tests.fakes:percept")
     k.provide("exec.rollouts", _FakeExecutor(), ref="tests.fakes:executor")
     k.provide("graph.skill", InMemorySkillGraph(), ref="plugins.graphs:skill_graph_provider")
-    # The deterministic reference (no model identity): workload.run resolves it
-    # for the audit trail and falls through to run_campaign's internal proposer.
+    # Even a test reasoner without identity must be forwarded explicitly.
     k.provide("reasoner.proposer", FakeReasoner(), ref="harness.fakes:reasoner_provider")
     return k
 
@@ -123,6 +122,7 @@ def _fake_run_campaign_factory(captured: dict, *, second_generation_promoted: bo
                           reasoner=None):
         captured["prereg"] = prereg
         captured["store"] = store
+        captured["reasoner"] = reasoner
         # Mirror the real run_campaign: the sealed prereg payload is _hash_payload
         # (round-90 fields fold out at their defaults), so prereg_sha == prereg.sha().
         prereg_sha = store.put("preregistration", prereg._hash_payload())
@@ -332,7 +332,7 @@ def test_mount_plan_sha_present_when_kernel_mounted_a_plan(tmp_path, monkeypatch
         Mount("percept.model", "plugins.embodiment_robosuite.percept:provider"),
         Mount("exec.rollouts", "harness.executor:provider"),
         Mount("graph.skill", "plugins.graphs:skill_graph_provider"),
-        Mount("reasoner.proposer", "plugins.reasoner:provider", {"top_k": 3}),
+        Mount("reasoner.proposer", "harness.fakes:reasoner_provider"),
     )))
     kernel.mount(plan)
 
@@ -362,7 +362,7 @@ def test_mount_plan_sha_is_path_portable(tmp_path, monkeypatch):
             Mount("exec.rollouts", "harness.executor:provider"),
             Mount("graph.skill", "plugins.graphs:skill_graph_provider",
                   {"root": str(out / "skills")}),
-            Mount("reasoner.proposer", "plugins.reasoner:provider", {"top_k": 3}),
+            Mount("reasoner.proposer", "harness.fakes:reasoner_provider"),
         ))))
         workload.run(_prereg(), out / "store", kernel, workers=2, verbose=False)
         return kernel.resolve("graph.skill", consumer="test").skills()[0]["mount_plan_sha"]
@@ -639,3 +639,13 @@ def test_campaign_completion_enters_the_session_chain(tmp_path, monkeypatch):
     assert resolve_kinds.index("capability.resolve") < resolve_kinds.index("rsi.campaign_complete"), \
         "the completion must sit downstream of the resolutions in the same chain"
     assert log.verify(), "the combined ledger no longer verifies"
+
+
+def test_workload_forwards_identityless_reasoner_without_selecting_an_alternative(tmp_path, monkeypatch):
+    kernel = _kernel_with_fakes()
+    expected = kernel.resolve("reasoner.proposer", consumer="test")
+    captured = {}
+    monkeypatch.setattr(campaign, "run_campaign",
+        _fake_run_campaign_factory(captured, second_generation_promoted=None))
+    workload.run(_prereg(), tmp_path / "store", kernel, workers=1, verbose=False)
+    assert captured["reasoner"] is expected

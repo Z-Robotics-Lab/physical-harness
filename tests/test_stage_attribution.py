@@ -75,9 +75,14 @@ def _prereg(stages: tuple[StageSpec, ...] | None) -> Preregistration:
 
 def _campaign(tmp_path, monkeypatch, stages):
     monkeypatch.setattr(gate, "_run", _fake_run)
+    from plugins.reasoner import provider
+    response = tmp_path / "model-reply.json"
+    response.write_text(json.dumps({"feature": "observable.finger_gap", "op": "lt", "threshold": 0.02,
+                                    "dwell": 1, "arm_after": 10, "reducer": "value", "recovery": "regrasp"}))
+    monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(response))
     store = CampaignStore(tmp_path / "store")
     result = run_campaign(_prereg(stages), store, workers=1, verbose=False,
-                          executor=_FakeExecutor())
+                          executor=_FakeExecutor(), reasoner=provider())
     index = [json.loads(line) for line in store.index_path.open()]
     return store, result, index
 
@@ -119,11 +124,10 @@ def test_stages_none_writes_nothing_and_changes_nothing(tmp_path, monkeypatch):
     """Round 78's byte-identity discipline at the artifact layer: a stages=None
     campaign's index carries exactly the expected kinds and the result dict
     exactly the legacy keys -- no stage artifact, no new key, no new config.
-    (tie_break is round 88 part C's selection audit, sealed every generation
-    regardless of the stage overlay.)"""
+    The model proposal audit is sealed independently of the stage overlay."""
     _store, result, index = _campaign(tmp_path, monkeypatch, None)
 
-    assert [r["kind"] for r in index] == ["preregistration", "tie_break", "generation",
+    assert [r["kind"] for r in index] == ["preregistration", "model_proposal", "generation",
                                           "campaign_result"]
     assert set(result) == {"preregistration_sha", "power_plans", "generations", "promoted",
                            "final_sha", "rules", "heldout", "heldout_vs_blind", "ablation"}

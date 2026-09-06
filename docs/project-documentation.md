@@ -47,6 +47,12 @@ physical-harness/
 │     opstream.py       活状态事件流（永不进链）
 │     manifest.py       discover()：折叠所有 card 的 manifest
 │     config.py         MountPlan.sha —— 配置即实验身份
+│     protocol.py       Legal(G)、replan 单调、技能图派生关系（§9）
+│     skill_library.py  记录加载 + bind_executors / executor_key / rearm
+│     skill_executor.py 执行器契约：InprocExecutor、is_segment、normalize_handshake
+│     executor.py       StepExecutor：段内一步一步驱动
+│     unified_skill_graph.py  RoboCasa365 标注图的只读读取（图在 ../sims/）
+│     media.py          段级视频/GIF 与失败关键帧（§4.0）
 │
 ├── plugins/          card —— 所有"具体"的东西
 │     embodiment_robosuite/    机械臂 + robosuite
@@ -60,16 +66,35 @@ physical-harness/
 │     planner_vlm/             VLM 生成 node graph
 │     policy_vla_remote/       VLA 策略走 websocket
 │     model_endpoint/          OpenAI 兼容 chat 客户端
+│     planner_library/         planner 外壳：runtime 真正挂的是它，binding 的 planner 当 inner
+│     reasoner/                LLM 提案缝（reasoner.proposer，经 ModelEndpoint，身份进入实验记录）
+│     executor_mcp_segment/    走 MCP 的段执行器（transport = mcp）
+│     skill_graph_robocasa/    图词表：授权参数 + 符号 oracle + canonical 别名
+│     graphs/                  两个 layer-2 快照缝：graph.skill / graph.scene
+│     benchmark_robocasa/      benchmark 声明（`[benchmarks.<name>]`，当数据读）
+│     skill_geometric_grasp/   零特权几何抓取 task binding
+│     skill_place/             claim-only 卡（place 是 stack 的 recovery，无 mount/binding）
+│     skill_toy/               最小演示卡：一条 task binding，零底座改动
+│
+├── governor/         候选语法与策略缝（SearchProposer 留作显式研究参考，不是运行默认或 fallback）
+├── skill-library/    技能记录的家（`records/<name>.json`，§9.7）
 │
 ├── board/            对 runs/ 的唯一 API，三个 face 字节等价
 │     store.py          实现
 │     storecli.py       CLI face
 │     mcp_server.py     MCP face（agent 用的就是这个）
+│     planning.py       skill_library / plan_skill_task / submit_skill_plan（§6.1.2）
+│     vault.py          build_graph：技能图（§9.10）
+│     cards.py          卡片清单
+│     report.py         报表
 │
 ├── scripts/          常驻进程和入口
 │     harness_runtime.py   常驻 runtime，盯 inbox
 │     cockpit             一键启动一切（含拉起 ph-station）
-│     rsi_campaign.py      RSI 七步链
+│     evolve.py            evolve 环路：轮次、计分、判定（§4.0）
+│     evolve_llm.py        LLM 取证/采样/选择、预算与审计（§4.0）
+│     evolve_evidence.py   按需证据与源码分页（§4.0）
+│     rsi_campaign.py      RSI 八步链
 │     frame_dump.py        画面、keyframe 和最新 rollout MP4
 │     plugin_doctor.py     card 体检
 │
@@ -99,6 +124,8 @@ ph-station/
 │     dsh-ph-board/        ← 唯一连接 physical-harness 的包
 │                            每个 @Remote 方法转发给 storecli
 │                            自动暴露 POST /api/board/<name>
+│     dsh-ph-brain/         「大脑」面板的规划 Remote：读 runs/<session>/skill_index.json，
+│                            按实测成功率挑执行器，出计划；派发仍走 ctx.board 的 submitBrief
 │
 ├── packages/client/      面板（全是渲染）
 │     ui-ph-livegraph/      执行图谱 + 过程流 + 取景窗/视频下载
@@ -108,6 +135,7 @@ ph-station/
 │                            + `evolve` 页（campaign 列表/轮次表/rsiSeries 折线/rsiFrames 路径；Start=submitBrief `{kind:evolve}`，Stop=cancelBrief）
 │     ui-ph-vault/          技能库
 │     ui-ph-battle/         Held-out 战报
+│     ui-ph-icons/          面板共用图标
 │     ui-ph-dash/           实验台（面板布局）
 │     ui-conversation/      对话
 │
@@ -153,7 +181,7 @@ face 必须**响亮地失败**，而不是被截断成一个静默的空面板�
 面白等了 490 轮）。桥侧 `execFile` 的 maxBuffer 现在是 64 MB，比闸门高一个数
 量级；任何失败的调用文本直接渲染到页面上，不再退回空态。
 
-**面板只有三条写路径**：`submit_brief`（原子落 runtime 校验过的 inbox）、`submit_skill_plan`（规划面板的“执行”按钮：服务端重新核验一张已校验、全部叶子有 binding 的 skill plan，再投一张**普通** task brief，走同一条原子落盘，见 §6.1.2）和 `cancel_brief`（落取消标记，runtime 在下一个轮边界处理）；桥（dsh-ph-board）白名单里除此之外全是只读。规划本身（`plan_skill_task`）是读：不执行、不落盘。**没有认证层**：`trusted-host` 防的是 DNS rebinding，不是身份；服务绑`127.0.0.1`，`/api/board/*` 只读封存的 `runs/`。
+**桥（dsh-ph-board）白名单只有五条写路径**：`submitBrief`（原子落 runtime 校验过的 inbox）、`cancelBrief`（落取消标记，runtime 在下一个轮边界处理），以及 `modelServer` / `policyServer` / `restartServices` 三条服务进程开关（起停本机模型服务、pi0.5 策略服务，和 cockpit 自己的重启助手——都不写 `runs/` 证据）；白名单里除此之外全是只读。规划面板的“执行”按钮**今天还不存在**：`plan_skill_task`（读：不执行、不落盘）与 `submit_skill_plan`（服务端重新核验一张已校验、全部叶子有 binding 的 skill plan，再投一张**普通** task brief，走同一条原子落盘）只有 MCP 工具与 `storecli` 两面，桥上没有对应方法（见 §6.1.2）。**没有认证层**：`trusted-host` 防的是 DNS rebinding，不是身份；服务绑`127.0.0.1`，`/api/board/*` 只读封存的 `runs/`。
 
 **天花板（已标注）**：每个面板请求一个 Python 子进程，冷导入
 `board.store → harness.events.SessionLog`。人类节奏的轮询下够用；真测出慢了再把
@@ -164,6 +192,7 @@ bridge 升级成常驻读进程，面板和 CLI face 都不用改。
 | 功能 | 归属 | 为什么 |
 |---|---|---|
 | 任务图怎么拆 | physical-harness（planner） | 是能力，不是显示 |
+| 技能图词表、叶子 bound 不 bound | physical-harness（`plugins/skill_graph_robocasa` + `plugins/task/skill_planning.py`） | 标注不是控制器，能不能派发是能力判断 |
 | 统计检验、gate 判定 | physical-harness（plugins/rsi） | TypeScript 里不许有统计 |
 | seed 账本、burn 检查 | physical-harness（runtime） | 决定结论有效性 |
 | 什么算成功 | physical-harness（predicate/oracle） | 是证据 |
@@ -190,10 +219,24 @@ physical-harness。不会 → ph-station。
 操作员只用 UI，所以 cockpit 负责拉起**一切**：
 
 ```bash
-scripts/cockpit          # 常驻 runtime ×3 + ph-station UI @ :3080，全部留活
+scripts/cockpit          # 常驻 runtime ×4 + ph-station UI @ :3080，全部留活
 scripts/cockpit --status # 只打印健康，什么都不启动；exit 1 = 有问题（见 §8）
 scripts/cockpit --stop   # 只停本次调用启动的进程（按 pidfile 里的精确 PID）
 ```
+
+其余 flag（`scripts/cockpit` 帮助块的全表）：
+
+| flag | 做什么 |
+|---|---|
+| `--port N` | 控制台端口。缺省取 `.env` 的 `PH_CONSOLE_PORT`，再缺省 3080 |
+| `--trusted-host H` | 额外信任经该 host 进来的网关请求。dsh 只绑 127.0.0.1，浏览器在另一台机器上时配合 socat 之类的转发用。缺省取 `.env` 的 `PH_TRUSTED_HOST`，无则不设 |
+| `--no-render` | 有 `$DISPLAY` 也照样无头派生（缺省是 `$DISPLAY` 在时才 `--render`） |
+| `--no-runtime` | 一个 runtime 都不领养、不派生，只起 web 控制台 |
+| `--with-robocasa` | **接受即忽略**：`session-robocasa` 现在默认就开。留着只为旧命令行还能跑；解释器用 `ROBOCASA_PYTHON=…` 覆盖（缺省 `$REPO/../sims/robocasa-venv/bin/python`） |
+| `--with-model` | 顺带起本地模型服务（llama.cpp @ 127.0.0.1:30001），等它答 `/v1/models` 再服务。**默认关**；`.env` 的 `PH_WITH_MODEL=1` 打开 |
+| `--with-policy` | 顺带起 pi0.5 策略服务（openpi venv 下的 `scripts/serve_vla_openpi.py` @ 127.0.0.1:8000，checkpoint 取 `PH_POLICY_CHECKPOINT`）。**默认关**；`.env` 的 `PH_WITH_POLICY=1` 打开 |
+| `--restart [--build]` | 见下 |
+| `--build` | 只与 `--restart` 搭配：先在 `$PH_STATION` 跑 `pnpm build` |
 
 - **`--restart [--build]`**（控制台「重启」/「重建并重启」两个按钮 → MCP `restart_services(build)`
   → `board.store.restart_services`）：先 `setsid` 脱离再返回（按按钮的那个控制台马上就要被
@@ -202,9 +245,14 @@ scripts/cockpit --stop   # 只停本次调用启动的进程（按 pidfile 里�
   （pi0.5 由操作员手动起，绝不默认）。进度写 `runs/restart.log`，`health().restart` 读它
   （`state: idle|running|failed|done` + 最后一行），控制台回来后面板照此显示。
 
-它起三个常驻 runtime：`runs/session-main`（.venv，robosuite，`--frames`）、
-`runs/session-robocasa`（robocasa venv，无头 egl）、`runs/session-robocasa-rsi`
-（robocasa venv，`--mode evolution --frames`，默认开——进化态 brief 只能投这里）。
+它起四个常驻 runtime：`runs/session-main`（.venv，robosuite，`--frames`，有 `$DISPLAY`
+时才带本地窗口）、`runs/session-main-rsi`（.venv，robosuite，`--mode evolution --frames`，
+无头 egl）、`runs/session-robocasa`（robocasa venv，`--frames`，无头 egl）、
+`runs/session-robocasa-rsi`（robocasa venv，`--mode evolution --frames`，无头 egl）；四个
+默认全开，加上 web 控制台一共 5 个进程。**进化态 brief 按 sim 分投**：robosuite 的
+（`{"kind":"rsi","task":"stack"}`，§4.5 的例子）投 `session-main-rsi`，robocasa 的投
+`session-robocasa-rsi`——执行与进化永不共用一个常驻 runtime。两个 robocasa runtime 在
+robocasa venv 缺席时一起跳过（一条警告），其余照起。
 
 - **领养或派生**：先扫 `ps` 找该 session 目录上活着的 runtime，找到就**领养**
   （打印 PID，不重启，不记进 `--stop` 名单），没有才 `nohup` 派生并记 PID。
@@ -229,8 +277,13 @@ scripts/cockpit --stop   # 只停本次调用启动的进程（按 pidfile 里�
 无治理路径。
 
 - 渲染出来的每一条路径都由仓库根推导，所以 clone 到哪都能用。
-- 可变项——backbone `base_url` / model id / 显示名 / `apiKeyEnv`、控制台端口、可选
-  trusted host——来自仓库根 git-ignored 的 `.env`（`.env.example` 已提交并逐项注释）。
+- 可变项来自仓库根 git-ignored 的 `.env`（`.env.example` 已提交并逐项注释）：backbone
+  `base_url` / model id / 显示名 / `apiKeyEnv`，控制台的 `PH_CONSOLE_PORT` 与
+  `PH_TRUSTED_HOST`，服务开关 `PH_WITH_MODEL` / `PH_WITH_POLICY` 与
+  `PH_POLICY_CHECKPOINT`，以及路径覆盖 `PH_PYTHON` / `PH_MCP_SERVER` / `PH_RUNS`。
+- **`PH_NO_RENDER=1`** 单列：它让 `session-main` **即使有 `$DISPLAY` 也保持无头**。
+  本地 MuJoCo 窗口叠加 `--frames`（浏览器取景窗）会在 robosuite 的离屏渲染里 segfault，
+  而 LAN 上的操作员本来也看不见那个窗口。命令行的 `--no-render` 对单次启动做同一件事。
 - `.env` 同时是控制台自己的凭据层：dsh 解析 key 的优先级是 进程环境 >
   `$DSH_HOME/.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`，而 cockpit 在
   `exec node … web` 前会 `cd` 到仓库根，所以 `<cwd>` 是确定的。
@@ -415,24 +468,23 @@ PYTHONPATH=. .venv/bin/python -m pytest -o addopts="" -q -m "not robosuite and n
 test_grasp_geometric.py      camera env unavailable
 test_grasp_geometry.py       camera env unavailable
 test_reducers.py             cloned weights not present
-test_plugin_doctor.py        robocasa unimportable (robocasa venv only)
-test_robocasa_card.py        robocasa unimportable (robocasa venv only)
-test_robocasa_drivers.py     robocasa unimportable (robocasa venv only)
-test_robocasa_marker.py      robocasa unimportable (robocasa venv only)
-test_robocasa_missions.py    robocasa unimportable (robocasa venv only)
-test_runtime_frame.py        robocasa unimportable (robocasa venv only)
-test_libero_marker.py        libero unimportable (libero venv only)
 test_rsi_workload.py         runs/campaign-pj-scripted not present
+test_skill_planning.py       generated unified_skill_graph.json not present
+test_planning_faces.py       generated unified_skill_graph.json not present
+test_unified_skill_graph.py  generated unified_skill_graph.json not present
+test_evolve_llm_e2e.py       opt-in: one real DeepSeek call
+test_libero_marker.py        libero unimportable (libero venv only)
 AST green                    test_boundaries + test_kernel
-deselected                   robosuite-marked items
+deselected                   robosuite- 与 robocasa-marked items
 ```
 
 （policy_remote extra 已安装时，其 2 个 live-socket 测试参与运行。）
 
-**全量对照（卡在场）**：同一条命令在 harness `.venv` 里跑，robosuite 在场。区别只在于
-robocasa 标记项没有 robocasa 可导入而跳过，只在 `sims/robocasa-venv` 里经
-`pytest -m robocasa` 跑；libero 标记项同理只在 `sims/libero-venv` 里跑；camera-env 跳过项
-在卡在场时变成通过。跳过清单之外出现新的跳过或任何失败，才是需要看的信号。
+**全量对照（卡在场）**：同一条命令在 harness `.venv` 里跑，robosuite 在场。robocasa 标记项
+在这条命令里被 `-m "not robocasa"` **反选**掉（隔离与全量两边都是），只在 `../sims/robocasa-venv`
+里经 `pytest -m robocasa` 跑；libero 标记项没有被反选，`test_libero_marker.py` 照样跳过，真正的
+libero 用例只在仓库内的 `sims/libero-venv` 里跑。所以两边唯一的区别是 camera-env 跳过项在卡在场时变成
+通过。跳过清单之外出现新的跳过或任何失败，才是需要看的信号。
 
 ### 3.3 fresh clone 的合法差异
 
@@ -457,76 +509,49 @@ clone 合法地显示**更多跳过，绝不是失败**：
 实现：`scripts/rsi_campaign.py`（链本体）+ `scripts/harness_runtime.py`（brief 面）。
 通用路径里**没有任何任务名 if 分支**——任务是参数，加任务仍然是装一张卡。
 
-### 4.0 轻量 evolve 循环
+### 4.0 仿真中的在线程序策略学习
 
-`kind:"rsi"` 是重链（下面 4.1–4.5）。旁边还有一条**轻量**循环，不做候选分类、不做晋级状态机、不加门禁，harness 不训练：
+`kind:"evolve"` 使用执行 harness 作为实验器，在仿真中采样、读取真实奖励反馈并更新高层程序策略。LLM 决定读取哪些证据、试验什么修改、沿哪个候选继续以及何时提交完整评估。在线更新限于仿真开发环路；`kind:"rsi"` 的预注册、blind twin、held-out 和感知降级验证仍是正式安装所需的独立流程。开发接受不会写入技能库，也不会把短期成功冒充安装证据。
 
+```json
+{"kind":"evolve","task":"kitchen_thaw","seeds":[420011,420012],"continuous":true,"rounds":0,"arm":"auto","max_model_calls":8,"max_input_bytes":96000,"max_probe_episodes":3}
 ```
-{"kind":"evolve","task":"kitchen_thaw","seeds":[lo,hi],"rounds":N,"arm":"auto"}
-```
 
-只在进化态被接受（与 campaign/rsi 同一道拒绝）；runtime `_run_evolve` 起 `scripts/evolve.py` 子进程（走 `_run_watched`，取消/killpg 复用）。`rounds` 是**有真实试验的轮数目标**（`tried.kind:none` 的轮不计）；**缺省 0 = 无上限**（控制台的开始/继续就是这样投的），只有停止按钮（cancel 标记，落在轮边界，等待期间也立即生效）能结束：模型一轮拿不出方案时不停，节流后继续（`NONE_BACKOFF_S`：60 s 起逐轮翻倍到 600 s 封顶，`live.phase:"waiting"`，下一次真实试验归零）；显式 `rounds>0` 的有界投递保留旧规则（连续 `MAX_NONE`=2 轮 none → `status:done`）；none 的 `needs` 为空（每颗种子都成功，无事可解）两种模式都立即完成，`seeds`/`arm` 续投时可省（取 campaign.json 里的）。
+只有 evolution runtime 接受此 brief（`scripts/harness_runtime.py` 的 `_run_evolve` 把它起成一个受看管的 `scripts/evolve.py` 子进程；LLM proposer 本体是 `scripts/evolve_llm.py`）。自主提案只使用 LLM；`proposer` 可省略或写 `llm`，`rules` 会被拒绝，没有规则回退。`rounds>0` 限制本次提交完成的学习周期数（包括无更新的周期），历史 cursor 只作编号；`rounds:0` 不设周期数上限。`continuous:true` 显式开启持续运行，每周期使用独立小预算，直到用户取消或出现服务、执行基础设施、磁盘等终止条件。省略或设置 `continuous:false` 时，多周期共享本次提交的总预算，预算耗尽结束。控制台默认明确提交持续模式，也可选择有限周期。`llm_propose` 必须接入实测 trial、choose 和 projection 回调，不再保留独立的单轮提案执行路径。模型使用 `inspect → trial → choose/stop` 协议；`stop`、选择 incumbent、拒绝候选或本周期预算耗尽只结束当前周期。外层调度器决定是否继续，模型不能终止整个持续任务。每周期保留已验证 incumbent、实测工作分支和简短 `cycle_context`；总结携带上轮 memo、原因以及连续未采样、未验收、未更新周期数，完整聊天不跨周期复制；有界源码工作集只保留仍匹配策略、绑定和内容哈希的原文页，随工作区重置失效。每个周期结束后直接进入下一周期，没有额外等待；周期边界检查用户取消，零额度或无法容纳一次模型请求的预算仍会终止，避免无有效调用的空转。模型加载或 API 调用失败则封存 `outcome:error`、`llm.status:error` 及错误阶段/类型/信息，campaign 标为 failed，brief 失败；不会产生替代候选或新经验。`cancel_brief` 的取消有独立结束状态，绝不计作实验失败。续投从 campaign cursor 继续；代码、绑定或评测协议变化会开启新 epoch，原始轮次和旧 applied 状态保留在历史中，不沿用旧分数。
 
-一轮：
-1. **看**：同种子 suite（与 task brief 同一条 `_mount_plan → workload.run` 路径）→ 每种子首死节点、fault `{kind,node,msg}`、每节点 executor。
-2. **试**（内置 proposer，按序取第一个可行的）：① 首死节点换 executor —— 绑定 policy 的 record `evidence.by_executor` 成功率高于实测者优先，否则 record 上任一本轮之前没试过的其它绑定 executor（无证据也诚实试一次）；② 该节点驱动 mount 参数一维 ±30% 扰动（`[tunables]` 表或顶层数值）：卡的 `[tunable_hints]` 把首死节点的 `failure_mode` 映到先试的键（其余按名序），每个键先 −30% 再 +30%（int 保持 int，原地不动的步跳过），history 里已试过的 (键, 方向) 不重试；经 `PH_MOUNT_PARAMS_OVERRIDE` 并进 `manifest.mount_params`（按已接受的 `applied` 算起点，不是上一轮未发布的试验）；`tried.detail` = `{skill,executor,ref,path,from,to,hint: failure_mode|null}`；③ 都没有 → `kind:"none"` 并写明原因，`detail.needs` 列出能解锁的项（`tunables on <ref>` / `evidence for another executor` / `proposal`）。
-**候选卡的边界体检**：`scripts/plugin_doctor` 现在对每张卡（含模型写的候选）查导入边界——只许 harness/governor/numpy/stdlib、自己的包、manifest 里声明的 `third_party`，禁止 import 兄弟卡（卡之间只按 ref 相互到达）。patch 卡是某个模块的**副本**，`write_patch` 在它的 manifest 写 `patched_from = "<原卡>"` 并把原卡的 `third_party` 与该模块自身的导入根一起并进去，所以副本合法地 import 原包。`tests/test_boundaries.py` 只扫**已安装**的卡（`plugins/candidates/` 是运行产物、git-ignored），候选卡的违规由体检拦下而不是测试套件。
+**采样与策略更新。** `plugins/rsi/learner.py` 管理当前策略及临时工作分支。每个策略 ID 由冻结评测身份和完整程序 overlay 计算。`trial` 在模型选择的已声明开发种子上从 reset 运行一次，返回固定评测向量、相对当前策略的增益/回退、节点行为变化和证据引用。探针完成后，下一次决策立即看到该候选的新世界观测；省略父策略时仍从当前正式策略开始。一次 probe 不晋级；零收益的候选仍可成为下一次修改的父策略，让多项修改组合后再观察反馈。模型 `choose(policy_id)` 后，完整组合策略从 reset 跑同一批开发种子，与当前策略配对比较。该结果直接用于接受判定，不重复跑一遍。只有通过判定的完整 overlay 才成为后续轮次的当前策略。同一次运行、同一 incumbent、评测身份和开发种子范围内，工作分支跨周期保留；周期边界保留最近的完整祖先路径，最多12个未接受策略和48条成功测量回执。周期预算和当前回执重新计数，历史实测不会冒充本周期新增采样；相同策略与种子的重复请求复用测量，换种子会更新最新观测并保留原有祖先关系。选择或组合分支前重新验证祖先代码身份。接受新 incumbent 或改变评测身份、种子范围会重新建立工作区；进程重启后只保留精简实验记忆，历史策略 ID 不成为可执行父级。记忆按评测、策略与种子去重，最多24条，保留具体参数路径、改前/改后值、父策略、测量引用与重复次数，程序改动以内容哈希引用。模型据此总结已测事实、尚未排除的组合与下一项实验；中性单项不自动否定多项组合。不保存模拟器 checkpoint，也不训练模型权重。
 
-**LLM proposer**（`scripts/evolve_llm.py`，brief 键 `proposer: "llm"`（默认）| `"rules"`）：内置规则之前先让模型读本轮、定下一试。投影 `rsi_projection` = task/seeds/arm、轮史（每轮 tried + before→after + 每种子首死/failure_mode + proposer）、本轮每种子节点轨迹（哪些节点过了、死在哪、failure_mode、steps、fault）、首死节点驱动的 tunables（ref、path 前缀、当前值、`[tunable_hints]`）、该 skill 绑定的 executors 及其 `by_executor` 证据、已消费的收件箱提案、上一轮 `needs`、日志摘录（每种子死亡节点的 `task.fault` / `task.verify` 行，全 suite ≤60 行）、`output_schema`（`PROPOSAL_SCHEMA`），以及写卡所需的一切：`card_template`（ref / skill / embodiment / transport 都是**具体值**，embodiment 为 record 绑定键如 `robocasa`）、`executor_contract`（StepExecutor：`handshake`→`normalize_handshake("inproc", REF, meta)`、`reset`、`bind(env, target)`（stage driver 在 `enter_segment(..., executor=)` 后调用，kitchen_driver / stage_extras.CompositeStageDriver 同一 seam）、`act(obs)`→12 维 env 动作、`done`、`diagnostics`）、`reference_card`（`plugins/candidates/grasp_geometric_robocasa` 全文）、`scripted_driver_source`（首死 skill 的 stage driver 类源码，取自驱动模块 `_STAGES` 表）、`primitives`（本体 `drivers` 模块的常量与函数签名/docstring，按 ref 取用）、`obs_keys` / `action_order`（`vla_io`）；总量以 `PROMPT_CHARS`（120k 字符 ≈48k token；一轮值几分钟仿真，材料给足）为界，超出按序削：先日志摘录、再旧轮 per_seed、最后驱动源码。传输 = `plugins.model_endpoint` 卡（按 ref 挂载，卡声明的参数，缺省 DeepSeek preset；key 走 env → `~/.dsh/.credentials.yaml`，只进 Authorization 头；`PH_MODEL_ENDPOINT_FAKE` 时走 fake；请求带 `thinking:{type:disabled}`——DeepSeek 的推理 token 计入 max_tokens，曾把 content 吃空）。允许的回答与收件箱同形：`{kind: tunables|executor|card|none, payload, summary(中文 1–3 句), rationale}`；tunables 的 ref 必须是投影里的驱动 ref，executor 的 to 必须是已绑定的另一个键；`card` = code-as-policy：`{name, files:{"manifest.toml","__init__.py"}, to, ref}` 写进 `plugins/candidates/<name>/`（`PH_CANDIDATES_ROOT` 可改；文件名只能是裸文件名，ref 必须落在该目录内），先过 `scripts/plugin_doctor`（`[executors.*]` 的 ref 现在是 Tier A 必须能 load）→ 干实例化 `dry_run`（按 ref 挂载、`make_driver(None)`、须是 Step/SegmentExecutor 且 `handshake()` 的 transport 一致）→ **只跑第一颗种子**的预飞（执行器内抛异常 / 动作形状错 → traceback）→ 才经 `PH_PLUGINS_EXTRA` 挂进本轮 suite（预飞那颗种子的结果并入复测，不重跑）。**修复回合**：回答不合法 / `none` 但还有没试过的（call-1 brief 的 `untried`：首死节点上不在已试集合里的每个 (knob,方向)、还没试过的绑定 executor、没打过 patch 时 `first_death.modules` 的每个 `patch <module>`——驳回文逐条列出，要求模型挑一个或在 rationale 里说明每一条为何无用；解释照样只挡一次，第三次回答仍答 none 就如实收下并记下 rationale，`MAX_NONE` 不变） / (knob,方向) 或 executor 本战役已试过（轮史 `tried.detail` 的 `path`/`from`/`to`、`to`，加本轮先前被拒的回答；驳回文列出已试过的与仍没试过的键和方向） / doctor 红 / 干实例化不合格 / 预飞抛错 → 原文错误作为下一条 user 消息发回模型，每轮最多 `MAX_ATTEMPTS`=3 次回答（审计文件 `attempts:[{raw,reason,usage}]` 逐次保留，`usage` 累计）；用尽 → `tried.kind:"none"`、reason `llm: N answers rejected; last: <原文>`、`needs` 带该原因，文件保留给操作者。端点不可达 → 退回规则 proposer，轮行 `proposer:"rules"` 并把原因写进 `llm.reason`。
-**轮换与卡死**：一轮的**目标节点**不再是「最常见首死节点」，而是本轮各种子**互不相同**的首死节点里**最久没被针对**的那个（`scripts.evolve.death_nodes`：按上次被针对的轮号、再按死种子数、再按名序；brief 键 `death_nodes:[{node,seeds,failure_mode,rounds_targeted}]` 与 `target:{node,why}`），所以 4243 死在 drop-can1、4244 死在 nav-can1 时两个节点轮流拿到轮次；模型 payload 里的 `node` 仍可覆盖（必须是本轮跑过的节点），不写就落在目标节点上。同一节点连续 `STUCK_ROUNDS`（=6，brief 键 `stuck_rounds`；中间针对别的节点的轮不打断计数）被针对且没有变好 → brief 多一个 `stuck:{node,rounds,tried,modules,note}`：明说该节点的参数扰动已用尽（`tried` 列出已试过的 (knob,方向)/executor），并把该卡 stage 流水线的**其它**模块（stage 表模块、共享 `drivers`、任务 planner —— `scripts.evolve.pipeline_modules`）并进 `first_death.modules`，patch 这一轮可以点名它们；轮行同时记 `stuck:{node,rounds}|null`。首死驱动的每个 (knob,方向) 都试过时 brief 加一句`exhausted:"tunables exhausted for <node>: ..."`，`untried` 里也不再有 tunables 项（只剩 executor / patch）。
-**patch 答案与两步提问**：第五种答案 `patch` = `{name, module, edits:[{old,new}], to}`——对首死 skill 卡的**一个**模块（`first_death.modules`）做**精确片段替换**：`old` 必须从材料里的 `module_sources[module]`（该模块**全文**，每行带 `NNNN| ` 行号前缀，`first_death.modules_full` 说明哪些是全文、哪些是类/函数摘录）逐字抄下并去掉行号前缀，且在该模块中**只能出现一次**：先精确匹配，精确落空再退到**宽松匹配**（逐行忽略行首缩进与行尾空白，仍须唯一命中，`new` 按文件实际缩进平移），命中方式记进 `tried.detail.match:["exact"|"lenient"]`；两种都不唯一即驳回，驳回文给出次数与**整个所在函数**（定位不到函数时给类，两者都没有才是 ±6 行）的带行号全文。材料另带 `functions:{"模块:类.方法": 源码}`（键里的模块就是 `module` 该填的值）——**可改的每个模块**的每个类/函数（首死 stage 类优先，其余按模块源码由小到大填到 `FUNCTION_CHARS`=30k 为止），与 `module_sources` 同一份代码但**没有行号前缀**，`old` 从这里直接复制粘贴（线上 6 轮里 4 轮死在「`old` occurs 0 times」，就是照着行号文本重打的；还有一轮目标节点是 nav、模型却要改 drop 的类，材料里没有那个类，它就凭空编了一段）。`name` 与 `to` 是记账用的标识，模型不写就自动取 `patch_r<轮号>`（线上模型把 3 次机会里的 2 次花在补这两个键上）。`old` 在所填模块里找不到、却在 `first_death.modules` 的另一个模块里**恰好出现一次**时，驳回文直接点名那个模块（线上第 102 轮就是把逐字抄对的 `PointPlaceDriver._act` 发给了错的模块）。`apply_edits` 施改；给 `diff`（unified diff，`apply_diff` 按上下文行精确匹配）仍然受理。结果落在 `plugins/candidates/<name>/<module>.py` **副本**上（对本体包的 import 改写为 importlib by-ref；模块若读自身 manifest 则复制 `[tunables]`），生成 manifest `[executors.<to>]` + `PATCH_CARD` 卡：executor 在 `bind(env)` 时调用已装模块 `_STAGES[task]` 工厂、把补丁副本里的类（及以它们为基类的子类）临时换入构造，得到打补丁的 stage 实例并走原生 executor seam 驱动；已装卡文件不动（测试按哈希断言）。**已知限制**：被改模块里的类若在**另一个模块**被子类化、且子类方法用零参 `super()`，`_repoint` 重建出的子类会让那句 `super()` 抛 `TypeError: super(type, obj): obj must be an instance or subtype of type`（方法里的 `__class__` 闭包仍指向旧类）——真跑第 72 轮改 `drivers.py` 就撞在 `stage_extras.NavToObjectDriver` 上，预飞如实退回给模型。之后与 card 同一条 doctor → dry_run → 预飞 → 复测 → publish 路径，`tried.kind` 记为 `card`，`detail.module/edits`（或 `diff`）留底。**重复回答**：某次回答的 payload 与本轮已被驳回的某条**逐字节相同**（`none` 除外，它本就没有 payload）时不算一次 attempt——回一句「你重复了一条已经被拒的回答（<原因>）。必须换一个做法……」；第二次仍然相同就当轮收场，`tried.kind:"none"`、reason `llm: repeated the same rejected answer`（审计文件 `repeats:[{raw,reason}]`）。
-**看见自己的补丁跑成什么样**：brief 的**第一行**（`Round input` 之前）是 `trial_evidence` 的中文渲染（`scripts.evolve.trial_evidence` 的结构化度量 → `evolve_llm._trial_line`）：「你上一轮的补丁跑了：种子 4243 在 drop-can1 抛 AttributeError: '_last_d'（recycle_driver.py:212）」/「种子 4243 在 nav-can1 跑到第 41 步，d_eef 最小 0.570→0.550，底盘仍未移动，与基线逐步完全相同＝你的改动没有生效」——此前模型只看得到 score 0→0，不知道自己的代码跑没跑、崩没崩、改动有没有生效。**修复回合只谈它自己写的代码**：预飞里的 `SelfCheckError`（静态自检，见上）按原文回传、不裹 traceback（并点明这正是运行时会抛的 AttributeError），真抛异常时回传异常＋`_own_code` 从**候选副本**里截出它自己那几行（带行号，traceback 帧与自检点名的行，最多 3 段），而不是让它回去读已装源码重写。规则里多一张**补丁自检清单**：新状态必须在类**已有的** `__init__`/reset 里初始化（`first_death.state_init` = `{"模块:类.方法": [已赋的属性]}`）、不许调用没定义的方法、`old != new`、不许重复被拒过的回答。**跨轮防循环**：最近 5 条被拒 payload 的哈希从各轮审计文件读回（`attempts[].sha` → `_prior_rejects`），后面的轮再发同一条即驳回并点名「第 N 轮已经提过同一条回答并被拒：<原因>」，第二次相同就当轮收场；同一节点连续 3 轮死于运行时错误时 brief 多一条 `repeat_failure`，要求改小（一个阶段、一个守卫、不引入新状态）或换 death_nodes 里的另一个节点。
-提问分两步以省 token：call 1 只发**精简 brief**（`brief`，≤ `BRIEF_CHARS`=12k 字符：近 5 轮详情 + 更早轮次计数、每种子轨迹与首死节点 `trace`（含 `series`）/`geometry`/`upstream`、关键帧、tunables+hints、executors 证据、needs；超限先削日志摘录再削轮次 per_seed），要 `{decision, summary, rationale, payload?}`；decision ∈ {card, patch} 时发 call 2：静态**代码材料**（`MATERIAL_KEYS`：contract、card_template、reference_card、驱动源码、`module_sources`（每个可改模块的全文，带 1 起行号，总量 ≤ `MODULE_CHARS`=60k 字符：stage 类自己的模块必定全文，其余先全文后按顶层类/函数摘录）、primitives、obs/action）作为固定消息插在 system 之后、brief 之前（供前缀缓存命中），再追加"给出完整 payload"。模型**没等材料就凭空写了** patch/card payload（线上就是这样编出一段不存在的源码）时，该回答照常被驳回，材料随这次修复消息一并插入——材料每轮只发一次。用量按轮累计；审计文件记 `calls`、`brief`、`materials` 与完整消息列表。
-轮行新增 `proposer: llm|rules|inbox` 与 `llm: {summary, rationale, model, prompt_sha, raw_sha, reason}|null`（提案为 tunables 时 `tried.detail.from` = 该 knob 的当前数值，经 `mount_params` 查得，未知则 null）（收件箱提案时 null；永不含 key）；原始回答与 prompt 存 `campaigns/evolve-<task>/llm/round-<r>.json` 供审计，不进链。live 在 propose 阶段显示「LLM 分析第 r 轮…」。`rsi_step` 原样带出 `proposer` / `llm`；`rsi_series` 只带 `proposer`（`llm` 的正文随整轮走 `rsi_run(round=<n>)`）。
-3. **同种子再跑**，试验已应用（executor 经 `scripts.evolve:planner_provider` 盖进 `node.executor`）。
-4. **成功种子数变好才发布**：带实测 `by_executor` 行（tunables 还有新值）的 record 走 `InMemorySkillGraph.publish` —— 与 `publish_plans` 同一道进化态专用门；否则不发布。试验抛异常 → 记 `tried.detail.error`，after=before，不崩。
-**先确认再发布**（ASPIRE 的 debug/eval 种子分离，轻量版；brief 键 `confirm_seeds`，默认 2，0 关闭）：调试种子上变好的试验，再用块上方紧邻的 `confirm_seeds` 个 scratch 种子（`[hi+1, hi+n]`，不烧账本，不录媒体）跑一次同一 overlay，只有不差于已接受状态在这些种子上的成绩才发布；已接受状态的成绩每个 campaign 只测一次，缓存在 campaign.json `confirm_base:{seeds,count}`（发布后即更新为试验的成绩）。轮行 `confirm:{seeds,before,after}|null`，live 阶段 `confirm`（「新种子确认」）。
-**分层诊断（Zetta，自上而下）**：brief 带固定的 `layers` 阶梯——evaluation（判据/oracle 对不对）→ plan（图/节点序对不对：少一个 nav 节点、上一段停的位置这一段根本够不着）→ state（目标/几何对不对）→ recovery（修复对不对）→ parameter（调 knob，最后手段）；回答多一个 `layer` 字段（`LAYERS` 之一，非法值即驳回），rationale 要给证据链。**高层能解释就绝不改参数**：目标节点的 `exhausted` 已置位时，parameter 层的回答（不带 layer 的 tunables 决定同样算）被驳回，驳回文点名四个更高层及各自的问句。轮行与 `rsi_step` 记 `layer`。
-**里程碑与失败簇**：每颗种子按其节点轨迹＝里程碑链呈现，`first_missing_milestone` = 第一个没走完的节点（最早可观测偏离），有成功参照索引（campaign.json 的 `reference`）时再给该里程碑上的数值 `divergence:{指标:{seed,reference,delta}}`（指标取该节点 steps 与停滞 trace 末帧的标量）；失败种子按 (首个缺失里程碑, failure_mode) 聚成 `clusters`，本轮针对的那簇写在 `target.cluster`。
-**历史回归**（发布前，先于新种子确认）：试验变好时把**起源簇**（基线轮里首个缺失里程碑相同的全部种子）整簇重算 `regression:{seeds,before,after,lost}`——复测本就跑遍每颗 dev 种子且 dev 区间只增不减，故直接读两次 suite，不重跑；`lost` 非空（掉了一颗已经赢下的簇内种子）即挡住发布，哪怕总数变好。
-**held-out 烧毁**：确认种子挡下一次发布 ⇒ 它逼出了后续修改，就地并入 dev 区间（`seeds[1]` 抬到它，下一轮自动抽新的确认种子，`confirm_base` 随之重测），轮行记 `burned:[种子]`。
-**梯度进 brief**：投影带顶层那条 `last_outcome` 外加一句人读的 `says`——「上一轮（第 86 轮）：plan card，score (0, 9, 0) → (0, 11, 0)，种子 4243 的死亡点从 drop-can1 前移到 nav-can1 = 变差（未接受…）」（前移=变差、后移=变好）——以及 `score_definition` 与 `accepted_stack:{note,changes}`（campaign.json 的 `accepted_stack` 缺席时退回已 accepted/published 的轮）。规则明说：成功数全 0 时唯一的梯度是里程碑，优先让最远到达的里程碑再前进一步，绝不拿已通过的节点去换目标节点；**已接受的改动就是新 baseline**，再提一遍同一条 patch（同 module + 同 edits）当场驳回。
-**实验笔记本**：回答可带 `notes`（中文 1–3 句，本轮学到什么），落在轮行 `notes`，brief 里以 `notebook`（最近 10 条）回灌，模型不必每轮重推同一个结论。
-**分数与两级接受**（本轮的梯度）：一次 suite 的成绩是可逐位比较的元组 `score = (成功种子数, 里程碑数 = 各种子 ok 节点数之和, target_pass = 目标节点通过的种子数)`（`scripts.evolve.score`）。**修复节点不算里程碑**：`recover-<节点>`（或 kind 为 `recovery` 的轨迹行）只在某节点失败后才被规划器插入，把它算进里程碑等于给「需要一次恢复」的跑法比「不再需要恢复」的跑法打更高分。整任务成功率长期是 0/2，单看它没有梯度：死亡点**前移**的候选必须判为变差。轮行记 `before_score`/`after_score`（`before`/`after` 仍是成功数，供画图），`outcome` 按元组算（>/</= → improved/worse/same）。
-**接受（accept）≠ 发布（publish）**，两级分开：`after_score > before_score` **且**没有任何种子把原本通过的节点丢掉（`scripts.evolve.regressions` 逐节点比 ok 图，两种情况不算丢：试验根本没跑的种子（聚焦试验），以及**因为被修复的节点现在通过了、所以整个消失的修复节点**——补丁修好了 `drop-can1`，`recover-drop-can1` 就不再被插入，把它读成回归曾把 recycle_cans 战役里 8 个确实变好的轮（131…389，里程碑 9 → 13…18，target_pass 0 → 1）全部驳回；跑了又失败的修复、被修复节点仍然失败的修复、以及计划悄悄丢掉的普通节点，照旧算回归；新种子确认挡下的也不接受）→ 该轮 **accepted**：改动进 `applied`（tunables overlay + 候选卡）与 campaign.json 的 `accepted_stack:[{round,kind,detail,score}]`，**成为下一轮的 baseline**（此前 90 轮每轮都从同一个基线重来）；轮行记 `accepted`/`accepted_reason`，`parent` 指向上一个 accepted 轮，`rsi_campaigns` 摘要加 `accepted_rounds:[轮号]`（与 `published_rounds` 并列）。把证据写回 skill 记录（`InMemorySkillGraph.publish`）**规则不变**：仍要整任务成功数变好并过回归/确认门；部分胜利只进本战役的已接受状态，不进已装记录。
-**按节点聚焦试验**：一轮的试验先只跑目标节点 X 的失败簇种子（`focus_seeds`，即 `cluster_seeds` 落在 dev 区间内的部分）并计分；X 在这些种子上**一颗都没通过**就到此为止（轮行 `trial:{scope:"focused",seeds,target_pass}`，未跑的种子沿用基线成绩参与打分），不再花整套 suite——省下的仿真秒数记在 `usage.sim_s_saved`；X 变好了才跑完整 dev suite（`scope:"full"`）再走原有的回归/确认/发布门。
-**上一轮的回音**：campaign.json 顶层 `last_outcome:{round,layer,kind,summary,before_score,after_score,outcome,accepted,accepted_reason,regressions:[{seed,node,was_ok_now_not}]}`，随投影进 brief，把「你的改动把种子 4243 的死亡点从 drop-can1 推回了 nav-can1」直说给模型。
-**试验自己的证据**（模型看见自己的代码在跑）：每轮试验（聚焦或整套）之后轮行多一项 `trial_evidence:{node,exception,seeds:[{seed,trace,geometry,diff}]}`——目标节点在每颗试验种子上的逐步 `series`/`geometry`（与基线同形）外加对**同种子基线行**的 `diff:{phase_changed（相位序列变了才给）,first_divergent_step,base_moved,d_eef_min_before/after,d_base_min_before/after,steps_before/after}`；执行器抛错（预飞、复测或确认 suite）时 `exception:{type,message,file,line,traceback(尾 15 行)}` 如实带上——过去一次 raise 只在 `tried.detail.error` 留一句 `repr(exc)`。`last_outcome.trial_evidence` 是同一份的**去 series 摘要**，随投影进 brief：下一轮模型读的是自己上一轮代码在仿真里的行为，而不是「0 → 0」。**已测限制**：`PATCH_CARD` 执行器驱动的 stage 在 `diagnostics` 里不带 `trace`，所以 patch 试验的**试验侧**只有 `steps_after` 与 `first_divergent_step`，`d_eef/d_base_min_after`、`base_moved`、`phase_changed` 全是 null（真跑第 114/115/116 轮 3/3 如此）；基线侧照常有。
-**下仿真前的静态自检**（`scripts.evolve.self_check`，doctor + dry_run 之后、预飞种子之前）：候选目录里每个 `.py`，类中读到的每个 `self.x` 必须在该类或它**可导入的基类**（含基类 `__init__` 里赋的实例属性）中被赋过——线上第 104/108 轮的 `self._last_d` / `self._replan` 正死在这里；`old == new` 的 edit 同样拒收。结论以与 doctor 同形的 `doctor:self-check ...` 在预飞里抛出，走同一条修复回合（patch 答案由 `write_patch` 更早拦下，这里是下仿真前的最后一道，也覆盖 `card` 答案）。**限制**：一次廉价的 AST 阅读，不是类型检查——只认字面量 `self.x` 与 `setattr(self,"x",…)`，基类导入不了的类整个跳过（宁可不判也不误判），不看类型、参数与控制流。
-**假设树**（ENPIRE）：轮行 `parent` = 本试验出发的已接受状态（上一个已发布轮号，0 = 基线），`outcome: improved|same|worse|none`（调试种子上 after 对 before；发布与否看 `published`）；`rsi_campaigns` 摘要加 `published_rounds:[轮号]`。只出数据，控制台画树。
-**利用率**（MRU/MTU）：轮行 `usage:{llm_tokens:{prompt,completion}|null, sim_s}`（模型回复的 `usage`，经 `model_endpoint` 卡的 `last_usage`；suite 墙钟秒数，含 confirm），`rsi_campaigns.usage` 求和，live 带 campaign 累计 `sim_s`。
+**取证成本。** 默认预算为 8 次模型调用、累计 96,000 输入字节、3 次单种子 probe；每次模型输出最多 4,096 tokens。有限模式将这些额度作为整个 brief 的总上限；持续模式将它们作为每个学习周期的上限，因此持续运行的总消耗没有预设上限，由用户停止。零预算或小到无法发起一次有效模型请求的预算直接终止，不能靠反复开周期空转。对应 brief 字段是 `max_model_calls`、`max_input_bytes`、`max_probe_episodes`、`max_output_tokens`。每次请求另有 24,000 字节上限，每页证据最多 8,000 字节。输入字节按 canonical UTF-8 JSON messages 计算，不是模型 tokenizer 数量或含 HTTP 选项的 wire 大小；真实 tokens 由 API usage 单独记录，缺测为 null。`cycle_budget` 记录当前周期的额度与消耗；`run_budget` 始终累计本次提交的总消耗，持续模式的总调用、输入和 probe 上限写为 null，不能把周期刷新显示成累计清零。`cycle_outcome` 区分本周期更新、无更新、放弃、额度用完和错误；`stop_reason` 只记录整个运行为何结束。失败请求也计入消耗。probe 预算不包含 baseline、被选策略的完整配对复测及开发确认，这些环境成本单独记录。
 
-每轮封存一行 `rsi_step {brief,task,round,tried,before,after,best,published,suite_sha,per_seed,needs,proposer,llm,parent,outcome,confirm,usage,layer,notes,regression,burned}`（`per_seed` = 保留 suite 的 `[{seed,success,first_death,failure_mode,tunables_sha}]`（首死节点跑在哪组 knob 下），`needs` 只在 `tried.kind:none` 时非空）（按 (task,round) 幂等，2 s 轮询时实时封存，退出时兜底），并 tmp+rename 写 `runs/<session>/campaigns/evolve-<task>/campaign.json`：
-`{task,session,seeds,arm,rounds:[{round,tried:{kind,node,detail},before,after,before_score,after_score,accepted,accepted_reason,trial,trial_evidence,best,suite_sha,published,parent,outcome,confirm,stuck,layer,notes,regression,burned,usage,per_seed,after_seeds,needs,media:[路径],media_dropped:{"种子/节点":{reason,keyframes}},ts,proposer,llm}],best,cursor,status:running|cancelled|done,applied:{executors,tunables},accepted_stack,last_outcome,confirm_base}`（`after_seeds` = 本轮试验 suite 的同形 per_seed，未发布时也留着）。
-`applied` 是已接受的状态，后续每轮重新应用；下一轮的 before 直接沿用上一轮保留的结果，不重测。
+每次决策直接接收已执行节点、有效参数和执行器目录、冻结奖励摘要，以及各节点采样运动的数值和覆盖率；不把诊断标签当作干预规则。未观测项保持 unknown，全部未执行的节点仅报告省略计数。请求中的节点目录保留当前技能、执行器及可直接使用的参数、执行器和可编辑模块名，相同能力只发送一次并由节点引用。模块、类、方法与 AST 位置从实际绑定导出，通过带内容哈希的 catalog 引用按需读取；`inspect {view:catalog,node}` 仅返回所选节点绑定的类和准确方法 ID，可直接用于 source.symbol。冻结评测保留身份、结果和条件数量，完整目标定义通过 evaluation 引用读取。每个采样决策最多使用两次成功的批量只读调用；参数错误且未返回任何证据时不扣读取额度，但模型调用与输入消耗照常计数。随后模型选择试验、提交已测策略或停止。只有新的实测 probe 才恢复只读预算，缓存和错误不恢复；后端不指定干预方向。 请求超过单次或剩余累计字节预算时，先把已保留源码正文替换为可重读引用，再按需把运动详情替换为 trace 引用；奖励反馈、策略身份和预算不删减，完整缓存与审计不变。精简后仍超限则明确停止，不增大预算或自动选择候选。模型可直接提出已声明参数或执行器试验，代码修改仍需读取同一父策略的源码或执行器契约。参数试验提交 `{node,parameter,to}`，后端从当前 binding 导出 provider 和路径，再走原有权限校验。
 
-**有界存储（`scripts.evolve.EvolveStore`）**：campaign.json 只留**表头 + 最近 `ROUNDS_KEPT`=20 轮的完整轮行**；更早的每一轮**整行写一次** `campaigns/evolve-<task>/rounds/<round>.json`（写入即冻结，永不重写），在 campaign.json 里只剩一条紧凑**索引行** `{round,sharded:true,tried_kind,node,tried:{kind,node,detail 去掉 edits},layer,notes,before,after,before_score,after_score,outcome,accepted,accepted_reason,published,parent,best,usage,proposer,needs,confirm,trial,stuck,regression,burned,suite_sha,proposal,ts,llm:{model,summary,reason},node_rate:{before,after},by_task:{任务:{before,after}},per_seed/after_seeds:[{seed,success,first_death,failure_mode}]}`——**没有 per-seed 节点轨迹**（活战役 42 MB 里 19 MB 是它）、没有 media 列表、没有卡片源码、没有模型原文。RSI 页面画整段历史要的东西（score 元组、outcome、accepted/published、`node_rate`、每个子任务的通过率）都在索引里**预先算好**，不必再开分片；`rsi_frames` 要的 media 与整行细节去读 `rounds/<n>.json`。第一轮是唯一保留轨迹的索引行：`cluster_seeds` 每轮都拿它算原始失败簇。写入不再缩进（索引不是给人 diff 的），长自由文本（notes / accepted_reason / reason / summary）截到 300 字符，全文留在分片里。
-**迁移**：加载时看到窗口之外还有未分片的轮，就地做一次原子迁移——原文件先整份拷成 `campaign.json.bak`，再写分片形状；加载器两种形状都读，迁移幂等（索引行认 `sharded`）。实测 490 轮的 recycle_cans：42 MB → 1.9 MB，加载 1.1 s，之后每次 tick 保存 0.02 s。
-**审计瘦身**（`prune_audits`）：`campaigns/<c>/llm/round-*.json` 只留最近 `AUDITS_KEPT`=50 份完整；更早的**改写成摘要**（round、decision、node、layer、summary、rationale、reason、usage、attempt 数、prompt/raw sha 以及每次被拒尝试的 `{sha,reason}`——`evolve_llm._prior_rejects` 回读的正是它），丢掉 messages / materials / raw 原文。选改写不选 gzip：老审计唯一被读的就是这份摘要（~1 KB vs 整份 ~285 KB、gzip ~40 KB）。**永不删除**，幂等（`pruned`）。实测 482 份 145 MB → 不到 1 MB。
-**候选卡回收**（`gc_candidates`，`python scripts/evolve.py --gc [--dry-run]`）：`plugins/candidates` 保留 ① git **跟踪**的手写卡（该目录整体 git-ignored，其余都是运行产物）、② `runs/` 下**任何** campaign 的 `applied` / `accepted_stack` / 已 accepted-published 轮行还引用的卡（发布必先被接受，所以已装记录的绑定绝不会被剪掉）、③ 其余里 mtime 最新的 `CANDIDATES_KEPT`=20 个；剩下的**从最旧开始**删，每删一个一行日志。卡库是仓库全局的、引用集却来自 campaign，所以每轮那次只在「session 在本仓库 `runs/` 下 **且** 卡根就是本仓库 `plugins/candidates`」时才跑——scratch runs（每个 e2e 测试）下一个也不删。git 答不上来（不是 checkout）时同样一个不删。
-**磁盘闸**（`disk_guard`）：每轮开始前先看 `runs/` 所在文件系统的剩余空间（下限 `MIN_FREE_BYTES`=5 GB）和本战役目录大小（上限 `MAX_CAMPAIGN_BYTES`=2 GB），越线就**不开这一轮**：`status:"paused_disk"`，live 消息与轮行都写明具体数字（轮行 `tried.kind:"none"`、`accepted_reason:"paused_disk"`、`paused_disk:<消息>`），进程 exit 4 → brief 报错停住。宁可响亮地停，也不要写满盘。
-**成功参照索引**（Zetta，轻量版）：campaign.json 顶层还有 `reference:{节点: {node,seed,steps,d_eef,d_base,round}|null}`——每个 segment 节点**最近一次通过**时的种子/步数/末端距离（null = 跑过但从未通过），跨轮累积、永不重置（`scripts.evolve.update_reference`，每轮用保留 suite 更新），随 doc 一并进 LLM 投影，做「健康基线」对照。
+`inspect` 支持一次提交最多四个相关只读请求：`args={requests:[{view,...},...]}`。所有页面共用工具字节限额，各自保留来源、哈希和续页位置。源码方法页携带原文，续页使用 `cursor=next`；同时提供 symbol 与绝对行号 start/end 会明确报错，不静默重读第一页。参数查询合并重叠代码片段，并按实际绑定类定位消费位置，静态表达式不冒充运行值。完整轨迹、计划和历史仍按需读取。证据只有结构化投影与分页读取一条路径，不再生成旧版全文 prompt 或重复的中文试验叙述；evaluation 页面可按 seed 读取独立评分、验证观测和终态观测，缺失读数保持缺失。本周期已有新的 probe 尝试且存在实测工作策略时，如果只剩一次模型调用、常规请求超过单次上限，或继续常规请求会侵占选择所需的累计输入预算，则同一工具循环发送精简的 selection 请求，只允许模型 choose/stop。该请求保留所有工作策略的条件比较、身份、预算和最近的选择错误，不加载源码或轨迹，不额外增加调用，也不自动选择候选。历史候选和缓存命中不触发这一限制；新周期仍可取证和试验。工作策略的长比较和改动详情在超限时转为带 policy_id 的 history 引用，保留可比较性和增益、回退数量；已有工作策略不再重复出现在历史回放中。若精简请求仍超限，仍按预算停止。每次请求重建，不累加完整聊天；最新工具页不再同时出现在保留页面中，最新工具页与保留页面合计不超过 8 KB，最近试验反馈优先保留。超出工作集上限的页面在修改缓存前拒绝，保留之前的证据和奖励反馈。模型的短 memo 用于保留观测和后续假设。同一工作区跨周期保留最多 8 KB 的有效源码页；策略被清理、绑定或源码变化时丢弃。只有实际发送的原文页可以恢复代码修改的取证资格，引用本身不授权。动态观测和工具错误不跨周期缓存为新事实。
 
-**进度（live）**：campaign.json 还带一个 `live` 块，每到阶段/种子/节点边界就随整个文件 tmp+rename 重写（单写者，无竞争）：`{phase: idle|baseline|propose|retest|confirm|publish|done|cancelled, round, sim_s, seeds_total, seed_index, seed, node, started_at, round_started_at, phase_started_at, last_round_s, per_seed_partial:[本次 suite 已跑完的 {seed,success,first_death,failure_mode}], tried, message:"第 1 轮 基线评测：种子 4244 运行中 (nav-can1) 节点 2/5，1/2", messages:[最近 20 条 {ts,text}，message 每变一次追加], nodes:[当前种子计划序的 {id,skill,ok:true|false|null,steps,failure_mode,after:[前驱节点 id],kind:segment|verify|decide|perceive|recovery,task:子任务标签}], seed_started_at}`。`nodes` 是当前种子的节点轨迹：`task.plan` 落地全为 null（replan 保留已 ok 的节点），`after`/`kind` 直接取自该 plan 图（replan 的新图整体替换边；replan 插入的修复节点以 `kind:"recovery"` 出现），前端可按此画成 DAG，每条 `task.verify` 落地填该节点的 ok（steps/failure_mode 取 verify 行的 diagnostics，今天没有则 null）；`node` = 计划序里第一个未 ok 的节点，是推断不是读数（没有 node-start 行）。
-每条 per_seed / after_seeds / per_seed_partial 行还带 `nodes:[{id,ok,steps,failure_mode,after,kind,task}]`（该种子轨迹的最终状态，steps/failure_mode 从结果补齐；`task` = 节点所属子任务标签 `scripts.evolve:node_group`：图带 mission `tasks` 时取节点的 `task`，否则取 id 首个 `-` 前的阶段词，nav-can1 → nav）和 `elapsed_s`；`rsi_campaigns` 的 `live` 摘要多一个 `nodes_done:"k/n"`。`rsi_run` 原样返回为 `live`（旧文件为 null）；它是活状态，`rsi_step` 只封轮行，永不封 live。
-**取景窗**：runtime `--frames`（egl 自动开）时给 evolve 子进程传 `PH_RSI_FRAMES=<session>/frame.jpg`，与 rsi 链同一把 `_maybe_arm_frames` 锁，suite 每集镜像到 `read_runtime_frame` 读的那份文件；帧永不进链。
+最近六条 probe 观测跨源码 epoch 保留，但携带原始评测身份；不同或未知身份明确标记 `transfer_only`，只供重新检验假设，不能直接成为父策略、接受证据或新评分。当前 `working_policies` 才是可执行策略目录，其中包含 incumbent。目录保留每个候选逐 seed 相对 incumbent 的实测比较：`comparable`、带 obligation ID 和原始前后值的 gains/regressions、比较理由；不可比较的结果不伪装成零收益。同一策略和 seed 去重，源码与轨迹不随目录重复发送，probe 明确标记为未验收。选择 incumbent ID 等同本周期不更新并保留当前策略，不重复评测或晋级，也不终止整个持续运行。只读额度与 `probe_budget` 独立：只读耗尽仍可采样，仿真报错也会消耗探针并在下一请求反映已用预算。probe 与完整评测都核对实际返回的种子集合；空批次、错种子、多余或重复种子记为采样错误，仍计入已用预算，不建立可选策略。采样决策默认使用 off effort；RSI 的“模型设置”页可选择同一已配置 endpoint 的模型 ID 和声明的 effort，通过 brief 的 `llm_model`、`llm_effort` 传递，仅在下一次开始或继续时生效。可选模型来自 endpoint 的 `/models`，允许填写未列出的实验模型 ID；effort 的请求参数由 model_endpoint 卡的 `reasoning_efforts` 声明，未支持的值明确拒绝，不静默降级。每次输出仍受原有 token 上限约束；辅助审计记录最终操作、请求、工具结果与用量，不保存或重放内部推理文本。每轮另封存 `llm.decision_flow`，统计请求、执行、selection 调用及最多八类拒绝原因；`board.store.rsi_command_summary` 返回这一精简摘要，旧轮次仅在 prompt/raw 身份匹配时从审计投影，不返回提示、源码或轨迹。该摘要用于诊断接口，不作为奖励证据。 `rsi_model_options` 只返回模型名、默认配置与 effort 列表，不返回地址或凭据；目录读取失败时保留已配置模型并报告错误。campaign 的 `llm_config` 记录本次提交配置，单轮审计记录 `requested_model`、实际 model 身份、effort 和每次请求 options，选择变化不改写历史。
 
-**停/续**：`cancel_brief` 落标记 → evolve.py 在轮边界退出（状态 `cancelled`，exit 3；轮中则 killpg）→ `runtime.task_cancelled`，brief 进 `cancelled/`。同 task 再投 evolve → 从 `cursor` 继续；已 `done` 且 rounds 不变 → 空操作。
+**固定评测目标。** `plugins/rsi/evaluation.py` 在首次无候选 baseline 后，从服务器原始计划和谓词绑定编译 `EvaluationContract`，连同绑定、SkillRecord、证据策略与源码摘要写入实验身份。每个具备服务器谓词绑定的 verify 定义一项待测条件；相同技能、参数与谓词来源只占一个维度。最终完成另由原始 embodiment 的 `terminal_success` 在世界关闭前判定。控制器的 `done()`、可调停止距离、diagnostics、图节点数量、report 的“读取成功”以及候选自己的目标坐标，都不进入奖励。
 
-**媒体规则**（`harness/media.py`）：段级节点每 4 步录一帧 128px 到内存，来源按序取第一个存在的：`embodiment.frame(obs)`（robocasa：obs 里已有的 `robot0_agentview_left_image`，不需要渲染器，所有驱动免费得到）→ `driver.frame()` → `env.frame()`；verify 成功才落 `media/<task>/<seed>/<node>.mp4`（无 imageio 则 .gif），失败即丢；>1 MB 降 fps/抽帧重编；同节点重跑覆盖。录制失败不影响任务但绝不静默：该节点 `diagnostics.media` 封 `{kept:true,file}` 或 `{kept:false,reason:verify_failed|no_frame_source|no_frames|encode_failed[,error]}`，同一原因写进 `index.json["dropped"][node] = {reason, keyframes}`（evolve 轮行 `media_dropped`）。帧永不进链，链和 campaign.json 只存路径。
-**失败关键帧**（ENPIRE failure cases）：丢弃的段最多留 3 张 128px JPEG `<node>.fail-{0,1,2}.jpg`（首帧、停滞帧 = 驱动暴露 `last_progress_step` 时对应帧，否则中帧、末帧；每张几 KB），列在 `index.json["dropped"][node]["keyframes"]`；`rsi_frames` 在 `dropped["种子/节点"].keyframes` 带出。LLM 投影里每种子 `keyframes` 列首死节点的关键帧路径；端点接受图片（`model_endpoint` 参数 `images`，缺省按 model 名含 vision/vl 推断）时同一批帧以 base64 data URL 图片 part 附在 user 消息里（提示词说明其含义），审计与 `prompt_sha` 只存路径。
+执行层只产出 `verification_observations` 和 `terminal_observation`，不回调 RSI。RSI 按冻结来源和语义匹配读数，缺测为 unknown。开发接受要求同一批种子中至少一个条件从未通过变为通过，且没有任何已通过条件回退。界面中的 `evaluation.before/after.progress` 是后端计算的固定条件通过比例；完整布尔向量保存在每种子 evidence 中。旧 `node_rate` 仅是执行诊断，不能用于接受候选。此版本没有从布尔谓词虚构连续奖励，也没有宣称已自动拆出 benchmark 的全部物理合取项。
 
-**三面** `skills(session)`（逐字节等价）：records 概览，每技能一行 `{name, kind, bindings: {emb: [executor 键]}, evidence: {emb: {n, k, by_executor}}, limits, failure_modes, source}`——库记录被会话 `skills/` 下发布的同名副本覆盖（`source: session`）。ph-station 桥（dsh-ph-board）白名单同步加 `skills` / `rsiRun` / `rsiSeries` / `rsiFrames`，写路径只有 `submitBrief` / `cancelBrief`。
+源码固定并不足以保证读数独立：已安装谓词也可能间接读取执行器自报的 success。`fixed-verification-v2` 要求执行层在谓词的同一次调用中审计上下文读取，记录 `world-dependencies-v1` 和 `blocked_reads`。读取执行结果或控制器内部状态的值不作为评测真值；这种依赖经中间 facts 传递仍保留来源。原有执行判断保持不变，评测读数则成为 unknown，并列明依赖路径。没有审计标签的旧观测不能补成新证据。审计可能保守地丢弃实际为真的条件，当前不能据此声称谓词已经完成全部语义审计。
 
-**提案与候选卡**：`runs/<session>/proposals/<id>.json` 是 evolve 的收件箱，条目 `{task, kind: tunables|executor|card, payload, note}`（三面 `submit_proposal` 校验形状后原子落盘（store/CLI 收 JSON 字符串，MCP 面收 `proposal: dict`）、`proposals(session)` 列出，`applied` 为 null 表示待处理）。evolve 每轮开头取该 task 最旧的待处理条目，就地盖 `applied:{round,ts}`，封存 `rsi_proposal_applied {brief,task,round,id,kind,note}`，并把它当作本轮的「试」——取代内置 proposer，发布规则不变（同种子成功数变好才写回 record）。payload：
-- `tunables`：`{ref, path:[...], to, node?}`（与内置 ② 同一条 `PH_MOUNT_PARAMS_OVERRIDE` 路径）；
-- `executor`：`{to, node?}`（record 里已绑定的 executor 键）；
-- `card`：`{path: plugins/candidates/<name>, to: <executor 键>, ref: "module:attr", params?, node?}`——该轮 suite 把候选目录追加进 `PH_PLUGINS_EXTRA`（`discover` 接受单卡目录），绑定只注入内存里的 records/segment_specs；变好才把 `bindings[emb].policies[<键>] = {ref, params, transport}` 写进发布的 record。
-`node` 缺省为本轮的目标节点（见上「轮换与卡死」）；缺字段或节点未跑过 → `tried.kind:"none"` 并写明原因（提案照样盖 `applied`）。campaign.json 每轮多一项 `proposal: {id,kind,note}|null`，`applied` 多一项 `cards`。
-候选卡 `plugins/candidates/<name>/` 与普通卡同一 manifest 形状，不被 base fold 扫到；`[executors.<键>] skill=, embodiment=, ref=, transport?` 由 `discover` 折进 `Registry.executors`，`skill_library.bind_executors` 在加载时把它盖到 `bindings.<本体>.policies.<键>`（只在挂载时可见，record 文件不动）。首张代码候选 `grasp_geometric_robocasa`：executor 键 `geometric`，code-as-policy `hover→descend→close→lift`，自带 `[tunables]`，provider 参数 `{tunables:{...}}` 覆盖（`mount_params` 只扫 `plugins/*/`，不扫 PH_PLUGINS_EXTRA）；`KitchenThawDriver` 对有 `bind(env, target=)` 的 executor 走原生路径（raw obs 进，12 维 env action 出）。`scripts/plugin_doctor.py plugins/candidates/<name>` 可直接体检（`[executors.*]` 的每个 ref 作 Tier A load）。
-提案人：ph-station 的 `skill-author` preset 只读 `rsi_run/rsi_series/rsi_frames` 与链，唯一写口是 `submit_proposal`。
+**诊断与干预。** `plugins/rsi/diagnosis.py` 读取 embodiment 声明的动作组、状态坐标、带符号命令和采样轨迹，在目标及阶段一致的窗口内比较命令与响应。它区分样本未激励、发出命令但未观测到运动、远离目标、残差不在已观测响应空间内、进展和未知；这些是可检验的假设，不是物理不可达证明。采样间隔、目标漂移和缺少命令都会限制结论。通用 RSI 不包含特定墙面的臂展、dock 坐标或指定旋钮豁免。
 
-**三面**（store / storecli / mcp 逐字节等价，只读 campaign.json 与 `rounds/<n>.json`）：`rsi_run(task, session, round=0)` = campaign.json 表头 + `latest`（紧凑轮行）+ **有界**的 `rounds`（最后 20 轮，与 `rsi_series` 同一紧凑形状）；`round=<n>` 改为只返回那一轮的**完整**行（per_seed / after_seeds 轨迹、trial_evidence、llm、media、needs、confirm，单元素列表；无此轮 → `[]`）——该轮已被 `EvolveStore` 分片时读 `rounds/<n>.json`（`rsi_frames` 同）；分片不可读则退回索引行，残缺胜过空白——轮卡片按需取一轮，永不整包拉历史。`rsi_series(task, session)` = 每轮 `{round,before,after,best,parent,proposer,outcome,accepted,published,usage,tried:{kind,node,detail 仅留 path/from/to/reason/error},node_rate:{before,after,best},by_task:{任务:{before,after}}}`（**按构造有界**：per-seed 轨迹 / trace / evidence 永不上这一面）（`node_rate` = 各种子 ok 节点数/节点数 的均值，before 取 per_seed、after 取 after_seeds、best 为 after-或-before 的滚动最大；`by_task` = 每个子任务标签的通过率，一个种子上该任务的全部节点 ok 才算过；**修复节点（`kind=="recovery"` 或 `recover-` 前缀）两者都不计**——它只因某节点失败才存在，算进去就等于 `score` 曾犯的错：机器人走得更远的那两轮，图上 `recover` 反而从 1.0 掉到 0.5，修好读成了退步；无 nodes 的旧轮读为 null / `{}`；索引行直接用 evolve 预算好的值，同一套读数）；`rsi_frames(task, round, session)` = `{media:[那一轮的路径], dropped:{"种子/节点":{reason,keyframes:[路径]}}}`。没有 campaign → `None` / `[]` / 空 dict。`rsi_campaigns(session)` = 该 session 磁盘上全部 evolve campaign 的摘要列表 `{task,status,cursor,rounds,best,seeds,arm,node_rate_best,updated,live:{phase,message}|null,open_brief}`（running 在前，再按 updated 倒序）；`open_brief` / `rsi_run.open_brief` = inbox/processing 里驱动该 task 的 evolve brief id（可 `cancel_brief`），控制台重启后靠它们而不是每次启动截断的 `runtime_events` 找回进行中的 rsi。
+模型选择干预位置与方案；harness 不轮流指定目标，也不给“先调哪个参数、先向上还是向下”的菜单。可选节点来自本次实际执行过、具有安装绑定的动作节点，包含已通过的上游动作；首死位置和历史试验次数仅作为观测。动作类候选必须显式给出 `payload.node`，源码与参数跟随实际执行器解析；`plan` 和 `none` 不需要节点。模型的可改范围来自已安装能力。`tunables` 只能修改所选驱动实际声明的有限数值参数；`executor` 只能选该技能已绑定的执行器；`card`/`patch` 通过 doctor、实例化检查后进入 probe，选择后才做完整配对评估；doctor 对每张卡（模型写的候选一视同仁）查导入边界（`scripts/plugin_doctor.py` 的 `_CARD_IMPORTS`）：只许 stdlib、`harness`、`governor`、`numpy` 和卡自己声明的 `third_party`，`import` 兄弟卡直接 FAIL——卡之间只能按 ref 相认；patch 卡额外获准 import 它 `patched_from` 的那个包。源码编辑只覆盖真实 stage 所属模块，不能借 driver patch 修改规划器或评测器。在同一基线实验上已试过的精确重复候选会被拒绝；基线改变后不能用旧拒绝记录封死新的试验。连续参数空间不被离散方向枚举代替。没有合理试验时可以返回 `none` 并说明缺少的证据。
+
+`plan` 提案携带 `{"graph": <完整计划>}`。`plugins/rsi/interventions.py` 让提示与校验共享服务器计划、catalogue 和 oracle 词汇。当前只允许在原调用之间插入已安装动作技能，保持原节点相对顺序、技能参数、goal、tasks 和验证条目；新增动作仍需类型、依赖、验证覆盖及运行时 grounding 检查。该限制保护原验证检查点的含义；任意改图和任意重排需要更独立的世界状态观察器，当前不开放。新增节点不能增加评测维度。
+
+**跨任务复用。** `plugins/rsi/experience.py` 保存有 before/after 证据引用的诊断结构、干预策略与正负结果，最多保留 512 条。参数干预记相对变化，计划干预记新增动作的类型与数量；每条策略都有原始轮次引用。检索排除当前任务及不兼容评测协议或证据策略的记录，固定当前 campaign 启动时可见的记忆序号；不搬运候选源码或参数绝对值作为新任务设置。检索结果只是新试验的假设。更换评测 epoch 后，旧轮次仍可读，但旧拒绝记录不再限制新协议下的搜索。`transfer_report` 支持 cold/warm 的配对首次接受轮数、固定训练任务数和未出现改进的右删失记录。实际证明可扩展性还需要冻结未见任务、相同种子与预算，比较不同记忆规模下 cold/warm 的首次改进成本；单个 campaign 的曲线不能证明 scale。
+
+**改进成本。** 每轮 `usage` 记录本轮模型调用、输入字节、API tokens、仿真 episode 尝试次数、仿真调用耗时和整轮耗时；这些是增量，不累加 brief 的累计用量。基线复用不重复计数，已经开始但失败的 probe 仍计尝试与耗时。`transfer.cost` 从同一开发 epoch 的已封存轮次汇总总投入、截至首次被接受的改进所需投入，以及当前轮之前最近一次接受之后的投入（包括当前轮）。没有接受时首次成本为 null；历史缺项或 token 用量不完整按对应字段保留未知，不补零。分片与续跑保留这些读数，换 epoch 重新统计。模型的精简状态包含已测候选成本、当前采样投入、历史成本和完整候选验收的 episode 数；它自行决定继续采样、组合候选、验收或停止。成本不替代固定任务奖励，也不产生自动选优规则。控制台展示后端累计与首次改进成本，最近一个改进周期的详情可展开；不推算美元价格或宣称 benchmark 成功率已提升。
+
+**完整证据与控制台。** ph-station 的 RSI 页面宽屏按等宽两列展示媒体和分析，任务卡片均分可用宽度；媒体区使用一个主播放器及片段列表，实时画面限高并保持比例；右侧显示紧凑趋势和本轮评估，轮次历史、子任务热图、节点矩阵及完整版本标识可展开。历史与矩阵在各自面板内滚动，任务名保持横排。内容区窄于 860px 时改为上下排列，日志独占整行。 模型审计明确区分 `proposed`、`abstained`、`rejected`、`error`。没有完成候选复测的轮次，其 after、after_score、evaluation.after、experiments.after 为 null，after_seeds 为空，不把 baseline 复制为复测结果。每轮的 `evaluation`（固定目标、配对读数、接受理由、安装状态）、`diagnosis`、`experience`、`transfer`、真正的 before/after 节点轨迹、异常、耗时，以及模型审计摘要由 runtime 封入 `rsi_step`。控制台展示该摘要中的模型身份、状态、调用数、理由和 prompt/raw 哈希；完整请求与原始答复保存在独立开发审计文件中，不等于控制台已展示这些全文。视频、关键帧及其路径保留在 campaign 媒体记录中，不进入 session-log 链。候选目录不可覆盖，源码和数据共同进入内容摘要，挂载前重新核验。完整配对选择结果直接复用；probe 及其错误、父策略和测量结果保留在 `learning.probes`，完整选择与当前策略保留在 `policy`。两者在控制台分别显示，probe 不冒充 after 或开发接受。`confirm_seeds` 只增加开发种子，并保存两侧完整读数和实验身份，绝不是一次性 held-out 或安装依据。恢复封存会读取完整历史分片，并匹配那一轮原始评测合同。
+
+媒体按 `media/rsi/<task>/epoch-<n>/round-<r>/<phase>/` 分开存放，其中 probe 使用 `probe-<n>`，避免 baseline、多次 probe、完整候选和后续轮次覆盖旧片段。段级录制器是 `harness/media.py`：每 `EVERY`=4 个 driver step 抓一帧 128px 存在内存里，verify 过了才落盘成 `<node>.mp4`（imageio+ffmpeg 不可导入时退成 `.gif`），丢掉的段把原因写进该种子 `index.json["dropped"]`（`no_frame_source` / `no_frames` / `verify_failed` / `encode_failed`），并留最多 3 张失败关键帧 `<node>.fail-{0,1,2}.jpg`（首帧、停滞帧——驱动暴露 `last_progress_step` 时用它、否则取中间——和末帧）。成功段视频、失败关键帧、节点轨迹及实时日志继续由 board 的只读面提供；媒体自身仍是可视化材料，帧不进入证据链。`rsi_run(round=n)` 读取单轮完整结果，`rsi_series` 仅返回紧凑数值与 evaluation 摘要，历史轮次仍按 `rounds/<n>.json` 分片，`rsi_frames(task, round)` 给那一轮的媒体路径与 `dropped`；`rsi_campaigns(session)` 列出磁盘上的全部 evolve campaign（`{task,status,cursor,rounds,best,seeds,arm,node_rate_best,published_rounds,accepted_rounds,usage:{llm_tokens,sim_s},updated,live,open_brief}`，`status` ∈ `running|stopped|cancelled|paused_disk|done`——`stopped` 是读侧派生的：campaign.json 还写着 running，但 inbox/processing 里已经没有 brief 在驱动它），控制台重启后靠它而不是每次启动截断的 `runtime_events` 找回进行中的 rsi。ph-station 用独立区域显示“开发接受”和“安装未评测”，旧 published 仅显示为历史发布。
+
+提案收件箱 `submit_proposal` 接受 `{task,kind,payload,note}`，其中 kind 为 `tunables|executor|card|plan`；LLM 的 `patch` 在投递前生成候选卡。收件箱用于显式提交候选，动作类 payload 必须声明 node；与循环内模型提案经过相同的实际权限校验，它不是自动 fallback。唯一执行入口仍是 `submit_brief`，控制台通过 `brief_status`/`cancel_brief` 管理运行。
+
+**当前边界。** 默认布尔验证信号仍可能稀疏；当前目标编译适用于基线计划的固定 grounded 检查点，动态任务若改变物体或参数会保留 unknown，不能冒充同一目标。候选 Python 执行器仍在仿真进程内，doctor 和来源绑定不是恶意代码的隔离沙箱。已有能力只支持提出并评测策略或执行器改动，并不等于已经完成跨 RoboCasa363 的策略训练或证明跨 benchmark 的性能增长。
 
 ### 4.1 brief 形状
 
@@ -546,15 +571,15 @@ clone 合法地显示**更多跳过，绝不是失败**：
 其他键一律被 `_BRIEF_KEYS` 拒掉（和 task/campaign 同一道闸）。
 `kind:"rsi"` 和 `kind:"campaign"` 一样**只在进化态被接受**。
 
-### 4.2 链上七步
+### 4.2 链上八步
 
 | 步 | 做什么 | 在哪 |
 |---|---|---|
 | a. 领种子 | 从**派生账本**（`board.store.burned_blocks(runs/)`：`runs/` 下所有已封存 prereg 的 gate/heldout 区间，并上 STATUS.md 已烧行的历史）之外领**一整块 650**，切成标定 150 / dev 300 / held-out 200；钉住的 dev/heldout 撞上已烧区间同样拒绝。没有任何 store ⇒ 拒绝领 gate/heldout，绝不当作「没烧过」；标定块不过闸（标定永不设门、永远可复测），可用 `cal` 钉住旧块复测 | `rsi_campaign.allocate` + `harness_runtime._rsi_blocks` / `_assert_unburned` |
 | b. 标定 | **通用探针**：把 `{"kind":"task"}` 那条路在池子里跑 N 次，skills root 指向空目录 → 臂天然是 baseline。产出链基率、**逐节点 × 机制**首死、每集耗时。任务的节点图/kind/after 边由 planner 现问，不是硬编码表 | `rsi_campaign.calibrate` / `_probe_one`，brief 装配复用 `harness_runtime.task_brief`（和活跑逐字节同一张 brief） |
 | c. 门禁 | 六条机械判据逐条打分。**没过就停在这里**，裁决书写清缺哪条能力 + 触发它的那个数，一粒 dev 种子不烧 | `rsi_campaign.gate` |
-| d. prereg | content-hash 封存，**在任何 dev 种子跑之前** | `rsi_campaign.build_prereg` + `plugins.rsi.workload.run` 盖 provider 三元组 |
-| e. dev campaign | 调既有 `run_campaign`，FROM-SCRATCH（`parent_store=None`）。门 = 配对同种子 McNemar（对父）+ blind twin + `min_fixed`，功效缩放取前缀 | `plugins/rsi/campaign.py` |
+| d. prereg | content-hash 封存，**在任何 dev 种子跑之前**；包含执行 provider 和 reasoner 身份 | `rsi_campaign.build_prereg` + `plugins.rsi.workload.run` |
+| e. dev campaign | 当前模型端点驱动的 reasoner 根据观测提出恢复候选，调用 `run_campaign`，FROM-SCRATCH（`parent_store=None`）。门 = 配对同种子 McNemar（对父）+ blind twin + `min_fixed`，功效缩放取前缀 | `plugins/reasoner` + `plugins/rsi/campaign.py` |
 | f. held-out | 仅当有晋级，**只评一次** | 同上 |
 | g. 折入 | 发布记录复制进该 session 的 skills root；两态铁律照旧（执行态 skills-root 变更触审计 → 归档旧 log + 全新 boot 封 row0） | `harness_runtime._run_rsi` → `_copy_skills` |
 | h. 账本 | 生成一段 STATUS.md 形状的条目**打印给操作员**，并进 `runtime.rsi_scheduled` 链行。**从不自动 append**——STATUS.md 只是操作员的展示用笔记，真正的账本由 d 步封存的 prereg 派生（a 步），没有第二份可写的真相 | `rsi_campaign.ledger_entry` |
@@ -601,16 +626,18 @@ Protocol 做 isinstance 校验。理由：`RecoveryActor` 把 phase 名翻成动
 
 `blockers` 是列表，不是第一个就返回——只被告知其中一条的操作员会去修错的东西。
 
-**2. 目标节点不由 agent 挑。** 由 `attribute()` 从首死数据选：verify 节点的死沿
+**2. 旧恢复链的目标节点由归因选择。** 由 `attribute()` 从首死数据选：verify 节点的死沿
 `after` 边回 charge 给它验的那个执行节点（它本来就没有自己的治理面），perceive/decide
 的死谁也不 charge（那是 c4 的 pivot 信号），然后在可治理节点里取 argmax。
 `node` 键能覆盖，但覆盖会写进裁决书。
 
-**3. 阈值不由 agent 挑。** `critic_budget=0` 让 `plugins/rsi/stats/search.py` 结构性地
-够不到特权特征——「优先非特权」是预算，不是偏好。特权规则只能靠调高预算进来，而
-`run_campaign` 在每次晋级都跑转移消融，所以特权收益必定带着它的塌陷曲线一起出现。
-恢复形状同理：由目标节点**实测**的主导失败 stage 决定（stage 名落在 place 词汇里 →
-place 形修复），且只能在该本体已注册的 repertoire 里取。
+**3. 候选由 LLM 提出，验证规则保持固定。** 默认 reasoner 使用当前 `ModelEndpoint`，
+根据成功与失败样本的实际特征分布提出触发特征、阈值和已安装的恢复动作。输入只列当前
+本体可执行的恢复动作，模型只能引用本轮实际观测到的特征；解析器继续检查特权预算和
+候选语法。`run_campaign` 要求显式 reasoner 身份，不提供默认搜索或自动恢复参数搜索。
+模型请求、原始答复、用量、修复拒因及端点异常写入 `model_proposal` 证据；模型无方案
+保留 null，端点异常终止，不替换为规则候选。每次晋级仍执行转移消融，模型不能修改
+统计门槛或把特权收益描述成无需特权的能力。
 
 **4. 诚实 NO-GO / 诚实 null 是合格产出。** 裁决书带 `proceed` + 逐条判据 + 触发它的
 那个数；账本条目把「未烧」写明。链停在门禁时 store 里有裁决、没有 skills，这是**完成
@@ -640,10 +667,11 @@ STATUS 声明块内）上跑通：
   1.5.2 release + mujoco 3.3.7 + numpy 1.26.4。**numpy 1.x/2.x ABI 是隔离的最大理由。**
 * 底座依赖是松的（`numpy>=1.26` + zstandard），base lane 在 robosuite 不可导入的机器
   上全绿——**底座本来就是 sim-agnostic 的**，这是本设计的全部凭据。
-* RoboCasa venv：`sims/robocasa-venv`（py3.12，robocasa 1.0.1@a07e365 +
+* RoboCasa venv：`../sims/robocasa-venv`（**仓库的兄弟目录**，不在仓库内；
+  `ROBOCASA_PYTHON=…` 可覆盖解释器路径。py3.12，robocasa 1.0.1@a07e365 +
   robosuite master@5ce6643 editable-compat + 23G 资产），EGL 无头冒烟通过，同 seed
   双 rollout 逐元素一致（确定性成立），`get_ep_meta()/set_ep_meta()` 可做场景指纹。
-* **sys.path 遮蔽陷阱**：cwd 能看见 `sims/robocasa/`（repo 根目录名 == 包名）时
+* **sys.path 遮蔽陷阱**：cwd 能看见 `../sims/robocasa/`（repo 根目录名 == 包名）时
   `import robocasa` 命中 namespace package，374 个 kitchen env 静默不注册。
   规矩：robocasa runtime 一律 cwd=physical-harness repo（那里没有 robocasa 目录）。
 * 隔 websocket 的那一类（RoboTwin(SAPIEN) / RoboDojo(Isaac 5.1)）走 XPolicyLab 契约 =
@@ -654,7 +682,7 @@ STATUS 声明块内）上跑通：
 ### 5.2 架构 —— 三条既有轴各自延长，零新概念
 
 ```
-sims/robocasa-venv  ──解释器──▶  常驻 runtime #2 (runs/session-robocasa, MUJOCO_GL=egl,
+../sims/robocasa-venv ─解释器──▶  常驻 runtime #2 (runs/session-robocasa, MUJOCO_GL=egl,
                                   cwd=$REPO, PYTHONPATH=$REPO)
 plugins/embodiment_robocasa/  ── 卡片：env provider + percept provider + PREDICATES 原语
 board submit_brief(session=…) ── 路由：写哪个 session 的 inbox（默认 session-main 不变）
@@ -716,7 +744,7 @@ robocasa = embodiment 泄漏）。
 
 ### 5.4 首发 mission —— `kitchen_thaw`（MicrowaveThawingFridge）
 
-一个持久 episode（`EpisodeContext`，`episodic: true`），≥14 节点：
+一个持久 episode（`EpisodeContext`，`episodic: true`），固定 15 节点：
 survey(perceive) → plan(decide) → nav-fridge(segment) → verify-at →
 grasp-item(segment) → verify-grasped → nav-microwave(segment) → verify-at →
 place-in(segment) → verify-inside(`obj_inside_of`) → close-door(segment) →
@@ -856,14 +884,21 @@ oracles   = "plugins.planner_vlm:ORACLES"                # declared verify predi
 - `deepseek` —— `https://api.deepseek.com/v1`，`model = deepseek-chat`；
   `export DEEPSEEK_API_KEY=...`。key 走的是环境变量**名**、绝不是值——秘密不进哈希链。
 
-一个已在代码里核实的坑：runtime 的 task 路径挂 binding 的 planner ref 时**不带
-params**，planner 用它**自己**的默认值按 ref 解析 endpoint。当前与 3080 的操作员设置
-对齐到 `deepseek-official / deepseek-v4-pro`；`model_endpoint` 先读
+一个已在代码里核实的坑：runtime 的 task 路径挂的其实是
+`plugins.planner_library:provider`，binding 的 planner 当 `inner` ref 传进去
+（`harness_runtime.py`：`Mount("task.planner", _LIBRARY_PLANNER_REF, {"inner": binding["planner"]})`），
+`LibraryPlanner` 再按 ref 加载内层，**内层不带 params**（`inner_params` 缺省是空表），
+所以 planner 用它**自己**的默认值按 ref 解析 endpoint。`planner_vlm` 的默认 `endpoint_params` **不引用任何 preset**，
+把 `base_url = https://api.deepseek.com/v1` / `model = deepseek-v4-pro` /
+`api_key_env = DEEPSEEK_API_KEY` 逐字段写死在代码里，与 3080 控制台已提交的那条
+provider/model route 对齐；`model_endpoint` 先读
 `DEEPSEEK_API_KEY` 环境变量，缺失时只按同名 ref 从 `$DSH_HOME/.credentials.yaml` 读取，
 key 不进入 manifest、brief、prompt、日志或 endpoint identity。
-改 `plugins/model_endpoint/manifest.toml` 的 params **不会**给 planner 改道——那些
-params 只在有东西 kernel-mount `model.endpoint` 时才起作用，而今天没有。要用托管 API
-或别的端口，改 planner 的 `endpoint_params` 默认值（一行；支持逐字段覆盖，如
+改 `plugins/model_endpoint/manifest.toml` 的 params **不会**给 planner 改道——今天读这张卡
+manifest params 的包括 evolve 的 LLM proposer 与恢复链的 reasoner（`scripts/evolve_llm.py:endpoint()`：
+`load_provider(ENDPOINT_REF, mount_params(ENDPOINT_REF) or {"preset": "deepseek"})`），
+planner 完全不看它。要给 planner 换托管 API 或别的端口，改 planner 的 `endpoint_params`
+默认值（一行；支持逐字段覆盖，如
 `{"preset": "local_sglang", "base_url": "http://host:8001/v1"}`）。
 **endpoint 身份进 plan sha：换端点就是换实验。**
 
@@ -951,12 +986,15 @@ replan，因此偶发的边缘放置不会立刻让长任务重新规划。RoboC
 启用 `--frames` 时，runtime 会把当前任务渲染帧汇成
 `runs/<session>/rollout.mp4`。它是可丢弃的实时产物，不进入证据链，也不会影响任务判定；
 任务结束后可直接在执行图的取景窗点击“下载视频”。新任务开始时会替换上一条视频。
+喂给 VLM 看的不是它：evolve 侧另有一套**段级**媒体录制（`harness/media.py`）与失败关键帧，
+按 `media/rsi/<task>/epoch-<n>/round-<r>/<phase>/` 分开存放，经 `rsi_frames` 面读出——
+规则见 §4.0。
 
 #### 6.1.2 自然语言 → skill graph → 可执行组合（`plan_skill_task`）
 
-`sims/robocasa/skill_annotation_analysis/taxonomy/unified_skill_graph.json` 是 RoboCasa365 标注
-生成的**只读**统一技能图（生成器 `robocasa/scripts/build_skill_taxonomy.py`；本仓库不复制、不重扫、
-不改它）。五种边各有各的语义，绝不混用：`IS_A`（taxonomy 分类）、`HAS_STAGE`（observed skill 的
+`../sims/robocasa/skill_annotation_analysis/taxonomy/unified_skill_graph.json`（仓库的**兄弟**
+目录 `sims/`，`harness/unified_skill_graph.py:DEFAULT_GRAPH_PATH`）是 RoboCasa365 标注
+生成的**只读**统一技能图（本仓库不复制、不重扫、不改它）。五种边各有各的语义，绝不混用：`IS_A`（taxonomy 分类）、`HAS_STAGE`（observed skill 的
 有序阶段）、`REALIZES`（阶段对应的 canonical 接口）、`DECOMPOSES_TO`（组合技能的有序配方）、
 `OBSERVED_TRANSITION`（数据里观察到的相邻转移，**不是**因果）。图里节点的 `executable: true` 是
 标注者的本体断言，**不是** binding。
@@ -980,9 +1018,10 @@ instruction ──► harness/unified_skill_graph.py   检索相关 IS_A 子树�
 逐条列出缺口——标注不是控制器）、`rejected`（`validation.message` 给出校验器原话；模型两次都给不出
 合法 JSON 也落这里）、`no_match`（没有词表命中，根本不调模型）。
 
-三张脸调的是同一个函数（`board/planning.py`）：MCP 工具 `skill_library` / `plan_skill_task` / `submit_skill_plan`、
-`storecli skill_library` / `plan_skill_task --instruction=… [--channel X]` / `submit_skill_plan --plan=<record>`、ph-station
-的 `POST /api/board/skillLibrary` / `planSkillTask` / `submitSkillPlan`（技能库与规划面板）。`skill_library` 与 `plan_skill_task` 都是读，不落盘。
+两张脸调的是同一个函数（`board/planning.py`）：MCP 工具 `skill_library` / `plan_skill_task` / `submit_skill_plan`、
+`storecli skill_library` / `plan_skill_task --instruction=… [--channel X]` / `submit_skill_plan --plan=<record>`。
+**控制台侧还没有这三个面**：桥（dsh-ph-board）的 `@Remote` 白名单里没有 `skillLibrary` / `planSkillTask` /
+`submitSkillPlan`，技能库与规划面板今天只能经 MCP 或 CLI 走。`skill_library` 与 `plan_skill_task` 都是读，不落盘。
 `submit_skill_plan` 是唯一的执行入口：从零重新核验 `composite_plan` 记录（channel 必须是当前装着的
 task binding、`validate_plan` 用该任务当下的 catalogue/planning_context 再过一遍、每个叶子 bound），
 不合格就拒绝、不落任何文件；合格就投一张**普通** task brief `{"kind":"task","task":…,"instruction":…,
@@ -991,13 +1030,16 @@ task binding、`validate_plan` 用该任务当下的 catalogue/planning_context 
 
 配置：图路径 `PH_UNIFIED_SKILL_GRAPH`（默认工作区相对路径 `../sims/robocasa/.../unified_skill_graph.json`）；
 planner 端点默认走 planner_vlm 自己的 DeepSeek 默认值（key 只经 `DEEPSEEK_API_KEY` 或控制台凭据库），
-`PH_PLANNER_BASE_URL` / `PH_PLANNER_MODEL` / `PH_PLANNER_API_KEY_ENV` 可把三张脸一起指到别的
+`PH_PLANNER_BASE_URL` / `PH_PLANNER_MODEL` / `PH_PLANNER_API_KEY_ENV` 可把这两张脸一起指到别的
 OpenAI 兼容服务（测试就是这样指到假服务器的）。
 
-验收两例（`tests/test_skill_planning.py`、`tests/test_planning_faces.py`、ph-station 的
-`ui-ph-panels/tests/plan-*.client.spec.tsx`，模型一律是假的）：
+验收两例（`tests/test_skill_planning.py`、`tests/test_planning_faces.py`，模型一律是假的）。
+**这两个文件在本 checkout 里整批跳过**：上面那份 `unified_skill_graph.json` 是 RoboCasa 仓库的
+生成产物，不随本仓库发布，缺席时 `test_skill_planning.py` / `test_planning_faces.py` /
+`test_unified_skill_graph.py` 全部 skip（见 §3.2），所以下面第一例的紧凑目录计数在本仓库
+**不可复现**——它来自另一份带图的 checkout：
 
-- **Prepare a cup of coffee.** → 图词表；紧凑目录 9/56；链 `CoffeeSetupMug.pick → CoffeeSetupMug.place →
+- **Prepare a cup of coffee.** → 图词表；紧凑目录只披露相关 IS_A 子树、不是整张图；链 `CoffeeSetupMug.pick → CoffeeSetupMug.place →
   StartCoffeeMachine.execute → done`；规范展开 `CoffeeSetupMug → Pick → Place`、`StartCoffeeMachine →
   PressButton`；`planning_only`，三个叶子全在 `missing_bindings`，提交被拒。
 - **Pack every food item into its assigned tupperware.** → `pack_all_robocasa` 词表；16 个叶子全部 bound
@@ -1211,7 +1253,7 @@ print(repertoire.strategies_for('embodiment_yourcard'))"
 3. **冻结的 SkillRecord 必须仍可复现。** 一条安装记录写明它是用哪个 provider 测出来的。
    provider 消失了，记录就不可重放，`scripts/parity_check.py` 也没有东西可逐字节比。
 
-### 7.2 缝在哪：一行 manifest
+### 7.2 缝在哪：一条执行器绑定
 
 派发路径本来就是逐 segment 路由的，所以**不需要改 kernel**：
 
@@ -1225,28 +1267,39 @@ plan node {kind: "segment", skill: "place"}
 ```
 
 `SEGMENT_SPECS` 是 mission 卡里的**纯数据表**。所以给某一段选一个不同的执行器是一次
-manifest 编辑，不是代码编辑——和 task binding 可换是同一个性质。
+**数据编辑**，不是代码编辑——和 task binding 可换是同一个性质。
 
-**改动就是：一条 segment spec 可以指名自己的执行器。**
+**改动就是：一条 skill 记录可以为某个本体多绑一个执行器**（`skill-library/records/<技能>.json`
+的 `bindings.<本体>.policies`，键就是执行器名）：
 
-```toml
-# plugins/mission_kitchen_thaw/manifest.toml
-[segment_executors.place]
-ref = "plugins.policy_vla_remote:provider"
+```json
+"bindings": {"robocasa": {"policies": {
+  "scripted": {"transport": "inproc", "task": "place_meat"},
+  "pi05":     {"transport": "ssp", "ref": "plugins.policy_vla_remote:provider",
+               "checkpoint_sha": "08bae6a…"}}}}
 ```
 
-没有这一行，该段保留 mission 自己的驱动——所以每个现存 mission 逐字节不变，而 VLA 卡上
-的 `enabled = false` 让底座折叠和它的 sha 永不移动。
+派发每个节点时由 `harness/skill_library.py` 的 `executor_key` / `rearm` 解析这张表：节点自己
+写了 `executor` 就用那个（没绑就报错），否则 brief 的 `arm` 命中哪个键就用哪个，都不命中就落回
+`scripted`——那一路 `ref` 为 None、transport `inproc`，段仍由 mission 自己的 stage driver 执行。
+`plugins/task/workload.py` 再按 `harness/skill_executor.py:is_segment` 分岔：SEGMENT 执行器整段
+接管，StepExecutor 经 `driver.enter_segment(..., executor=)` 挂在 stage driver 上（§9.8/§9.9）。
+所以每个现存 mission 逐字节不变，而 VLA 卡上的 `enabled = false` 让底座折叠和它的 sha 永不移动。
+
+一张**卡**要把执行器绑上某个技能，写 manifest 的 `[executors.<键>]`（`skill` / `embodiment` /
+`ref` / 可选 `transport`，默认 `inproc`）：`bind_executors` 在卡挂载时把它折进上面那张 `policies`
+表，记录文件一个字节不动（evolve 的候选卡就是这么临时上场的）。
 
 ### 7.3 三层各归谁
 
 | 层 | 谁 | 这里会变吗 |
 |---|---|---|
 | 任务 → 节点图 | VLM（控制台的 backbone） | 不变 —— `planner_vlm` 已经在 |
-| 节点 → segment spec | mission 卡的 `SEGMENT_SPECS`（纯数据） | +1 条可选 executor ref |
+| 节点 → segment spec | mission 卡的 `SEGMENT_SPECS`（纯数据） | 不变 —— 执行器写在 record 的 `policies` 里 |
 | **segment → 动作** | **脚本驱动 *或* 学习策略** | **就是这一层** |
 | 有没有做到 | 卡片声明的谓词读活状态 | 不变 |
 | 失败怎么修 | 本体卡折出来的 `[recoveries.*]` | 不变 |
+| 补丁/候选怎么提 | evolve 的 LLM proposer（`scripts/evolve_llm.py`，§4.0） | 它和恢复链的 reasoner 都读取 `model_endpoint` 的 manifest params |
 
 慢脑与快脑之间的契约**就是那条 segment spec**——一个子目标加预算。它不发自由文本，
 也永远不发动作。这条边界是两个脑打不起来的原因：一个决定**做哪一段、什么顺序**，另一个
@@ -1321,7 +1374,7 @@ metadata——所以服务端在一条活连接上热重载了不同权重，这
 
 ### 7.5 数据：RoboCasa 自带示范
 
-已在 `sims/robocasa/robocasa/utils/dataset_registry.py` 核实：每个 atomic task 都同时带
+已在 `../sims/robocasa/robocasa/utils/dataset_registry.py` 核实：每个 atomic task 都同时带
 `human_path`（遥操）和 `mg_path`（MimicGen 生成），由
 `robocasa/scripts/download_datasets.py` 拉取。
 
@@ -1344,7 +1397,8 @@ metadata——所以服务端在一条活连接上热重载了不同权重，这
    obs/action。存进内容寻址的 `datasets/` 根，由训练 prereg 按摘要引用，**在封存链
    之外**——它是数据，不是证据，而且很大。
 4. **训练卡**放在它自己的 venv 里（sim 卡隔离那套模式）。产出：checkpoint + 摘要。
-5. **接执行器**：`[segment_executors.<node>]`，打开 VLA 卡，服务那个 checkpoint，
+5. **接执行器**：在 `skill-library/records/<技能>.json` 的 `bindings.<本体>.policies` 下加一个
+   执行器键（`ref` + `transport` + `checkpoint_sha`，见 §7.2），打开 VLA 卡，服务那个 checkpoint，
    并证明握手闸**会拒绝错的 checkpoint**。
 6. **过门禁**：脚本驱动当在位者，微调策略当挑战者，**同种子**，配对 → blind twin →
    held-out 只评一次。晋级写一条 SkillRecord，写明 checkpoint 摘要。
@@ -1402,7 +1456,7 @@ B 的前提在 A 真正留下的状态上成立，才把 A 接到 B。
 schema 存在的目的所要挡的那种假话。身份闸在**权重那一侧**（§7.4 的
 `policy_vla_remote.reconcile`：声明了摘要而服务端不回显，就拒绝挂载）。
 
-**六条校验，每条挡一种真实的失败**（`harness/skill_record.py`，在 `publish()` 里执行，
+**八条校验，每条挡一种真实的失败**（`harness/skill_record.py`，在 `publish()` 里执行，
 不合格**直接抛**，不是警告后照写）：
 
 | 规则 | 挡住的失败 |
@@ -1412,6 +1466,8 @@ schema 存在的目的所要挡的那种假话。身份闸在**权重那一侧**
 | `0 <= successes <= n`，`n > 0` | 无分母的率 |
 | `split` 只能是 `train` / `test`（RoboCasa：layout 11-60 / 1-10） | 分不清是能力还是泛化 |
 | `checkpoint_sha` 出现时必须是 64 位小写 hex | 记不住是哪份权重拿到的这个数 |
+| `binding.transport` 必须是 `TRANSPORTS` 之一 | 声明了一种传输，却没有任何东西认得它 |
+| `class` 必须是小写 token（`[a-z][a-z0-9]*`） | 技能分组名漂，同一组分裂成几个写法 |
 | **未知顶层键一律拒绝** | 打错的字段名把证据静默丢掉，记录 claim 得就比测的多 |
 
 `preconditions` / `effects` **不许为空**：空不是"没有入口条件"，而是"永远适用"这个最宽的
@@ -1470,7 +1526,9 @@ scripts/cockpit --status        # 什么都不启动，不需要 node；exit 1 =
 | UI bridge / 脚本 | `python -m board.storecli health [PORT] --runs runs/` |
 
 它在一次调用里覆盖：每个进件 session 的 runtime 活性（问 `/proc`，不是问状态文件）+
-模式 + 心跳年龄 + inbox 积压 + `processing/` 孤儿，然后是控制台和模型服务。
+模式 + 心跳年龄 + inbox 积压 + `processing/` 孤儿，然后是控制台、模型服务、pi0.5 策略服务
+（`policy`，只在 `PH_WITH_POLICY=1` 时才计 problem）和最后一次 `cockpit --restart`
+（`restart.state ∈ idle|running|failed|done`）。
 **`problems` 是要读的那个列表**，其余都是它背后的证据。
 
 **停着的 runtime 加空 inbox 被刻意判定为"不是问题"。** 真机器上退役的 session 目录比
@@ -1542,7 +1600,7 @@ planner 产出的图、runtime 的验收事件、技能库的记录和种子账�
 `harness/protocol.py`（stdlib + `sha_json`，不依赖任何卡）。对象都是内容寻址的
 （`content_id` = sha256 of canonical JSON），链行是唯一真相，下面每一样都是链行的投影。
 
-### 9.1 五个对象
+### 9.1 八个对象
 
 | 对象 | 是什么 | 代码 |
 |---|---|---|
@@ -1550,6 +1608,8 @@ planner 产出的图、runtime 的验收事件、技能库的记录和种子账�
 | Predicate | `id, name, args, reads(读哪些键), bindings{本体: "module:attr"}, audit{本体: {n,tp,fp,tn,fn,seed_block,store}}`。**三值**：读键缺失 → `None`（未知），绝不伪造 False。审计门 `sens>=th_s ∧ spec>=th_p ∧ eps<=base_rate<=1-eps`，阈值是参数不是常量 | `PredicateRecord` / `Audit.passes`；本体卡 manifest `[[provides]] kind="predicate"` 声明，`harness/predicates.py` 的 `records()` / `evaluate()` / `audit_gate()` |
 | SkillRecord | `id, name, kind, class, lineage{parent,round}, args(模式), requires / ensures / clobbers（谓词引用，`clobbers` 是 STRIPS 删除表）, limits, failure_modes, bindings{本体}, evidence{本体}`。symbolic 半边与本体无关，绑定与证据按本体分开。入库规则：`ensures` 非空，且引用的每个谓词对目标本体都有审计记录 | `SkillRecordV0`；`skill-library/records/<name>.json`，`harness/skill_library.py` 加载 |
 | ExecutionGraph G | `{mission, seed, tasks[{id, goal[谓词]}], nodes[{id, task, skill, args, after[], on_fail{policy: replan\|recovery\|abort, budget?, rule?}}], rationale, planner{}}` | `ExecutionGraph.from_dict`；`plugins/task/validate.py:plan_to_graph` 把 planner 的 `{goal,nodes,verify}` 形状抬成它 |
+| 统一技能图 | RoboCasa365 标注生成的**只读**图，五种边各有各的语义（`IS_A` / `HAS_STAGE` / `REALIZES` / `DECOMPOSES_TO` / `OBSERVED_TRANSITION`）。节点的 `executable: true` 是标注者的本体断言，**不是** binding。图文件不随本仓库发布（在 `../sims/` 里，`PH_UNIFIED_SKILL_GRAPH` 覆盖），缺席时相关测试整批跳过 | `harness/unified_skill_graph.py`；`plugins/task/skill_planning.py:skill_library_snapshot` 把它与已装 task catalogue 做**只读并集**（§6.1.2） |
+| `composite_plan` 记录 | `{plan_id(内容摘要), channel, task, instruction, plan}`——自然语言那条路的可提交产物。`submit_skill_plan` 从零重核它（channel 必须是当下装着的 binding、`validate_plan` 用该任务当下的 catalogue 再过一遍、每个叶子 bound），合格才投一张**普通** task brief | `plugins/task/skill_planning.py`；`board/planning.py` 两张脸 |
 | Trajectory τ | `(x, y, o)`：x = {mission, σ₀ 的 sensed 投影, 可见技能 id, show_evidence, done, fault}，y = {graph id, rationale}，o = {legal, 每节点 verify, L, success, replans, seed, block, role∈{dev,heldout}}。`id = hash(x, y)`。**纯投影**，从链行算出来，不另存 | `board.store.trajectories(session)`；storecli / MCP 同名 |
 | 种子账本 B | 所有**已封存** prereg 的 gate/heldout 区间之并，再并上 STATUS.md 的已烧行（store 格式之前的历史：phase 1/2 区块、held-out 复评；标定块永不烧）。`alloc(block, role)` 合法 ⇔ block ∩ B = ∅。没有任何 store ⇒ **拒绝**分配 gate/heldout，不是「没烧过」 | `board.store.burned_blocks(runs/)`；`rsi_campaign.allocate` / `harness_runtime._assert_unburned` 消费 |
 
@@ -1558,29 +1618,35 @@ planner 产出的图、runtime 的验收事件、技能库的记录和种子账�
 谓词引用的规范串是 `name(a,b)`（零元 `name()`）；record 里的 `holding(object)` 是模板，
 派发时用节点 args 实例化成 `holding(apple)`（`protocol.instantiate`）。
 
-### 9.2 Legal(G)：四条规则，缺一张图就不派发
+### 9.2 Legal(G)：五条规则，缺一张图就不派发
 
 `validate_graph(G, records, σ₀.facts, σ₀.objects) -> (ok, problems[])` 一次收齐全部问题：
 
 1. **Typed**：每个节点的 args 与 record 的 args 模式逐键匹配（`TYPES`：entity/str/int/float/bool）。
-2. **Grounded**：`entity` 类型的实参必须在 `σ₀.objects` 里，或由某个前驱节点产出。
-3. **Supported**：节点 n 的每个 `requires` 谓词 p，要么在 σ₀.facts 里，要么在某个祖先 m 的
+2. **Bound**：节点写了显式 `executor` 时，它必须是该 record 该本体 `policies` 里的一个键
+   （`executors_of`；plain binding 只认 `scripted`）。问题前缀 `bound:`，派发前拒绝。
+3. **Grounded**：`entity` 类型的实参必须在 `σ₀.objects` 里，或由某个前驱节点产出。
+4. **Supported**：节点 n 的每个 `requires` 谓词 p，要么在 σ₀.facts 里，要么在某个祖先 m 的
    `ensures` 里，且不存在威胁 c（p ∈ clobbers(c)，c 既不在 m 之前也不在 n 之后）——**与 n
    不可比的节点算作可能的威胁**。
-4. **Covered**：每个 task 的 goal ⊆ 该 task 各节点 `ensures` 之并，且在 task 结束时未被威胁。
+5. **Covered**：每个 task 的 goal ⊆ 该 task 各节点 `ensures` 之并，且在 task 结束时未被威胁。
 
 不合法的图**从不派发**，但会作为负样本封进链（`task.plan` 行照封，`legal=false`）。
-今天 mission 卡的 CATALOGUE 只有 args，所以 Supported/Covered 对它们是空真；卡通过
-`brief["records"]` / `brief["facts"]` / `brief["objects"]` 发布真 record 后四条全部生效。
+四张 mission 卡（`kitchen_thaw` / `pack_lunch` / `steam_prep` / `recycle_cans`）的
+manifest 都已声明 `records` 与 `initial_facts`，而 `skill_record.publish` 又强制
+`preconditions` / `effects` 非空，所以契约一定非空——**五条今天对它们全部生效**。
+空真只对还没写 record 的卡成立；那样的卡通过
+`brief["records"]` / `brief["facts"]` / `brief["objects"]` 发布真 record 后五条同样生效。
 
 ### 9.3 运行期：verify → fault → replan 单调
 
 每个节点跑完，在 σ 上求 `ensures` → 链行 `task.verify {node, results{谓词: true|false|null}}`；
 任一非 true → `task.fault {node, failed[], signature?}`。replan 输入 `(G, D=已验收节点, fault, σ)`，
-输出 G′ 必须满足 **D ⊆ nodes(G′) 且每个 done 节点的 (skill, args) 逐字节相同**
-（`replan_monotone`），再以当前 facts 为 σ₀ 重新过 `Legal(G′)`。违者封为
+输出 G′ 必须让已完成节点按原执行顺序构成前缀，保留其 **skill、args、kind、task、executor**，且不得依赖未完成节点（`replan_monotone`）。这些动作已经发生，后续执行只会跳过它们，不能通过后移或重排假装再次产生效果。未完成后缀仍可修改或插入合法 recovery，再以原始 facts 为 σ₀ 重新过 `Legal(G′)`。违者封为
 `task.replan_rejected {replan, problems}`，折回成一次 `invalid_plan` fault，计入 `max_replans`，
 不派发。超过 R 次 → 不可恢复；**L = 第一次不可恢复失败前已验收的节点数**，进 τ.o。
+
+持久 episode 的 planner 每次读取当前 `episode.obs` 经 `graph.scene` 转换的场景，包含上一尝试留下的状态；完整图的合法性仍以 reset 时的 facts 为基准。环境创建后若 reset、driver 初始化或首次 observe 失败，会立即清理已取得的环境。episode 进入后，场景读取、规划、派发或证据写入异常都走同一清理出口；所有执行器连接均尝试关闭，一处关闭失败不会跳过其余连接，清理错误也不会掩盖原始执行异常。正常返回仍只关闭一次，取消与预算终止语义不变。
 
 进展规则（`protocol.replan_progress`）：对同一 (node, fault 签名)，同一 `graph_sha`（同 args、同 executor）的图只允许**一次原样重跑**；
 再次给出同图 → `task.replan_rejected {reason:"no_progress"}`，折回成 `no_progress` fault（携带原签名、graph_sha 与「同图已试过，改 args/executor 或加 recovery 节点」提示）交回 planner；
@@ -1590,8 +1656,8 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
 
 ### 9.4 卡怎么接入
 
-- 本体卡 manifest 加 `[[provides]]`（`kind ∈ {embodiment, predicate, recovery, skill, planner}`，
-  `ref = "module:attr"`；谓词必须带 `reads`）。`discover()` 折进 `Registry.provides`，
+- 本体卡 manifest 加 `[[provides]]`（`kind ∈ {embodiment, predicate, recovery, skill, planner, executor}`，
+  `ref = "module:attr"`；谓词必须带 `reads`，executor 条目多一个 `transport`，缺省 `inproc`）。`discover()` 折进 `Registry.provides`，
   形状错在 discover 就 `ValueError`。
 - 技能加一份 `skill-library/records/<name>.json`；不能执行的本体写 `implemented: false`，
   planner 看不见它。
@@ -1612,7 +1678,7 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
   按 seed 落在 `burned_blocks` 的 role 分（无 store → 全 dev，`o.role_source` 记来源）。
   e2e：`tests/test_mission_e2e.py`（G1–G4，真 runtime + 真 CLI）、`tests/test_mission_sim_e2e.py`（G5，robosuite）。
 
-测试：`tests/test_protocol.py`（Legal 四条 + 单调 + 三值 + 稳定 id）、`tests/test_predicates.py`、
+测试：`tests/test_protocol.py`（Legal 五条 + 单调 + 三值 + 稳定 id）、`tests/test_predicates.py`、
 `tests/test_static_skill_library.py`、`tests/test_task_protocol_events.py`、
 `tests/test_trajectories.py`、`tests/test_store.py::*burned_blocks*`。
 
@@ -1635,11 +1701,11 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
   以及底盘够得着的两个旋钮 `carry_stop`（载物 nav 离 dock 的停靠距离 0.65，NavigateDriver.CARRY_STOP）/ `nudge_max`（base_nudge 修复的底盘位移上限 0.15））是卡 manifest `[tunables]` 的数据，
   `drivers.tunables()` 读默认值并按进程用 `PH_TUNABLES='{"stall_k":20}'` 覆盖（未知键拒绝）；`drivers.tunables_sha()` 随每个 robocasa 段的
   `diagnostics.tunables_sha` 封入节点/`task.plan_complete.nodes`/`actuation_end`，同处 `diagnostics.failure_mode`（`"reach_stall"` = eef 到目标距离 K=stall_k 步不降，段提前失败）。
-  `[tunables]` 经 `manifest.mount_params` 到达该卡每个 driver provider（`params["tunables"]`，evolve 的 `PH_MOUNT_PARAMS_OVERRIDE` 同路并入，`drivers.mount_tunables` 一处共享读）；同卡 `[tunable_hints]`（`failure_mode → [先试的 knob…]`：`reach_stall` → carry_stop, nudge_max, drop_edge_margin, drop_over_dz, standoff, hover_dz, reach_tol；`nav_stall` → carry_stop, stall_k）同路到 `params["tunable_hints"]`，只有 evolve 的 proposer 读（§4.0 ②）；任一 nav 段（载物/空载，含 NavToObjectDriver）底盘到 dock 距离 K 步不降且离 dock > 到达带（载物 CARRY_NEAR，空载 NAV_POS_TOL）→ `failure_mode "nav_stall"`。pack_lunch / kitchen_thaw planner 同 recycle_cans：对 `no_progress` 按首死节点的阶段词插入本体声明的修复（nav/carry → `redock_retry`，grasp → `regrasp_kitchen`，pack/place → `reapproach`；载物段修复保持夹持）。
+  `[tunables]` 经 `manifest.mount_params` 到达该卡每个 driver provider（`params["tunables"]`，evolve 的 `PH_MOUNT_PARAMS_OVERRIDE` 同路并入，`drivers.mount_tunables` 一处共享读）；参数只声明可改的量，不声明按 failure_mode 排列的提案优先级；任一 nav 段（载物/空载，含 NavToObjectDriver）底盘到 dock 距离 K 步不降且离 dock > 到达带（载物 CARRY_NEAR，空载 NAV_POS_TOL）→ `failure_mode "nav_stall"`。pack_lunch / kitchen_thaw planner 同 recycle_cans：对 `no_progress` 按首死节点的阶段词插入本体声明的修复（nav/carry → `redock_retry`，grasp → `regrasp_kitchen`，pack/place → `reapproach`；载物段修复保持夹持）。
   trace：会 stall 的阶段（GraspDriver hover/descend、PointPlaceDriver/ClusterDropDriver/PlaceDriver over/lower、任一 nav 腿）在 `diagnostics.trace` 封 `{start,stall,end}`×`{eef,target,base:[x,y,yaw],d_eef_target,d_base_target,step}`（dock 目标 z=0）的数值几何——proposer 看得见够不着的落点；
   还带 `trace.series`：**每步一行**下采样到 ≤40 行的 `{step,phase,eef,target,base,d_eef,d_base,grip,cmd:{mode:"arm"|"base",nonzero:[通道名],norm}}`——`cmd` 是该步真正下发的动作，整段 `mode:"arm"` 即底盘从未被指令（drop 段正是如此：三点 base 相同，落点 1.03 m 外，段内无解）。
   `diagnostics.geometry` 给目标的**出处**：drop 段 = 炉灶 bbox（center/top_z/half_extent）+ `edge_margin`/`spread`/`drop_dz`/`slot` + 落点，nav 腿 = dock + `carry_stop`/`carry_near`/`nav_pos_tol`；两者都带 `reach_max`=0.664 m（实测手臂水平最大伸展，描述性常量，不是旋钮）与 `d_base_point`。
-  evolve 给每个跑过的段落 per_seed `nodes[].trace_end`（该段 trace 的 end 行），首死节点另有 `trace`（含 series）、`geometry` 与 `upstream:{node,skill,steps,trace_end}`（计划序里它前面那个 **segment**，跳过 verify/recovery：谁把底盘停在那里）；recovery 节点的 diagnostics 带 `base_travel`（底盘实际位移）。
+  evolve 给每个跑过的段落 per_seed `nodes[].trace_end`（该段 trace 的 end 行），所有带诊断的动作节点保留 `trace`（含 series）和 `geometry`，首死节点另有 `upstream:{node,skill,steps,trace_end}`（计划序里它前面那个 **segment**，跳过 verify/recovery：谁把底盘停在那里）；recovery 节点的 diagnostics 带 `base_travel`（底盘实际位移）。
 
 ### 9.7 Plan library and mission briefs
 
@@ -1670,7 +1736,10 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
 ### 9.9 Executor 契约
 
 - `harness/skill_executor.py`：`StepExecutor`（handshake/reset/act/done/diagnostics，harness 逐步 act）与 `SegmentExecutor`（handshake + `run(spec, deadline_s)->{ok, diagnostics}`，执行器自己跑完整个子目标）；`is_segment(x)` = 有 run 无 act。
-- `normalize_handshake(transport, ref, meta)` 是 `task.verify.driver.handshake` 唯一封存形状：`{transport: inproc|ssp|mcp, ref, checkpoint_sha|None, unverified:[...], ok, meta}`；未知 transport 挂载即报错。scripted / skill_geometric_grasp 走 inproc（`InprocExecutor` 基类），pi05 走 ssp（reconcile 结果经此归一化）。
+- `normalize_handshake(transport, ref, meta)` 是 `task.verify.driver.handshake` 唯一封存形状：`{transport: inproc|ssp|mcp, ref, checkpoint_sha|None, unverified:[...], ok, meta}`；未知 transport 挂载即报错。段驱动走 inproc（`InprocExecutor` 基类：`plugins/policies/drivers.py:ScriptedDriver`、
+`plugins/embodiment_robocasa/kitchen_driver.py:KitchenThawDriver`），pi05 走 ssp（reconcile 结果经此归一化）。
+`skill_geometric_grasp` 不在这张表里：它是一张 task binding 的 policy 卡
+（`[task_bindings.lift_geometric]` → `plugins.policies:lift_geometric_provider`），既不声明 executor，也不继承 `InprocExecutor`。
 - record `bindings[emb].policies[key]` 显式带 `transport`（缺省 inproc）；`skill_library.rearm(spec, arm, executor)` 返回 `{key, transport, ref, params, checkpoint_sha, spec}`，workload 按 ref 挂 provider、每节点 `make_driver`。
 - 段执行器接入点（`plugins/task/workload.py::_segment`）：rearm 后若 `is_segment(executor)`，不走 driver.act 循环，调 `run({skill,args,sigma}, SEGMENT_DEADLINE_S)`；stage driver 仍 `enter_segment`，其 `segment_success` 与图上的 verify 谓词照常判定——执行器的 ok 只是主张，验证永不外包；ok=false → 该节点 fault → replan。
 - 首个 MCP 段执行器卡 `plugins/executor_mcp_segment/`（provides executor `mcp_segment`, transport mcp）：`provider(command=[...])` 起子进程，stdio 上按行 JSON-RPC 2.0（MCP stdio）：`initialize` → `notifications/initialized` → `tools/call run_segment {skill,args,sigma,deadline_s}`；handshake = initialize 的 serverInfo。零新依赖（~40 行客户端）。
@@ -1686,6 +1755,11 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
 - `skill_benchmarks(records, cards, mission_cards)` → `{技能: [benchmark]}`：卡的 `embodiment` 在记录 `bindings` 里，且（卡没写 `tasks`，或某条 plan 记录的 task 在 `tasks` 里且用了该技能，或 benchmark 覆盖的某张 mission 卡在 `skills` 里列了它）。benchmark 卡的 `embodiment` / `tasks` 从 `plugins/benchmark_*/manifest.toml` 的 `[benchmarks.<name>]` 读，当数据看。
 - `benchmark_coverage(cards, mission_cards)` → `[(benchmark, 卡目录, task)]`：benchmark 的 task 是某张 mission 卡 `[task_bindings.<task>]` 的键，且同一 embodiment（binding 的 `env` ref 指向的 `embodiment_<x>` 卡）；`mission_uses(mission_cards)` → `[(卡目录, 技能)]`，读 binding 的 `skills` 行。
 - mission 卡的 `[task_bindings.<task>]` 多一行 `skills = [...]`（排序后的记录名，与规划器 `SKILL_RECORDS` 的键一一相等，`tests/test_mission_card_skills.py` 钉死）——board/ 只读这一行，永不 import `SKILL_RECORDS`。
+
+这三条关系只吃 `skill-library` 的记录。**另有一张图不在这里**：RoboCasa365 标注的统一技能图
+（`harness/unified_skill_graph.py`，文件在 `../sims/`）只在自然语言那条路上用，
+`plugins/task/skill_planning.py:skill_library_snapshot` 把它的 IS_A 树与已装 task catalogue 做
+**只读并集**交给控制台的技能库标签页；只有同名 catalogue 项算直接 binding，canonical 别名只列作候选（§6.1.2）。
 
 `board/vault.py:build_graph` 把静态技能库和这三条关系折进**同一张图**——控制台看到的技能图就是这一张，没有第二处：
 
@@ -1707,8 +1781,8 @@ workload 经 episode driver 的 `make_recovery` 缝在持久世界上跑完 acto
 
 ## 10. 没在这份文档里的东西
 
-**开发史与设计资本不随仓库发布。** 它们在 git 历史里，和操作员机器上的
-`local-archive/docs/`（git-ignored）里。两份被本文取代、只保留在本地归档
+**开发史与设计资本不随仓库发布。** 它们在 git 历史里，和
+`local-archive/docs/`（**随仓库发布的退休区，git 跟踪**）里。两份被本文取代、只保留在本地归档
 `local-archive/docs/retired-from-public/` 的：
 
 - `ph-station-design.md` —— 当初为什么 fork dsh、rebrand 要改哪 7 处上游源码和行号、

@@ -58,6 +58,15 @@ REACH_MAX = 0.664
 #: per-step ``Trace`` rows kept in the sealed series (the raw steps are downsampled).
 SERIES_MAX = 40
 
+# Coordinate declarations for generic action/response diagnostics. These only
+# describe trace fields, not task goals or reachable-distance thresholds.
+TRACE_GROUPS = {
+    "base_translation": {"state": "base", "axes": [0, 1], "target": "target",
+                         "commands": ["vx", "vy"], "mode": "base", "noise": 0.003},
+    "eef_translation": {"state": "eef", "axes": [0, 1, 2], "target": "target",
+                        "commands": ["dx", "dy", "dz"], "mode": "arm", "noise": 0.003},
+}
+
 
 def _r3(v) -> list:
     return [round(float(x), 3) for x in v]
@@ -71,6 +80,7 @@ def _cmd(a) -> dict:
     a = np.asarray(a, float)
     return {"mode": "base" if a[MODE] > 0 else "arm",
             "nonzero": [n for i, n in enumerate(CHANNELS) if i != GRIP and abs(a[i]) > 1e-3],
+            "values": {n: round(float(a[i]), 6) for i, n in enumerate(CHANNELS)},
             "norm": round(float(np.linalg.norm(np.delete(a[:TORSO + 1], GRIP))), 3)}
 
 # Navigate success tolerance == NavigateKitchen._check_success (kitchen_navigate.py).
@@ -198,6 +208,10 @@ class Trace:
             out["series"] = self.samples[::n]
             if out["series"][-1] is not self.samples[-1]:
                 out["series"].append(self.samples[-1])
+            out["groups"] = TRACE_GROUPS
+            out["sampling"] = {"kind": "complete" if n == 1 else "downsampled",
+                               "raw_samples": len(self.samples),
+                               "retained_samples": len(out["series"]), "stride": n}
         return out
 
 

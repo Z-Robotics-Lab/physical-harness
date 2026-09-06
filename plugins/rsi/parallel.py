@@ -2,13 +2,6 @@
 which makes the rollout budget a non-issue for gating; see local-archive/docs/retired-from-public/verified-environment.md."""
 from __future__ import annotations
 
-from collections.abc import Sequence
-
-from harness.spec import EpisodeSpec
-from plugins.rsi.governed import governed_rollout
-
-DEFAULT_WORKERS = 10
-
 
 def default_executor():
     """The exec.rollouts provider used when no executor is injected.
@@ -23,15 +16,3 @@ def default_executor():
     from harness.executor import LocalPoolExecutor
 
     return LocalPoolExecutor()
-
-
-def _one(spec: EpisodeSpec) -> dict:
-    return governed_rollout(spec, None)
-
-
-def rollout_many(specs: Sequence[EpisodeSpec], workers: int = DEFAULT_WORKERS,
-                 executor=None) -> list[dict]:
-    """Run every spec; results come back in submission order."""
-    if workers <= 1:
-        return [_one(s) for s in specs]
-    return (executor or default_executor()).map(_one, list(specs), workers=workers)

@@ -945,7 +945,8 @@ def run_chain(task: str, out: Path, *, workers: int = 10, stop_after: str = "hel
         prereg,
         env_provider=kernel.provider_ref("embodiment.env"),
         policy_provider=kernel.provider_ref("policy.driver"),
-        percept_provider=kernel.provider_ref("percept.model")).sha()
+        percept_provider=kernel.provider_ref("percept.model"),
+        reasoner=kernel.resolve("reasoner.proposer", consumer="rsi").identity).sha()
     report["preregistration_sha"] = stamped
     report["recovery_name"] = prereg.recovery_name
     beat("dev", cal_n + 1, prereg_sha=stamped[:12],

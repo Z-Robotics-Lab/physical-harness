@@ -15,10 +15,11 @@ import json
 
 import pytest
 from test_evolve_e2e import _CARD as _E2E_CARD
-from test_evolve_patch_e2e import GOOD, MODULE
+from test_evolve_patch_e2e import GOOD, INSTALLED, MODULE
 from test_mission_e2e import _Runtime
 
-from scripts import evolve, evolve_llm
+from scripts import evolve
+from scripts.evolve_evidence import inspect_evidence
 
 # ── trial_evidence: the diff against the baseline seed ────────────────────────────
 
@@ -54,13 +55,7 @@ def test_the_diff_says_what_the_trials_own_code_did_differently():
 
 
 def test_a_failure_mode_rides_only_when_that_side_actually_reported_one():
-    """``failure_mode_after`` is the causal reading the distances never gave -- and the
-    easiest one to fake. A candidate executor that reports no failure_mode leaves NO key
-    (D.merge_executor_diagnostics), and the absence has to survive to _trial_line, which
-    renders it 测不到. Over evolve-recycle_cans' 588 rounds the judged node read None on
-    364 of the 365 candidate trial rows, 347 of them at the segment cap, while the same
-    two nodes' scripted baseline rows carried the stall in 580 rounds: an unconditional
-    key told the model "failure_mode reach_stall→无" in essentially every candidate round."""
+    """Missing diagnostics stay absent through the model's history read."""
     def suite(fm):
         s = _suite(1, "drop-can1", BASE, 40)
         row = s["seeds"]["1"]["trail"][0]
@@ -74,9 +69,10 @@ def test_a_failure_mode_rides_only_when_that_side_actually_reported_one():
     assert "failure_mode_after" in answered and answered["failure_mode_after"] is None
     mute = evolve.trial_evidence(scripted, silent, "drop-can1", [1])["seeds"][0]["diff"]
     assert mute["failure_mode_before"] == "reach_stall" and "failure_mode_after" not in mute
-    line = evolve_llm._trial_line({"node": "drop-can1", "exception": None,
-                                   "seeds": [{"seed": 1, "diff": mute}]})
-    assert "本轮测不到（执行器没交回这个读数）" in line and "→无" not in line
+    ev = {"node": "drop-can1", "exception": None, "seeds": [{"seed": 1, "diff": mute}]}
+    exposed = inspect_evidence({"trial_evidence": ev}, {"view": "history"})["data"]["trial_evidence"]
+    assert "failure_mode_after" not in exposed["seeds"][0]["diff"]
+
 
 
 def test_a_trial_that_changed_nothing_says_so_and_a_missing_node_is_not_invented():
@@ -86,6 +82,19 @@ def test_a_trial_that_changed_nothing_says_so_and_a_missing_node_is_not_invented
     assert a["diff"]["base_moved"] is False and a["diff"]["steps_after"] == 40
     assert b["seed"] == 2 and "trace" not in b   # seed 2 never ran the node
     assert b["diff"]["steps_after"] is None and b["diff"]["base_moved"] is None
+
+
+def test_equal_steps_without_trace_do_not_claim_identical_trajectories_or_an_ineffective_change():
+    suite = {"count": 0, "seeds": {"1": {"success": False, "trail": [
+        {"id": "n", "kind": "segment", "steps": 40, "ok": False}]}}}
+    ev = evolve.trial_evidence(suite, suite, "n", [1])
+    diff = ev["seeds"][0]["diff"]
+    assert diff["steps_before"] == diff["steps_after"] == 40
+    assert diff["first_divergent_step"] is None and diff["base_moved"] is None
+    exposed = inspect_evidence({"trial_evidence": ev}, {"view": "history"})["data"]["trial_evidence"]
+    assert exposed["seeds"][0]["diff"] == diff
+    assert exposed["seeds"][0].get("trace") is None
+
 
 
 def test_the_summary_last_outcome_carries_drops_the_series_but_keeps_the_numbers():
@@ -155,13 +164,14 @@ HIT = "        if self.STOP < 0.5:"
 
 def _patch(name, new):
     return {"decision": "patch", "summary": "试一下。", "rationale": "grab never closes",
-            "payload": {"name": name, "module": MODULE, "to": "patched",
+            "payload": {"node": "grab-0", "name": name, "module": MODULE, "to": "patched",
                         "edits": [{"old": HIT, "new": new}]}}
 
 
-#: A patch decision with no payload: call 1 of every patch round now, since the brief
-#: carries no source and the answer must be written against the material (call 2).
-_ASK = {"decision": "patch", "summary": "先要源码。", "rationale": "grab never closes"}
+# An explicit source read precedes the compatibility proposal syntax. The real
+# tool protocol and dynamic choose IDs have separate main-loop coverage.
+_ASK = {"op": "inspect", "args": {"view": "source", "node": "grab-0", "module": MODULE,
+                                "start": 1, "end": len(INSTALLED.read_text().splitlines())}}
 
 CANNED = [
     _ASK,   # round 1 call 1: the two-step answers with the material, no attempt spent
@@ -174,7 +184,7 @@ CANNED = [
     _ASK,   # round 2 call 1
     # round 2: the real fix -- it runs, wins, and the evidence says what it did
     {"decision": "patch", "summary": "把 STOP 调小。", "rationale": "the standoff never closes",
-     "payload": {"name": "grab_stop", "module": MODULE, "to": "patched", "edits": GOOD}},
+     "payload": {"node": "grab-0", "name": "grab_stop", "module": MODULE, "to": "patched", "edits": GOOD}},
 ]
 
 
@@ -186,6 +196,9 @@ def runtime(tmp_path_factory):
     rt.campaign = rt.session / "campaigns" / f"evolve-{TASK}" / "campaign.json"
     try:
         rt.run({"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 1, "arm": "auto"})
+        # Abstaining ends the run; an explicit resume supplies a new model attempt.
+        (runs / "canned.json").write_text(json.dumps(CANNED[4:]))
+        rt.run({"kind": "evolve", "task": TASK, "rounds": 1, "arm": "auto"})
         yield rt
     finally:
         rt.stop()
@@ -198,16 +211,25 @@ def test_a_raise_inside_the_candidate_is_the_rounds_finding_not_a_repr(runtime):
     # the static rejection rode the repair loop, and it cost no simulator seed (whichever
     # door fired: write_patch checks a patch first, evolve.self_check is the last gate)
     assert "self._last_d" in audit["attempts"][0]["reason"]   # whichever door names it
-    assert "RuntimeError" in audit["attempts"][1]["reason"] and "act blew up" in audit["attempts"][1]["reason"]
-    exc = r1["trial_evidence"]["exception"]
+    assert audit["attempts"][1]["error"]["type"] == "RuntimeError"
+    assert "act blew up" in audit["attempts"][1]["reason"]
+    # This was a failed probe, never a full paired result. Rich exception evidence
+    # remains sealed under its actual scope instead of manufacturing after/full.
+    assert r1["after"] is None and r1["trial"] is None
+    assert r1["trial_evidence"]["exception"] is None
+    probe, = r1["learning"]["probes"]
+    assert probe["scope"] == "probe" and probe["accepted"] is False
+    exc = probe["error"]
     assert (exc["type"], r1["tried"]["kind"], r1["accepted"]) == ("RuntimeError", "none", False)
     assert exc["message"] == "act blew up" and exc["line"] > 0
     assert exc["file"].endswith("patch_stage.py") and any("act blew up" in t for t in exc["traceback"])
     assert 0 < len(exc["traceback"]) <= 15
-    # and the NEXT round's model actually read it: last_outcome carried it into the brief
+    # The resumed model sees a compact historical probe error; complete error
+    # context remains in the exploration report and the requested history view.
     nxt = json.loads((runtime.campaign.parent / "llm" / "round-2.json").read_text())
-    assert nxt["brief"]["last_outcome"]["trial_evidence"]["exception"]["type"] == "RuntimeError"
-    assert "act blew up" in json.dumps(nxt["brief"]["last_outcome"]["trial_evidence"])
+    previous = nxt["brief"]["historical_probe_replay"][0]
+    assert "RuntimeError" in previous["error"] and "act blew up" in previous["error"]
+    assert previous["measurement_sha"] is None
 
 
 def test_a_candidate_that_runs_reports_the_before_after_diff(runtime):

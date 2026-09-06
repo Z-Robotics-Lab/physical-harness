@@ -26,10 +26,10 @@ from plugins.task import workload
 from profiles import base_profile
 from scripts import harness_runtime as runtime
 
-#: The base plan sha sealed in runs/round25-rerun (a kernel.mount plan_sha). The
-#: manifest fold must reproduce it byte-for-byte -- installing a task-only card
-#: (skill_toy) declares no mount, so the base identity is unchanged.
-_SEALED_BASE_SHA = "b905a5119415de325c8c1d13f7c8a552eb3b2e8565e0a8af4ef7ca9c5f4c1a7c"
+#: Current installed LLM-only base manifest, measured after replacing the reasoner
+#: mount's search parameters with endpoint/decode parameters. Task-only cards and
+#: alternate bundles still leave this manifest identity unchanged.
+_LLM_BASE_SHA = "918d1144fe8d9a4f3146ddd0f2a5584682ec17a44e2f8c26ff0220d813e123e4"
 
 
 def _ok_rollout(spec, bundle=None):
@@ -48,13 +48,36 @@ def _write_manifest(root: Path, plugin: str, body: str) -> None:
     (root / plugin / "manifest.toml").write_text(body)
 
 
+def test_extra_provider_parameters_are_visible_but_cannot_shadow_installed_parameters(tmp_path, monkeypatch):
+    from harness.manifest import mount_params
+
+    installed, extra = tmp_path / "installed", tmp_path / "extra"
+    _write_manifest(installed, "original", '[mounts."policy.driver"]\n'
+                    'ref = "original:provider"\n[mounts."policy.driver".params]\nrate = 1.0\n')
+    _write_manifest(extra, "candidate", 'enabled = false\n[mounts."policy.driver"]\n'
+                    'ref = "candidate:provider"\n[mounts."policy.driver".params]\nrate = 2.0\n')
+    _write_manifest(extra, "shadow", 'enabled = false\n[mounts."policy.driver"]\n'
+                    'ref = "original:provider"\n[mounts."policy.driver".params]\nrate = 99.0\n')
+    monkeypatch.setenv("PH_PLUGINS_EXTRA", str(extra))
+    monkeypatch.delenv("PH_MOUNT_PARAMS_OVERRIDE", raising=False)
+    assert mount_params("candidate:provider", installed) == {"rate": 2.0}
+    assert mount_params("original:provider", installed) == {"rate": 1.0}
+
+
 def test_toy_card_registers_a_task_without_touching_the_base():
     """The committed toy card's binding is in the union, and the base sha is
     unchanged -- a task-only card is a new selector, not a new experiment identity."""
     reg = discover()
     assert "toy" in reg.task_bindings, "the dropped-in card's task is in the union"
     assert reg.task_bindings["toy"]["planner"] == "plugins.skill_toy.planner:provider"
-    assert resolve_plan(base_profile()).sha() == _SEALED_BASE_SHA
+    assert resolve_plan(base_profile()).sha() == _LLM_BASE_SHA
+
+
+def test_default_reasoner_manifest_is_the_model_endpoint_adapter():
+    reasoner, = [m for m in resolve_plan(base_profile()).mounts if m.capability == "reasoner.proposer"]
+    assert reasoner.provider == "plugins.reasoner:provider"
+    assert reasoner.params == {"endpoint": "plugins.model_endpoint:provider", "attempts": 2,
+                               "max_tokens": 2048, "temperature": 0.0, "seed": 0}
 
 
 def test_runtime_accepts_the_manifest_declared_task(tmp_path, monkeypatch):
@@ -192,7 +215,7 @@ def test_committed_cards_declare_their_bundles_in_the_union():
 def test_bundles_do_not_move_the_base_plan_sha():
     """Bundles are alternate overlays, never folded into base_profile -- declaring
     them leaves the sealed base identity untouched."""
-    assert resolve_plan(base_profile()).sha() == _SEALED_BASE_SHA
+    assert resolve_plan(base_profile()).sha() == _LLM_BASE_SHA
 
 
 def test_profiles_bundle_builds_and_is_absent_from_the_base_mounts():

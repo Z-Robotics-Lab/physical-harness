@@ -752,7 +752,8 @@ def test_recycle_cans_planner_keeps_a_done_recovery_node_across_faults():
     pl = P.RecycleCansPlanner()
     cat, brief = P.CATALOGUE, {"facts": [], "objects": []}
     g1 = pl.plan({"task": "recycle_cans", "fault": {"kind": "no_progress", "node": "drop-can1"}})
-    done = ["survey", "plan-order", "recover-drop-can1"]
+    recovered = next(i for i, node in enumerate(g1["nodes"]) if node["id"] == "recover-drop-can1")
+    done = [node["id"] for node in g1["nodes"][:recovered + 1]]
     g2 = pl.plan({"task": "recycle_cans", "fault": {
         "kind": "node_failure", "node": "grasp-can2", "nodes_done": done}})
     assert "recover-drop-can1" in {n["id"] for n in g2["nodes"]}

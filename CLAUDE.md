@@ -24,6 +24,9 @@ the board (query it), architecture in `ARCHITECTURE.md`.
   write-ups, per-increment ledgers) goes to `local-archive/docs/`. Cite those
   by their `docs-dev/…` / `local-archive/…` path so a reader can tell at a
   glance that the reference does not ship.
+  Clean `docs-dev/` during each change: delete completed scratch plans and
+  superseded logs, merge duplicate reports, and retain one current design and
+  verification record. Keep unfinished research and unique experimental evidence.
 - **Evidence over demos.** A claim is worth exactly the sealed evidence behind
   it. An honest null and an honest NO-GO are deliverables, not failures.
 - **Never game a gate.** No tuning thresholds, swapping gates, or cherry-picking
@@ -57,18 +60,54 @@ provider.
 minimal form needs only a task name; the runtime runs allocate → calibrate →
 gates → prereg → dev → held-out → install by itself. See
 `docs/project-documentation.md` §4.
-`kind:"evolve"` is the lightweight loop (evolution mode only): per round look →
-an LLM (model_endpoint card, DeepSeek; `proposer:"rules"` opts out) reads the round's trails/log
-excerpt and answers ONE try (tunable, executor switch, or a code-as-policy card that must pass
-plugin_doctor; invalid/unreachable → the ±30% failure-mode-hinted rules) → same-seed re-run → publish
-only if the success count improves; cancel lands at the round boundary and a
-resubmit resumes from `campaign.json` cursor. See §4.0.
-An outside proposal (`submit_proposal` (JSON string on store/CLI, `proposal: dict` on MCP) → `runs/<session>/proposals/`, kind tunables|executor|card) replaces the built-in proposer for one round; same publish rule.
-Three things are never yours to pick:
+`kind:"evolve"` accepts optional `llm_model` and `llm_effort` for its next run.
+These select a model and declared effort on the installed endpoint; they do not
+select providers or change robot bindings. `board.store.rsi_model_options()`
+returns the available model IDs and configured efforts without credentials.
 
-- **The target node comes from first-death attribution**, not from you
-  (an explicit `node` override is recorded in the verdict).
-- **Thresholds come from `plugins/rsi/stats/search.py`**, not from you.
+`kind:"evolve"` is online program-policy learning inside the offline simulation
+laboratory (evolution mode only). Each sampling decision allows at most two batched evidence calls. The LLM samples a
+single development seed with `trial`, and may compose edits on a measured working
+parent across bounded cycles before `choose` runs the full paired seed suite.
+Working branches and policy/seed measurements survive cycles within the same run,
+incumbent, evaluator and seed range; exact repeated probes reuse their receipts.
+Process restarts retain compact experimental memory, not executable branches.
+Historical branches do not force a new cycle into selection before fresh sampling.
+Capabilities include editable module names; node-scoped catalogs expose exact source
+symbols. Invalid read arguments still cost model calls, but do not consume the
+successful-inspection allowance. Bounded literal source pages survive cycles only
+while their policy, binding and content remain valid; other evidence is refreshed.
+Use `board.store.rsi_command_summary` for bounded command/refusal counts without
+reading full experiment audits.
+Probes never promote a
+policy. Only a strict frozen verification gain without regression updates the
+campaign's program overlay. Finite briefs share call, input-byte and probe budgets. Explicit
+`continuous:true` renews bounded learning-cycle budgets until cancellation or
+a terminal error; cumulative run costs never reset. `rounds>0` caps completed
+cycles in this submission, including abstentions; `rounds:0` removes that cap.
+Each completed cycle proceeds directly to the next; full trajectories/source stay outside prompts until requested. This does
+not train model weights or install skills. The GOAL verification battery remains
+required for installation. Logs, before/after trajectories, videos and keyframes
+remain available through the board. See `docs/project-documentation.md` §4.0.
+Outside proposals use `submit_proposal`, with kind tunables|executor|card|plan;
+the same installed-authority validation applies. Cancel and resubmit use the
+brief lifecycle. A changed evaluator/source identity starts a new epoch without
+reinterpreting historical scores. Autonomous evolve proposals are LLM-only: omit
+`proposer` or use `llm`; `rules` is rejected. Endpoint failures seal an error and
+stop, never trigger a substitute candidate. A model abstention or exhausted
+candidate-repair budget ends only the learning cycle. The scheduler continues within the finite brief budget or opens a new
+bounded cycle in explicit continuous mode. A stop reason for the entire run is
+recorded separately from the cycle outcome. No trial means
+no after measurement. Outside proposals remain an explicit submission interface
+for agents/operators; action candidates must name their node.
+
+Intervention and verification boundaries:
+
+- **In evolve, the model selects the intervention node** from observed installed
+  actions; first-death attribution is evidence, not a target-selection policy.
+  The older preregistered recovery campaign has its own attribution gate.
+- **Verification thresholds stay frozen.** The model may propose a trigger threshold
+  inside the declared candidate grammar; it cannot change the statistical gates.
 - **If an embodiment has no registered recovery primitive, say "nothing to work
   with"** — never improvise an action to fill the gap.
 
@@ -130,6 +169,8 @@ round; never edit the old one.
   what is burned (that is `board.store.burned_blocks`), and `rsi_campaign`
   prints a STATUS.md-shaped paragraph for the operator without appending it.
 
-Before you start: skim the board's recent rounds. This repository's history is
-full of "looked right but a fake predicate said so" lessons — reading for five
-minutes is cheaper than rediscovering one.
+Framework development uses compact board summaries and structured metrics only.
+Full RSI experiment logs, videos, trajectories, failure diagnosis and benchmark
+sampling belong to the built-in physical agent. Do not inspect that material or
+advance benchmarks on its behalf; use concise reported outcomes to improve the
+framework, and validate changes with focused regression tests.

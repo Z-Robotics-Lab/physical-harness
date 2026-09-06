@@ -111,14 +111,9 @@ def run(
     content-hashes and audits cleanly (harness/registry.py; ARCHITECTURE.md's
     "L0 迁移方式").
 
-    The mounted `reasoner.proposer` drives `run_campaign`'s per-generation
-    proposal ONLY when it declares a model `identity` (an LLM card, e.g.
-    `plugins.model_qwen`): that identity is content, so `run_campaign` stamps it
-    into the seal. The deterministic reference (`plugins.reasoner`) declares
-    none and falls through to `run_campaign`'s byte-identical internal proposer
-    -- passing the generic search seam instead would drop `propose_rule`'s
-    campaign-internal tie-break audit and its prereg-aware recovery/rule_id, so
-    a sealed campaign would silently regress (tests/test_reasoner_seam.py).
+    The mounted `reasoner.proposer` always drives candidate generation. Its
+    declared identity is sealed by `run_campaign`; absence of an identity never
+    switches execution to a different proposer.
 
     After the campaign returns, every rule it promoted is published as a
     `SkillRecord` to the resolved `graph.skill` provider. Returns
@@ -149,12 +144,8 @@ def run(
     )
     store = CampaignStore(Path(store_root))
     start_seq = store.size()
-    # Drive the mounted reasoner only when it declares a model identity (see the
-    # docstring); the deterministic reference falls through to run_campaign's
-    # byte-identical internal proposer.
-    reasoner_arg = reasoner if getattr(reasoner, "identity", None) is not None else None
     result = campaign.run_campaign(prereg2, store, workers=workers, verbose=verbose,
-                                   executor=executor, reasoner=reasoner_arg)
+                                   executor=executor, reasoner=reasoner)
 
     mount_plan_sha = _mount_plan_sha(kernel)
     heldout = result.get("heldout") or {}

@@ -55,6 +55,8 @@ def test_determinism_plan_and_replan_are_byte_identical():
 
 
 def test_binding_folds_and_base_sha_is_untouched():
+    from test_manifest import _LLM_BASE_SHA
+
     reg = discover()
     b = reg.task_bindings.get("kitchen_thaw")
     assert b is not None, "kitchen_thaw not discovered"
@@ -63,8 +65,8 @@ def test_binding_folds_and_base_sha_is_untouched():
     for key in ("env", "percept", "policy", "planner", "catalogue", "oracles",
                 "predicates", "episode", "segment_specs"):
         assert key in b, f"binding missing {key}"
-    # the card declares NO mounts -> base_profile sha is the sealed b905a51
-    assert resolve_plan(base_profile()).sha().startswith("b905a51")
+    # A task-only card adds no mounts to the current LLM-only base manifest.
+    assert resolve_plan(base_profile()).sha() == _LLM_BASE_SHA
 
 
 def test_every_ref_resolves_base_clean():

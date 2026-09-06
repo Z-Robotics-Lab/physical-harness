@@ -82,11 +82,12 @@ def test_replan_keeps_a_done_clear_node_for_a_dropped_object():
     # refuses a graph that loses finished work), while its failing verify goes.
     p = ClearWorkspacePlanner()
     brief = {"task": "clear_workspace"}
-    p.plan(brief)
+    original = p.plan(brief)
+    completed = next(i for i, node in enumerate(original["nodes"]) if node["id"] == "clear-cereal")
+    done = original["nodes"][:completed + 1]
     nxt = p.plan({**brief, "fault": {
         "kind": "node_failure", "node": "verify-cereal",
-        "nodes_done": ["survey", "plan-order", "clear-milk", "verify-milk",
-                       "clear-bread", "verify-bread", "clear-cereal"]}})
+        "nodes_done": [node["id"] for node in done]}})
     ids = [n["id"] for n in nxt["nodes"]]
     assert "clear-cereal" in ids and "verify-cereal" not in ids
     kept = next(n for n in nxt["nodes"] if n["id"] == "clear-cereal")
@@ -94,7 +95,6 @@ def test_replan_keeps_a_done_clear_node_for_a_dropped_object():
         and kept["kind"] == "segment"
     # still verify-covered, and the whole graph clears the hardened validator
     assert {"after": "clear-cereal", "predicate": "lifted"} in nxt["verify"]
-    done = [{"id": "clear-cereal", "skill": "clear", "args": {"object": "cereal"}}]
     ok, msg = validate_plan(nxt, CATALOGUE, ORACLES, done=done)
     assert ok, msg
 

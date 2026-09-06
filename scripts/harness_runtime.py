@@ -1055,6 +1055,9 @@ def _seal_rounds(rt: Runtime, brief_id: str, task: str, path: Path) -> None:
               if r["kind"] == "rsi_step" and r["data"].get("task") == task}
     for rd in doc.get("rounds") or ():
         if rd["round"] not in sealed:
+            if rd.get('sharded'):
+                shard = path.parent / 'rounds' / f"{int(rd['round'])}.json"
+                rd = json.loads(shard.read_text())
             if rd.get("proposal"):   # the inbox entry this round consumed, sealed first
                 rt.log.append("rsi_proposal_applied", {"brief": brief_id, "task": task,
                                                        "round": rd["round"], **rd["proposal"]})
@@ -1064,7 +1067,15 @@ def _seal_rounds(rt: Runtime, brief_id: str, task: str, path: Path) -> None:
                                                                  "per_seed", "needs", "proposer", "llm",
                                                                  "parent", "outcome", "confirm", "usage",
                                                                  # the round's diagnosis and its acceptance
-                                                                 "layer", "notes", "regression", "burned")}})
+                                                                 "layer", "notes", "regression", "burned",
+                                                                 "accepted", "accepted_reason", "after_seeds",
+                                                                 "before_score", "after_score", "trial_evidence",
+                                                                 "evaluation", "diagnosis", "experience", "transfer",
+                                                                 "experiments", "learning", "policy", "run_budget",
+                                                                 "cycle_budget", "cycle_outcome")},
+                                       "evaluation_contract": (doc.get('evaluation_contracts') or {}).get(
+                                           (rd.get('evaluation') or {}).get('objective_id'))
+                                       if rd.get('evaluation') else None})
 
 
 def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
@@ -1075,6 +1086,14 @@ def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
     as an ``rsi_step`` row (on each poll and at exit, cancel included). A cancel
     the loop sees at a round boundary exits nonzero -> the marker makes it
     ``runtime.task_cancelled``. Resubmitting the same task resumes from cursor."""
+    if brief.get('proposer', 'llm') != 'llm':
+        raise ValueError("RSI proposals are LLM-only; proposer must be omitted or 'llm'")
+    if type(brief.get('continuous', False)) is not bool:
+        raise ValueError('continuous must be a boolean')
+    from scripts.evolve_llm import model_request_config
+    if any(key in brief and not isinstance(brief[key], str) for key in ('llm_model', 'llm_effort')):
+        raise ValueError('llm_model and llm_effort must be strings when provided')
+    model_request_config(brief.get('llm_model'), brief.get('llm_effort', 'off'))
     task = brief["task"]
     if task not in rt.task_bindings:
         raise ValueError(f"no task binding for {task!r}; install a plugin that "
@@ -1083,15 +1102,24 @@ def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
     cmd = [sys.executable, str(REPO_ROOT / "scripts/evolve.py"), "--mode", "evolution",
            "--task", task, "--session", str(rt.inbox.parent),
            "--skills-root", str(rt.skills_root),
-           "--rounds", str(int(brief.get("rounds", 0))),   # 0 = until 停止
+           "--rounds", str(int(brief.get("rounds", 0))),   # 0 removes the cycle cap, not a shared budget
            "--arm", str(brief.get("arm", "auto")),
            "--cancel-marker", str(_cancel_marker(rt, brief_id))]
+    if brief.get('continuous', False):
+        cmd.append('--continuous')
+    for key in ('llm_model', 'llm_effort'):
+        if key in brief:
+            cmd += [f"--{key.replace('_', '-')}", brief[key]]
     if brief.get("seeds"):
         cmd += ["--seeds", str(int(brief["seeds"][0])), str(int(brief["seeds"][1]))]
-    if brief.get("proposer"):   # llm (default) | rules
-        cmd += ["--proposer", str(brief["proposer"])]
-    for k in ("max_replans", "max_actuations", "confirm_seeds"):   # budgets: brief > binding > workload default
+    for k in ("max_replans", "max_actuations", "confirm_seeds", "max_model_calls",
+              "max_input_bytes", "max_output_tokens", "max_probe_episodes"):
         if brief.get(k) is not None:
+            if k.startswith(('max_model_', 'max_input_', 'max_output_', 'max_probe_')):
+                value = brief[k]
+                minimum = 1 if k == 'max_output_tokens' else 0
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                    raise ValueError(f'{k} must be an integer >= {minimum}')
             cmd += [f"--{k.replace('_', '-')}", str(int(brief[k]))]
     seal = lambda: _seal_rounds(rt, brief_id, task, out / "campaign.json")
     env = {**os.environ, "MUJOCO_GL": "egl"}
@@ -1210,8 +1238,9 @@ _BRIEF_KEYS = {
     "suite": {"kind", "suite", "arm", "seeds", "max_replans", "max_actuations"},
     "rsi": {"kind", "task", "node", "cal", "dev", "heldout", "workers", "floor"},
     "mission": {"kind", "mission", "seed", "arm", "max_replans", "max_actuations"},
-    "evolve": {"kind", "task", "seeds", "rounds", "arm", "max_replans", "max_actuations", "proposer",
-               "confirm_seeds"},
+    "evolve": {"kind", "task", "seeds", "rounds", "continuous", "arm", "max_replans", "max_actuations", "proposer",
+               "confirm_seeds", "max_model_calls", "max_input_bytes", "max_output_tokens", "max_probe_episodes",
+               "llm_model", "llm_effort"},
 }
 _MAX_INSTRUCTION_CHARS = 4000
 

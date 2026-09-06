@@ -65,13 +65,6 @@ carry_stop = 0.65    # NavigateDriver loaded leg: stop this far from the dock; t
                      # stage's arm covers the rest (m) -- the base-reach knob
 nudge_max = 0.15     # base_nudge recovery: base travel bound toward the target (m)
 
-# failure_mode -> the tunables evolve's proposer perturbs FIRST for a first death
-# in that mode (manifest.mount_params hands it to the proposer as
-# params["tunable_hints"]); knobs not listed follow, in name order.
-[tunable_hints]
-reach_stall = ["carry_stop", "nudge_max", "drop_edge_margin", "drop_over_dz", "standoff", "hover_dz", "reach_tol"]
-nav_stall = ["carry_stop", "stall_k"]
-
 # Predicates this card provides (the free-oracle factories in predicates.py;
 # harness.predicates folds them). reads = sigma keys, args = factory params.
 

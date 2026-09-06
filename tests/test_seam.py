@@ -16,6 +16,7 @@ local-archive/docs/retired-from-public/observability-design.md's spawn findings)
 from __future__ import annotations
 
 import dataclasses as dc
+import json
 import pickle
 
 import numpy as np
@@ -97,11 +98,14 @@ def test_governor_policies_satisfies_policy_factory():
     assert isinstance(load_provider(POLICY_REF), PolicyFactory)
 
 
-def test_search_reasoner_satisfies_reasoner():
+def test_model_reasoner_satisfies_reasoner(tmp_path, monkeypatch):
+    reply = tmp_path / "model.json"
+    reply.write_text(json.dumps({"kind": "none", "reason": "No measured intervention yet."}))
+    monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(reply))
     assert isinstance(load_provider(REASONER_REF), Reasoner)
 
 
-def test_search_reasoner_propose_thin_adapter_round_trips():
+def test_model_reasoner_propose_thin_adapter_round_trips(tmp_path, monkeypatch):
     """Not required by the contract shape check above, but this is new code:
     a brief in, a plain-Mapping proposal out, matching governor.proposer's
     own return shape (a Rule or None) collapsed through Rule.canonical().
@@ -122,11 +126,16 @@ def test_search_reasoner_propose_thin_adapter_round_trips():
         })
         labels.append(not failing)
 
+    reply = tmp_path / "model.json"
+    reply.write_text(json.dumps({"feature": "observable.finger_gap", "op": "lt", "threshold": 0.02,
+                                 "dwell": 1, "arm_after": 10, "reducer": "value", "recovery": "regrasp"}))
+    monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(reply))
     reasoner = load_provider(REASONER_REF)
     out = reasoner.propose({"traces": traces, "labels": labels, "generation": 1,
-                            "prereg": prereg})
+                            "prereg": prereg, "strategies": ("regrasp",)})
     assert isinstance(out, dict) and "rule" in out
-    assert out["rule"] is None or out["rule"]["rule_id"] == "g1"
+    assert out["status"] == "proposed" and out["rule"]["rule_id"] == "g1"
+    assert out["rule"]["trigger"]["threshold"] == 0.02 and reasoner.identity.startswith("llm_reasoner:")
 
 
 # --- (c) make_env dispatch equivalence, with ONE short real env build -------

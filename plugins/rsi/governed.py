@@ -238,15 +238,23 @@ def open_episode(spec: EpisodeSpec):
     """Open a PERSISTENT episode: make env, reset, build + observe the driver --
     the make+reset+observe prefix ``governed_rollout`` runs before it drives,
     factored so a persistent EpisodeContext (plugins/task/workload.py, M7) opens
-    the world the SAME way a one-shot rollout does. The caller owns ``env.close()``
-    and fires it ONCE at mission end -- not per sub-goal, the whole point of M7.
+    the world the SAME way a one-shot rollout does. After a successful return,
+    the caller owns ``env.close()`` and fires it once at mission end. Initialization
+    failures close the acquired environment here before propagating the error.
     Returns ``(embodiment, env, obs, driver)``, the live handles a segment reuses.
     """
     embodiment = _embodiment(spec)
     env = embodiment.make_env(spec)
-    obs = env.reset()
-    driver = make_driver(spec)
-    driver.observe_once(obs)
+    try:
+        obs = env.reset()
+        driver = make_driver(spec)
+        driver.observe_once(obs)
+    except BaseException as error:
+        try:
+            env.close()
+        except BaseException as cleanup_error:  # noqa: BLE001 -- preserve the original initialization failure
+            error.add_note(f"Episode initialization cleanup also failed: {cleanup_error!r}")
+        raise
     return embodiment, env, obs, driver
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -28,7 +29,7 @@ _DEAD = "http://127.0.0.1:9/v1"
 class _Server(BaseHTTPRequestHandler):
     """A minimal OpenAI-shaped server: GET /models, POST /chat/completions."""
 
-    seen: dict = {}
+    seen: ClassVar[dict] = {}
 
     def do_GET(self):
         self._reply({"data": [{"id": "served-model"}]})
@@ -39,7 +40,7 @@ class _Server(BaseHTTPRequestHandler):
             "auth": self.headers.get("Authorization"),
             "body": json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
         }
-        self._reply({"choices": [{"message": {"content": "pong"},
+        self._reply({"choices": [{"message": {"content": "pong", "reasoning_content": "PRIVATE_REASONING_FIXTURE"},
                                   "finish_reason": "length"}]})
 
     def _reply(self, payload):
@@ -98,6 +99,17 @@ def test_chat_speaks_openai_shape_end_to_end(endpoint_url, monkeypatch):
     # the reply's own verdict on why it stopped: the evolve proposer reads "length" as
     # "the answer was cut off", which a completion-token count only ever approximates
     assert ep.last_finish == "length"
+
+
+def test_thinking_options_keep_the_completion_cap_and_do_not_expose_or_store_private_reasoning(endpoint_url):
+    ep = provider(base_url=endpoint_url, model="test-thinking-model")
+    answer = ep.chat([{"role": "user", "content": "Return an answer."}],
+                     thinking={"type": "enabled"}, reasoning_effort="low", max_tokens=4096)
+    assert _Server.seen["body"]["thinking"] == {"type": "enabled"}
+    assert _Server.seen["body"]["reasoning_effort"] == "low"
+    assert _Server.seen["body"]["max_tokens"] == 4096
+    assert answer == "pong"
+    assert "PRIVATE_REASONING_FIXTURE" not in json.dumps(vars(ep))
 
 
 def test_named_credential_falls_back_to_dsh_store_without_entering_identity(

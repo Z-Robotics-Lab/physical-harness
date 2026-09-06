@@ -341,6 +341,7 @@ class Node:
     after: tuple[str, ...] = ()
     on_fail: dict[str, Any] = field(default_factory=dict)   # {policy, budget?, rule?}
     executor: str | None = None     # explicit policy key (bindings.<emb>.policies); None = arm default
+    kind: str = "manipulate"
 
 
 @dataclass(frozen=True)
@@ -360,7 +361,8 @@ class ExecutionGraph:
                         for t in d.get("tasks", ())),
             nodes=tuple(Node(id=n["id"], task=n["task"], skill=n["skill"],
                              args=dict(n.get("args", {})), after=tuple(n.get("after", ())),
-                             on_fail=dict(n.get("on_fail", {})), executor=n.get("executor"))
+                             on_fail=dict(n.get("on_fail", {})), executor=n.get("executor"),
+                             kind=n.get("kind", "manipulate"))
                         for n in d.get("nodes", ())),
             rationale=str(d.get("rationale", "")), planner=dict(d.get("planner", {})))
 
@@ -400,7 +402,10 @@ class Trajectory:
 def to_plain(obj: Any) -> Any:
     """JSON-able form: dataclasses -> dicts, tuples -> lists, sets -> sorted lists."""
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name.rstrip("_"): to_plain(getattr(obj, f.name)) for f in fields(obj)}
+        out = {f.name.rstrip("_"): to_plain(getattr(obj, f.name)) for f in fields(obj)}
+        if isinstance(obj, Node) and obj.kind == "manipulate":
+            out.pop("kind")  # preserve the canonical form of existing default-kind graphs
+        return out
     if isinstance(obj, Mapping):
         return {str(k): to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (set, frozenset)):
@@ -555,14 +560,20 @@ def validate_graph(graph: Any, records: Mapping[str, SkillRecordV0],
 
 def replan_monotone(old_graph: Any, new_graph: Any, done_ids: Collection[str]
                     ) -> tuple[bool, list[str]]:
-    """D subset of nodes(G') with identical (skill, args) per done node.
-    Legality of G' against current facts is ``validate_graph``'s job."""
+    """Completed nodes retain execution identity and form the same ordered prefix.
+
+    The task scheduler skips completed ids. Moving them after unfinished work
+    would let graph validation credit effects that will never be executed there.
+    A completed node also cannot depend on unfinished work, even in an unordered
+    protocol graph. Remaining contract legality is ``validate_graph``'s job.
+    """
     old = old_graph if isinstance(old_graph, ExecutionGraph) else ExecutionGraph.from_dict(old_graph)
     new = new_graph if isinstance(new_graph, ExecutionGraph) else ExecutionGraph.from_dict(new_graph)
     o = {n.id: n for n in old.nodes}
     nw = {n.id: n for n in new.nodes}
+    done = set(done_ids)
     problems = []
-    for d in done_ids:
+    for d in sorted(done):
         if d not in o:
             problems.append(f"done node {d!r} is not in the old graph")
         elif d not in nw:
@@ -570,6 +581,18 @@ def replan_monotone(old_graph: Any, new_graph: Any, done_ids: Collection[str]
         elif (nw[d].skill, dict(nw[d].args)) != (o[d].skill, dict(o[d].args)):
             problems.append(f"replan rewrote done node {d!r}: {nw[d].skill}{dict(nw[d].args)} "
                             f"!= {o[d].skill}{dict(o[d].args)}")
+        elif (nw[d].kind, nw[d].task, nw[d].executor) != (o[d].kind, o[d].task, o[d].executor):
+            problems.append(f"replan rewrote done node {d!r} execution identity "
+                            "(kind, task, executor)")
+        if d in nw and set(nw[d].after) - done:
+            problems.append(f"done node {d!r} depends on unfinished nodes "
+                            f"{sorted(set(nw[d].after) - done)}")
+    if done <= o.keys() and done <= nw.keys():
+        expected = [n.id for n in old.nodes if n.id in done]
+        actual = [n.id for n in new.nodes[:len(expected)]]
+        if actual != expected:
+            problems.append("replan must preserve done nodes as an ordered prefix: "
+                            f"expected {expected}, got {actual}")
     return not problems, problems
 
 

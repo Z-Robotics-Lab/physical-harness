@@ -1,10 +1,8 @@
-"""The gradient and the accumulating accepted state (scripts/evolve.py): the lexicographic
-``score`` tuple, node-focused trials that stop before the full suite, and a partial win that
-joins ``accepted_stack`` and becomes the next round's baseline. Stdlib fakes, fake endpoint.
+"""Fixed world-verification vectors and accumulating development candidates.
 
-The fixture is the production shape: whole-task success is 0 on EVERY candidate (``grab``
-never passes), so the only gradient is how far the seeds get. ``reach`` passes for the seeds
-at or below the overlay knob ``reach_gate`` (baseline 1: seed 1 alone gets past it).
+The integration fixture keeps task success at zero while an independent world
+predicate improves. Historical campaign fixtures remain diagnostic evidence;
+without their original frozen oracle contract they cannot qualify as new wins.
 """
 
 from __future__ import annotations
@@ -13,12 +11,14 @@ import json
 import os
 from pathlib import Path
 
-from test_evolve_e2e import _OBS, _Env, _Planner, CATALOGUE, ORACLES  # noqa: F401
+import pytest
+from test_evolve_e2e import _OBS, CATALOGUE, ORACLES, _Env, _Planner  # noqa: F401
 
 from board import store as bs
 from harness import protocol
 from harness.fakes import _FakeEnvHandle
 from harness.skill_library import segment_specs
+from plugins.rsi import evaluation
 from scripts import evolve
 
 TASK = "e2e_score"
@@ -27,7 +27,11 @@ POLICY = "test_evolve_score:policy_provider"
 RECORDS = {"reach": {"id": "reach", "name": "reach", "kind": "segment", "args": {},
                      "bindings": {EMB: {"task": "reach"}}},
            "grab": {"id": "grab", "name": "grab", "kind": "segment", "args": {},
-                    "bindings": {EMB: {"task": "grab"}}}}
+                    "bindings": {EMB: {"task": "grab"}}},
+           "reached": {"id": "reached", "name": "reached", "kind": "verify", "args": {},
+                       "bindings": {EMB: {}}}}
+CATALOGUE = {**CATALOGUE, "reached": {}}
+PREDICATES = {"reached": "test_evolve_score:reached"}
 SEGMENT_SPECS = segment_specs(
     {k: protocol.SkillRecordV0.from_dict(v) for k, v in RECORDS.items()}, EMB)
 EPISODE = {"task": "reach", "horizon": 40}
@@ -48,10 +52,13 @@ class _SeedHandle(_FakeEnvHandle):
 
     def reset(self):
         super().reset()
+        self.achieved = set()
         return dict(_OBS)
 
     def step(self, action):
         self.t += 1
+        if action[0] == 1.0:
+            self.achieved.add("reach")
         return dict(_OBS), 0.0, False, {}
 
 
@@ -76,15 +83,16 @@ class _Driver:
 
     def act(self, obs):
         self.n += 1
-        return (0.0,)
+        return (self.command,)
 
     def enter_segment(self, env, spec, executor=None):
         self.n = 0
         RUNS.append((env.seed, _gate()))
-        self.ok = spec.task == "reach" and env.seed <= _gate()
+        self.task = spec.task
+        self.command = 1.0 if spec.task == "reach" and env.seed <= _gate() else 0.0
 
     def segment_success(self, env):
-        return self.ok
+        return self.task in env.achieved
 
 
 class _Policy:
@@ -100,12 +108,30 @@ def policy_provider(**params):
     return _Policy()
 
 
+def reached():
+    return lambda node, ctx: {"success": "reach" in ctx.episode.env.achieved}
+
+
+class _ScorePlanner(_Planner):
+    def plan(self, brief):
+        plan = super().plan(brief)
+        plan["nodes"].insert(1, {"id": "verify-reach", "skill": "reached", "kind": "verify",
+                                 "args": {}, "after": ["reach-0"]})
+        plan["nodes"][-1]["after"] = ["verify-reach"]
+        return plan
+
+
+def planner_provider():
+    return _ScorePlanner()
+
+
 _CARD = f"""
 [task_bindings.{TASK}]
 env = "{EMB}"
 policy = "{POLICY}"
-planner = "test_evolve_e2e:planner_provider"
-catalogue = "test_evolve_e2e:CATALOGUE"
+planner = "test_evolve_score:planner_provider"
+catalogue = "test_evolve_score:CATALOGUE"
+predicates = "test_evolve_score:PREDICATES"
 records = "test_evolve_score:RECORDS"
 oracles = "test_evolve_e2e:ORACLES"
 episodic = true
@@ -124,10 +150,19 @@ def _run(tmp_path, monkeypatch, canned, rounds=1) -> tuple[Path, dict]:
     root = tmp_path / "s"
     (tmp_path / "plugins" / "score").mkdir(parents=True)
     (tmp_path / "plugins" / "score" / "manifest.toml").write_text(_CARD)
+    params_card = tmp_path / "plugins" / "score_params"
+    params_card.mkdir()
+    (params_card / "manifest.toml").write_text(
+        f'enabled = false\n[mounts."policy.driver"]\nref = "{POLICY}"\n'
+        'params = {reach_gate = 1}\n')
     monkeypatch.setenv("PH_PLUGINS_EXTRA", str(tmp_path / "plugins"))
     monkeypatch.setattr(evolve, "_BASE_EXTRA", str(tmp_path / "plugins"))
     monkeypatch.delenv("MUJOCO_GL", raising=False)
-    (tmp_path / "canned.json").write_text(json.dumps(canned))
+    answers = []
+    for answer in canned:
+        answers.extend([{"op": "inspect", "args": {"view": "parameter",
+                        "node": answer["payload"]["node"], "parameter": "reach_gate"}}, answer])
+    (tmp_path / "canned.json").write_text(json.dumps(answers))
     monkeypatch.setenv("PH_MODEL_ENDPOINT_FAKE", str(tmp_path / "canned.json"))
     RUNS.clear()
     assert evolve.main(["--mode", "evolution", "--task", TASK, "--session", str(root),
@@ -136,39 +171,43 @@ def _run(tmp_path, monkeypatch, canned, rounds=1) -> tuple[Path, dict]:
     return root, json.loads((root / "campaigns" / f"evolve-{TASK}" / "campaign.json").read_text())
 
 
-# ── the score tuple, in the small ─────────────────────────────────────────────────
-
-def _suite(rows: dict) -> dict:
-    """A run_suite-shaped result from ``{seed: [(node, ok) | (node, ok, kind), ...]}``."""
-    done = lambda ns: all(n[1] for n in ns)
-    return {"count": sum(done(ns) for ns in rows.values()), "sha": "-",
-            "seeds": {str(s): {"success": done(ns), "nodes": {},
-                               "first_death": next((n[0] for n in ns if not n[1]), None),
-                               "trail": [{"id": n[0], "ok": n[1],
-                                          **({"kind": n[2]} if len(n) > 2 else {})} for n in ns]}
-                      for s, ns in rows.items()}}
+# The measured predicate has one fixed semantic identity. Scheduler trails below
+# may vary independently; only these oracle observations are reward evidence.
+_CHECK = {"id": "verified-reach", "kind": "verify", "skill": "reached", "args": {}}
+_CONTRACT = evaluation.compile_contract({"nodes": [_CHECK]}, task=TASK,
+                                        predicates=PREDICATES, terminal_ref=EMB)
 
 
-def test_score_orders_by_successes_then_milestones_then_the_target_node():
-    reached = _suite({1: [("nav", True), ("drop", False)]})
-    earlier = _suite({1: [("nav", False), ("drop", False)]})
-    won = _suite({1: [("nav", True), ("drop", True)]})
-    assert evolve.score(reached, "drop") == (0, 1, 0)
-    # the death moved EARLIER: worse, though the success count is 0 -> 0 either way
-    assert evolve.score(earlier, "drop") == (0, 0, 0) < evolve.score(reached, "drop")
-    assert evolve.score(won, "drop") == (1, 2, 1) > evolve.score(reached, "drop")
-    assert evolve.regressions(reached, earlier) == [{"seed": 1, "node": "nav",
-                                                     "was_ok_now_not": True}]
-    assert evolve.regressions(reached, won) == []
+def _verified(rows, *, trails=None, contract=None):
+    contract = contract or _CONTRACT
+    return {"count": 999, "sha": "display-count-is-untrusted", "seeds": {
+        str(seed): {"success": True, "trail": (trails or {}).get(seed, []),
+                    "evaluation": evaluation.evaluate(contract, [
+                        {"node": _CHECK, "authority": "predicate", "source": PREDICATES["reached"],
+                         "evidence_policy": "world-dependencies-v1", "blocked_reads": [],
+                         "success": checkpoint}],
+                        {"authority": "embodiment.terminal_success", "source": EMB,
+                         "success": terminal})}
+        for seed, (checkpoint, terminal) in rows.items()}}
 
 
-def test_focus_seeds_is_the_target_nodes_cluster_inside_the_dev_range():
-    before = _suite({1: [("nav", True), ("drop", False)],
-                     2: [("nav", False), ("drop", False)],
-                     3: [("nav", False), ("drop", False)]})
-    assert evolve.focus_seeds([], before, "nav", [1, 3]) == [2, 3]
-    assert evolve.focus_seeds([], before, "drop", [1, 3]) == [1]
-    assert evolve.focus_seeds([], before, None, [1, 3]) == []   # nothing to narrow to
+def test_only_a_measured_condition_creates_partial_progress():
+    before = _verified({1: (False, False)})
+    after = _verified({1: (True, False)})
+    result = evaluation.compare(before, after, _CONTRACT)
+    assert result["accepted"] and len(result["gains"]) == 1
+    assert result["before"]["progress"] == 0.0
+    assert result["after"]["progress"] == 0.5
+    assert result["after"]["successes"] == 0
+
+
+def test_scheduler_success_and_extra_nodes_never_create_a_gain():
+    before = _verified({1: (True, False)})
+    after = _verified({1: (True, False)}, trails={1: [
+        {"id": f"extra-{i}", "kind": "segment", "ok": True} for i in range(500)]})
+    result = evaluation.compare(before, after, _CONTRACT)
+    assert not result["accepted"] and result["gains"] == []
+    assert result["before"] == result["after"]
 
 
 # ── the loop, end to end on the fake endpoint ────────────────────────────────────
@@ -180,186 +219,106 @@ def test_a_partial_win_is_accepted_and_becomes_the_next_rounds_baseline(tmp_path
     # whole-task success never moves (0/3 both ways) -- the milestones do, so the round
     # is ACCEPTED without being PUBLISHED
     assert (r1["before"], r1["after"], r1["published"]) == (0, 0, False)
-    assert (r1["before_score"], r1["after_score"]) == ([0, 1, 1], [0, 3, 3])
+    assert (r1["before_score"], r1["after_score"]) == ([0, 1/6], [0, 0.5])
     assert (r1["outcome"], r1["accepted"]) == ("improved", True)
-    assert "no node regressed" in r1["accepted_reason"]
+    assert "without regressions" in r1["accepted_reason"]
     assert r1["trial"] == {"scope": "full", "seeds": [1, 2, 3], "target_pass": 3}
-    assert doc["accepted_stack"] == [
-        {"round": 1, "kind": "tunables", "score": [0, 3, 3],
-         "detail": {"node": "reach-0", "skill": "reach", "ref": POLICY,
-                    "path": ["reach_gate"], "from": None, "to": 3}}]
+    assert len(doc["accepted_stack"]) == 1
+    assert doc["accepted_stack"][0]["detail"] | {"node": "reach-0", "to": 3} == doc["accepted_stack"][0]["detail"]
     assert doc["applied"]["tunables"] == {POLICY: {"reach_gate": 3}}
     # the NEXT round starts from it: every seed now dies at grab-0, not at reach-0
     assert [s["first_death"] for s in r2["per_seed"]] == ["grab-0"] * 3
-    assert r2["before_score"] == [0, 3, 0] and r2["parent"] == 1
+    assert r2["before_score"] == [0, 0.5] and r2["parent"] == 1
     assert bs.rsi_campaigns(session)[0] | {"accepted_rounds": [1], "published_rounds": []} \
         == bs.rsi_campaigns(session)[0]
 
 
-def test_a_focused_trial_that_moves_a_death_earlier_is_worse_and_spends_no_full_suite(
+def test_a_full_paired_trial_that_loses_a_verified_condition_is_rejected(
         tmp_path, monkeypatch):
     session, doc = _run(tmp_path, monkeypatch, [_knob(0, "grab-0")])
     r = doc["rounds"][0]
-    # grab-0's cluster is seed 1 alone: the trial runs there, does not make grab-0 pass,
-    # and the other two seeds are never spent
-    assert r["trial"] == {"scope": "focused", "seeds": [1], "target_pass": 0}
-    assert {seed for seed, gate in RUNS if gate == 0} == {1}
-    assert r["usage"]["sim_s_saved"] > 0
+    assert r["trial"] == {"scope": "full", "seeds": [1, 2, 3], "target_pass": 0}
+    assert {seed for seed, gate in RUNS if gate == 0} == {1, 2, 3}
+    assert r["usage"]["sim_s_saved"] == 0
     # seed 1 lost reach-0: worse, not accepted, nothing joins the stack
-    assert (r["before_score"], r["after_score"]) == ([0, 1, 0], [0, 0, 0])
+    assert (r["before_score"], r["after_score"]) == ([0, 1/6], [0, 0.0])
     assert (r["outcome"], r["accepted"], r["published"]) == ("worse", False, False)
-    assert doc.get("accepted_stack") is None and doc["applied"]["tunables"] == {}
-    assert doc["last_outcome"]["regressions"] == [{"seed": 1, "node": "reach-0",
-                                                   "was_ok_now_not": True}]
-    assert doc["last_outcome"]["summary"] == "调闸" and doc["last_outcome"]["outcome"] == "worse"
+    assert doc.get("accepted_stack") == [] and doc["applied"]["tunables"] == {}
+    lost = doc["last_outcome"]["regressions"]
+    assert len(lost) == 1 and lost[0]["seed"] == "1" and lost[0]["before"] is True and lost[0]["after"] is None
+    assert doc["last_outcome"]["outcome"] == "worse"
     assert bs.rsi_campaigns(session)[0]["accepted_rounds"] == []
 
 
-# ── repairs: the node the planner inserts only after a failure ───────────────────
-# A ``recover-<node>`` exists BECAUSE ``<node>`` failed, so a patch that fixes the node
-# makes its repair vanish. Reading that as a lost node refused every measurable win of
-# the recycle_cans campaign (8 rounds, 131..389); counting it as a milestone scored the
-# run that NEEDED a recovery above the run that no longer does.
-
-def test_a_repair_that_vanished_because_its_target_passes_is_not_a_regression():
-    before = _suite({1: [("carry", True), ("recover-drop", True, "recovery"), ("drop", False)]})
-    after = _suite({1: [("carry", True), ("drop", True)]})
-    assert evolve.regressions(before, after) == []
-    # ...and the repair never counted as a milestone, so the win reads as a win
-    assert evolve.score(before, "drop") == (0, 1, 0)
-    assert evolve.score(after, "drop") == (1, 2, 1) > evolve.score(before, "drop")
+@pytest.mark.parametrize("repair", [[], [{"id": "recover-drop", "kind": "recovery", "ok": True}],
+                                      [{"id": "fix-drop", "kind": "recovery", "ok": False}]])
+def test_recovery_presence_names_and_self_reported_status_do_not_change_reward(repair):
+    before = _verified({1: (True, False)}, trails={1: [
+        {"id": "recover-drop", "kind": "recovery", "ok": True}]})
+    after = _verified({1: (True, False)}, trails={1: repair})
+    result = evaluation.compare(before, after, _CONTRACT)
+    assert not result["accepted"] and result["regressions"] == result["gains"] == []
+    assert result["before"] == result["after"]
 
 
-def test_a_repair_that_ran_again_and_failed_is_still_a_regression():
-    before = _suite({1: [("recover-drop", True, "recovery"), ("drop", False)]})
-    after = _suite({1: [("recover-drop", False, "recovery"), ("drop", False)]})
-    assert evolve.regressions(before, after) == [{"seed": 1, "node": "recover-drop",
-                                                  "was_ok_now_not": True}]
+def test_an_unobserved_previously_true_condition_is_a_regression_even_when_terminal_improves():
+    before = _verified({1: (True, False)})
+    after = _verified({1: (None, True)}, trails={1: [{"id": "drop", "ok": True}]})
+    result = evaluation.compare(before, after, _CONTRACT)
+    assert not result["accepted"] and len(result["gains"]) == len(result["regressions"]) == 1
+    assert result["regressions"][0]["after"] is None
 
 
-def test_a_repair_gone_while_its_target_still_fails_is_still_a_regression():
-    """The retry was dropped and the node it retried did not start passing: work lost."""
-    before = _suite({1: [("recover-drop", True, "recovery"), ("drop", False)]})
-    after = _suite({1: [("drop", False)]})
-    assert evolve.regressions(before, after) == [{"seed": 1, "node": "recover-drop",
-                                                  "was_ok_now_not": True}]
+def test_a_candidate_cannot_skip_an_unfavourable_seed():
+    before = _verified({1: (True, False), 2: (True, True)})
+    after = _verified({1: (True, True)})
+    result = evaluation.compare(before, after, _CONTRACT)
+    assert not result["accepted"] and "same nonempty seed set" in result["reason"]
 
 
-def test_an_ordinary_node_the_trial_dropped_is_still_a_regression():
-    """Only repairs get the exemption -- a plan that silently drops work is not a win."""
-    before = _suite({1: [("nav", True), ("carry", True), ("drop", False)]})
-    after = _suite({1: [("nav", True), ("drop", False)]})
-    assert evolve.regressions(before, after) == [{"seed": 1, "node": "carry",
-                                                  "was_ok_now_not": True}]
+def test_duplicate_or_renamed_checkpoint_nodes_do_not_inflate_the_contract():
+    duplicate = evaluation.compile_contract({"nodes": [{**_CHECK, "id": f"check-{i}"}
+                                                        for i in range(100)]},
+                                             task=TASK, predicates=PREDICATES, terminal_ref=EMB)
+    assert duplicate["sha"] == _CONTRACT["sha"] and len(duplicate["obligations"]) == 2
+    result = evaluation.compare(_verified({1: (True, False)}),
+                                _verified({1: (True, False)}, contract=duplicate), _CONTRACT)
+    assert not result["accepted"] and result["after"]["progress"] == 0.5
 
 
-def test_a_recovery_kind_known_on_one_side_only_is_still_a_repair():
-    """The kind is read from BOTH suites: the trial replanned and only its trail carries
-    the row (another seed still needs the repair), or only the baseline does. Merging the
-    two trails with either side winning loses the kind and the repair reads as a loss."""
-    # kind known from ``before`` only -- seed 1's repair is gone from the trial
-    before = _suite({1: [("fix-drop", True, "recovery"), ("drop", False)]})
-    after = _suite({1: [("drop", True)]})
-    assert evolve.regressions(before, after) == []
-    # kind known from ``after`` only -- seed 2 still needs the repair, seed 1 no longer does
-    before = _suite({1: [("fix-drop", True), ("drop", False)],
-                     2: [("fix-drop", True), ("drop", False)]})
-    after = _suite({1: [("drop", True)],
-                    2: [("fix-drop", True, "recovery"), ("drop", False)]})
-    assert evolve._recoveries(before, after) == {"fix-drop"}
-    assert evolve.regressions(before, after) == []
-    # neither side kinds it and it is not named ``recover-*``: it is an ordinary node
-    plain = _suite({1: [("fix-drop", True), ("drop", False)]})
-    assert evolve.regressions(plain, _suite({1: [("drop", True)]})) == [
-        {"seed": 1, "node": "fix-drop", "was_ok_now_not": True}]
+def test_missing_terminal_is_never_reconstructed_from_a_successful_report_node():
+    after = _verified({1: (True, None)}, trails={1: [
+        {"id": "report", "kind": "decide", "ok": True}]})
+    result = evaluation.summary(after, _CONTRACT)
+    assert result["successes"] == 0 and result["observed"] == 1
 
-
-def test_a_seed_the_trial_never_ran_is_not_a_regression():
-    """A focused trial folds the unrun seeds back in from the baseline (``_merge``), but
-    a suite that simply lacks the seed must not read every node it had as lost."""
-    before = _suite({1: [("nav", True), ("drop", False)], 2: [("nav", True), ("drop", False)]})
-    after = _suite({1: [("nav", True), ("drop", True)]})
-    assert evolve.regressions(before, after) == []
-    # a seed that DID run and lost the node is still caught
-    lost = _suite({1: [("nav", False), ("drop", False)], 2: [("nav", True), ("drop", False)]})
-    assert evolve.regressions(before, lost) == [{"seed": 1, "node": "nav",
-                                                 "was_ok_now_not": True}]
-
-
-def test_milestones_do_not_count_repairs_so_needing_a_recovery_never_scores_higher():
-    needed = _suite({1: [("carry", True), ("recover-drop", True, "recovery"), ("drop", False)]})
-    clean = _suite({1: [("carry", True), ("drop", False)]})
-    assert evolve.score(needed) == evolve.score(clean) == (0, 1, 0)
-
-
-# ── the real campaign: the eight rounds that measurably improved and were refused ──
 
 def _rounds() -> dict:
     return json.loads((Path(__file__).parent / "fixtures"
                        / "evolve_recycle_rounds.json").read_text())
 
 
-def _real(rows: list) -> dict:
-    """A run_suite-shaped result from a round's trimmed ``per_seed`` / ``after_seeds``."""
-    return {"count": sum(r["success"] for r in rows), "sha": "-",
-            "seeds": {str(r["seed"]): {"success": r["success"], "nodes": {},
-                                       "first_death": r["first_death"], "trail": r["nodes"]}
-                      for r in rows}}
+def _historical_suite(rows):
+    return {"seeds": {str(row["seed"]): {"success": row["success"], "trail": row["nodes"]}
+                      for row in rows}}
 
 
-def test_the_refused_recycle_cans_rounds_are_accepted_now():
-    """Rounds 131 and 389 of runs/session-robocasa-rsi (recycle_cans, 490 rounds, best 0,
-    accepted_stack empty): both moved seed 4243 from drop-can1 to a later death and made
-    the round's target node pass, and both were refused as
-    ``regressed: 4243/recover-drop-can1`` -- the repair that vanished because drop-can1
-    started passing. Nothing else about them may change silently."""
-    for rnd, want in (("131", [0, 13, 1]), ("389", [0, 16, 1])):
-        row = _rounds()[rnd]
-        before, after = _real(row["per_seed"]), _real(row["after_seeds"])
-        assert row["was"] == {"accepted": False,
-                              "reason": "regressed: 4243/recover-drop-can1"}
-        assert evolve.regressions(before, after) == []
-        bs = evolve.score(before, row["tried_node"])
-        assert list(bs) == [0, 9, 0] and list(evolve.score(after, row["tried_node"])) == want
-        assert evolve.score(after, row["tried_node"]) > bs   # accepted: score up, no regression
+@pytest.mark.parametrize("round_no", ["131", "389", "556"])
+def test_historical_node_trails_are_preserved_but_cannot_be_promoted_under_a_new_ruler(round_no):
+    row = _rounds()[round_no]
+    expected_reason = ("focused trial: nav-can1 passed on no seed of its cluster" if round_no == "556"
+                       else "regressed: 4243/recover-drop-can1")
+    assert row["was"] == {"accepted": False, "reason": expected_reason}
+    assert row["per_seed"] and row["after_seeds"]
+    assert all("nodes" in seed and "evaluation" not in seed for seed in row["after_seeds"])
+    result = evaluation.compare(_historical_suite(row["per_seed"]),
+                                _historical_suite(row["after_seeds"]), _CONTRACT)
+    assert not result["accepted"] and "lacks observations" in result["reason"]
 
 
-def test_a_focused_round_is_judged_by_the_score_like_any_other():
-    """Round 556 of the same campaign: 347 of its 588 rounds ended
-    ``focused trial: <node> passed on no seed of its cluster`` (nav-can1 196,
-    drop-can1 151) -- refused before the score was ever read. 556 had in fact run BOTH
-    dev seeds (4243 in preflight, 4244 in the focus: 59.8 sim_s) and still scored the
-    trial away. Judged on the score it is still refused, but for the true reason; and the
-    same judge accepts when the score DOES move -- 389's suites under 556's focused trial
-    row (389 itself ran ``scope: "full"`` and was refused ``regressed:
-    4243/recover-drop-can1``; the pairing is what makes this a focused round that won)."""
-    tie = _rounds()["556"]
-    assert tie["was"] == {"accepted": False,
-                          "reason": "focused trial: nav-can1 passed on no seed of its cluster"}
-    focused = dict(tie["trial"])
-    assert focused["scope"] == "focused"
-    tried = {"kind": "patch", "node": tie["tried_node"], "detail": {}}
-    judge = lambda row, node: evolve.verdict(
-        tried, focused, evolve.regressions(_real(row["per_seed"]), _real(row["after_seeds"])),
-        None, False, evolve.score(_real(row["per_seed"]), node),
-        evolve.score(_real(row["after_seeds"]), node))
-    assert judge(tie, tie["tried_node"]) == (False, "score [0, 9, 1] -> [0, 9, 1]")
-    won = _rounds()["389"]
-    accepted, why = judge(won, won["tried_node"])
-    assert accepted is True and why == "score [0, 9, 0] -> [0, 16, 1], no node regressed"
-
-
-def test_a_focused_accept_does_not_become_the_next_rounds_baseline():
-    """A focused trial's suite is ``_merge(before, done)``: every seed it never ran keeps a
-    row measured under the PREVIOUS state. Round 556's focus was 4244 alone, so accepting it
-    would have carried 4243's baseline row into the next round under a fresh ``suite_sha``,
-    where nothing can tell it from a measured one. ``next_baseline`` returns None and the
-    next round re-runs the suite -- one retest against a stale row that never expires. None
-    of the campaign's 347 focused rounds was accepted, so the cost is entirely future."""
-    kept = _real(_rounds()["556"]["after_seeds"])
-    focused = _rounds()["556"]["trial"]
-    assert focused["scope"] == "focused" and focused["seeds"] == [4244]
-    assert evolve.next_baseline(True, focused, kept) is None      # the one case that re-runs
-    assert evolve.next_baseline(False, focused, kept) is kept     # refused: nothing changed
-    assert evolve.next_baseline(True, {**focused, "scope": "full"}, kept) is kept
-    assert evolve.next_baseline(True, None, kept) is kept         # nothing tried
+def test_a_historical_focused_trial_is_not_relabelled_as_full_paired_evidence():
+    row = _rounds()["556"]
+    assert row["trial"]["scope"] == "focused" and row["trial"]["seeds"] == [4244]
+    result = evaluation.compare(_verified({4243: (True, False), 4244: (False, False)}),
+                                _verified({4244: (True, False)}), _CONTRACT)
+    assert not result["accepted"] and "same nonempty seed set" in result["reason"]

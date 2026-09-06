@@ -44,11 +44,10 @@ def validate_plan(plan: Mapping, catalogue: Mapping[str, Mapping[str, type]],
     authored by the skill side, never by the planner, which only selects and
     parameterizes. ``oracles`` are the verify predicates a plan may name.
 
-    ``done`` is the workload's own ledger of completed nodes (``{id, skill,
-    args}`` each), non-empty only on a replan: the new graph must carry every
-    one of them verbatim, because attribution, per-node billing, and
-    completed-node skipping all key on node ids across replans — a planner
-    that renames or rewrites finished work re-bills it silently.
+    ``done`` is the workload's ledger of completed node declarations, including
+    dispatch kind, task, executor and dependencies. A replan keeps their original
+    execution identity and ordered prefix: the runner skips these past actions,
+    so moving them cannot make their effects happen again.
 
     ``requirements`` is optional task-authored grounding. An ``objects`` list
     plus ``required_per_object_order`` requires exactly one call to each named
@@ -196,7 +195,7 @@ def validate_plan(plan: Mapping, catalogue: Mapping[str, Mapping[str, type]],
                                            f"expected {expected!r}")
     # Replan stability: every completed node must reappear byte-identical.
     if done:
-        old = {"mission": goal, "nodes": [{**d, "task": "main"} for d in done]}
+        old = {"mission": goal, "nodes": [{"task": "main", **d} for d in done]}
         ok, problems = replan_monotone(old, plan_to_graph(plan), [d["id"] for d in done])
         if not ok:
             return False, "; ".join(problems) + "; done nodes must be preserved verbatim"
@@ -211,7 +210,8 @@ def plan_to_graph(plan: Mapping) -> ExecutionGraph:
                   for t in plan.get("tasks") or ()) or (Task(id="main", goal=()),)
     nodes = tuple(Node(id=n["id"], task=n.get("task", tasks[0].id), skill=n["skill"],
                        args=dict(n["args"]), after=tuple(n["after"]),
-                       on_fail=dict(n.get("on_fail") or {}), executor=n.get("executor"))
+                       on_fail=dict(n.get("on_fail") or {}), executor=n.get("executor"),
+                       kind=n.get("kind", "manipulate"))
                   for n in plan["nodes"])
     return ExecutionGraph(mission=plan["goal"], seed=int(plan.get("seed", 0)),
                           tasks=tasks, nodes=nodes)

@@ -1,7 +1,7 @@
 """The proposals inbox end to end: ``submit_proposal`` / ``proposals`` byte-equal
 across the three faces, the REAL runtime + REAL scripts/evolve.py consuming a
 ``tunables`` proposal (round 1: the override reaches the driver, 0/2 -> 2/2,
-published, sealed ``rsi_proposal_applied``) then a ``card`` proposal (round 2: the
+accepted for development, sealed ``rsi_proposal_applied``) then a ``card`` proposal (round 2: the
 candidate dir mounted through PH_PLUGINS_EXTRA, its executor forced), and
 plugin_doctor GREEN on a candidate card directory.
 """
@@ -13,13 +13,14 @@ import os
 from pathlib import Path
 
 import pytest
-from test_mission_e2e import SESSION, _Runtime, _kinds
+from test_mission_e2e import SESSION, _kinds, _Runtime
 
 from board import mcp_server as ms
 from board import store as bs
 from board import storecli
 from harness import fakes, protocol
 from harness.manifest import discover, mount_params
+from harness.skill_executor import InprocExecutor
 from harness.skill_library import segment_specs
 from scripts import evolve, plugin_doctor
 
@@ -47,10 +48,16 @@ _OBS = {"robot0_gripper_qpos": [0.03, -0.03], "robot0_gripper_qvel": [0.0, 0.0],
 class _Handle(fakes._FakeEnvHandle):
     def reset(self):
         super().reset()
+        self.achieved = set()
         return dict(_OBS)
 
     def step(self, action):
+        assert len(action) == 1
         self.t += 1
+        if action[0] == 1.0:
+            self.achieved.add("reach")
+        elif action[0] == 2.0 and "reach" in self.achieved:
+            self.achieved.add("grab")
         return dict(_OBS), 0.0, False, {}
 
 
@@ -68,15 +75,17 @@ class _Env:
         return True
 
     def terminal_success(self, obs, spec, start_z, env=None):
-        return True
+        return {"reach", "grab"} <= env.achieved
 
 
-class _Driver:
+class _Driver(InprocExecutor):
     """grab succeeds only when the ``grip`` tunable (a proposal's override, read
     through manifest.mount_params) is >= 1, or under a non-scripted executor."""
     STEPS = 4
     n = 0
     ok = True
+    task = "grab"
+    executor = None
 
     @property
     def exhausted(self):
@@ -90,15 +99,19 @@ class _Driver:
 
     def act(self, obs):
         self.n += 1
-        return (0.0,)
+        if self.executor is not None:
+            return self.executor.act(obs)
+        return (1.0,) if self.task == "reach" else (2.0,) if self.ok else (0.0,)
 
     def enter_segment(self, env, spec, executor=None):
         self.n = 0
+        self.task = spec.task
+        self.executor = executor
         grip = (mount_params(POLICY).get("tunables") or {}).get("grip", 0)
         self.ok = spec.task != "grab" or executor is not None or grip >= 1
 
     def segment_success(self, env):
-        return self.ok
+        return self.task in env.achieved
 
 
 class _Policy:
@@ -173,7 +186,13 @@ def _candidate(root: Path) -> Path:
 
 @pytest.fixture(scope="module")
 def runtime(tmp_path_factory):
-    rt = _Runtime(tmp_path_factory.mktemp("runs"), card=_CARD, mode="evolution")
+    runs = tmp_path_factory.mktemp("runs")
+    params = runs / "plugins" / "params"
+    params.mkdir(parents=True)
+    (params / "manifest.toml").write_text(
+        'enabled = false\n[mounts."policy.driver"]\n' + f'ref = "{POLICY}"\n'
+        '[mounts."policy.driver".params.tunables]\ngrip = 0.0\n')
+    rt = _Runtime(runs, card=_CARD, mode="evolution")
     rt.campaign = rt.session / "campaigns" / f"evolve-{TASK}" / "campaign.json"
     rt.candidate = _candidate(rt.runs)
     yield rt
@@ -217,11 +236,12 @@ def test_three_faces_agree_on_submit_and_list(runtime, capsys):
 @pytest.fixture(scope="module")
 def two_rounds(runtime):
     sd = runtime.session
-    t = bs.submit_proposal(sd, _raw(TASK, "tunables", {"ref": POLICY, "path": ["tunables", "grip"],
+    t = bs.submit_proposal(sd, _raw(TASK, "tunables", {"node": "grab-0", "ref": POLICY, "path": ["tunables", "grip"],
                                                         "to": 1}, "grip harder"))["submitted"]
     c = bs.submit_proposal(sd, _raw(TASK, "card", {"path": str(runtime.candidate), "to": "cand",
                                                     "ref": CAND, "node": "grab-0"}, "try cand"))["submitted"]
-    name, rows = runtime.run({"kind": "evolve", "task": TASK, "seeds": [1, 2], "rounds": 2})
+    name, rows = runtime.run({"kind": "evolve", "task": TASK, "seeds": [1, 2],
+                              "rounds": 2, "confirm_seeds": 0})
     return t, c, name, rows
 
 
@@ -231,18 +251,17 @@ def test_evolve_consumes_a_tunables_then_a_card_proposal(runtime, two_rounds):
     assert doc["status"] == "done" and doc["cursor"] == 2
     r1, r2 = doc["rounds"]
     # round 1: the tunables proposal, applied instead of the built-in proposer; the
-    # override reached the driver (0/2 -> 2/2) so it was published
+    # override changed world state (0/2 -> 2/2), earning development acceptance.
     assert r1["tried"]["kind"] == "tunables" and r1["tried"]["node"] == "grab-0"
     d = r1["tried"]["detail"]
     assert (d["proposal"], d["note"], d["ref"], d["path"], d["to"]) == \
         (t, "grip harder", POLICY, ["tunables", "grip"], 1)
     assert (d["skill"], d["executor"]) == ("grab", "scripted")
-    assert (r1["before"], r1["after"], r1["published"]) == (0, 2, True)
+    assert (r1["before"], r1["after"], r1["accepted"], r1["published"]) == (0, 2, True, False)
     assert r1["proposal"] == {"id": t, "kind": "tunables", "note": "grip harder"}
     assert doc["applied"]["tunables"] == {POLICY: {"tunables": {"grip": 1}}}
-    rec = json.loads((runtime.session / "skills" / f"{d['digest']}.json").read_text())
-    assert rec["bindings"][EMB]["policies"]["scripted"]["params"] == {"tunables": {"grip": 1}}
-    assert rec["evidence"][EMB]["by_executor"]["scripted"] == {"n": 2, "k": 2}
+    assert "digest" not in d  # no installed record without the verification battery
+    assert r1["evaluation"]["installation"]["status"] == "not_evaluated"
     # round 2: the card proposal -- candidate mounted, executor forced, suite ran
     # (2/2 stays 2/2: consumed, not published, no error)
     assert r2["tried"]["kind"] == "card" and r2["tried"]["detail"]["proposal"] == c
@@ -263,24 +282,34 @@ def test_evolve_consumes_a_tunables_then_a_card_proposal(runtime, two_rounds):
     assert not _kinds(rows, "runtime.task_error")
 
 
-def test_card_root_mounts_and_a_winning_card_publishes_its_binding(runtime, tmp_path, monkeypatch):
+def test_card_root_mounts_and_accepted_overlay_retains_binding_without_installing(runtime, tmp_path, monkeypatch):
     # PH_PLUGINS_EXTRA may name ONE card dir (plugins/candidates/<name>)
     monkeypatch.setenv("PH_PLUGINS_EXTRA", str(runtime.candidate))
     prov = [p for p in discover().provides if p["plugin"] == "cand_fixture"]
     assert prov and prov[0]["kind"] == "skill" and prov[0]["name"] == "cand"
-    # publish(kind=card) writes the candidate's binding + its by_executor row
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    original = skills / "grab.json"
+    original.write_text(json.dumps(RECORDS["grab"]))
+    installed_before = original.read_bytes()
     tried = {"kind": "card", "node": "grab-0",
              "detail": {"skill": "grab", "executor": "scripted", "to": "cand", "ref": CAND,
                         "path": str(runtime.candidate), "params": {"k": 1}}}
-    after = {"seeds": {"1": {"nodes": {"grab-0": {"success": True}}}}}
-    _, d = evolve.publish(tmp_path / "skills", protocol.SkillRecordV0.from_dict(RECORDS["grab"]),
-                          EMB, tried, after)
-    assert d["bindings"][EMB]["policies"]["cand"] == {"ref": CAND, "params": {"k": 1}, "transport": "inproc"}
-    assert d["evidence"][EMB]["by_executor"]["cand"] == {"n": 1, "k": 1}
+    applied = {"executors": {}, "tunables": {POLICY: {"tunables": {"grip": 1}}}, "cards": {}}
+    accepted = evolve.apply(tried, applied)
+    assert accepted["executors"] == {"grab-0": "cand"}
+    assert accepted["tunables"] == applied["tunables"]
+    assert accepted["cards"]["cand"] == {
+        "skill": "grab", "path": str(runtime.candidate), "ref": CAND,
+        "params": {"k": 1}, "transport": "inproc",
+        "artifact_sha": evolve.evolve_llm.candidate_digest(runtime.candidate),
+    }
+    assert applied["executors"] == {} and applied["cards"] == {}
+    assert list(skills.iterdir()) == [original] and original.read_bytes() == installed_before
     # an incomplete proposal is an honest none, never a crash
     before = {"seeds": {"1": {"first_death": "grab-0",
                               "nodes": {"grab-0": {"skill": "grab", "success": False, "executor": "scripted"}}}}}
-    none = evolve.from_proposal({"id": "p", "kind": "card", "note": "", "payload": {"to": "x"}}, before)
+    none = evolve.from_proposal({"id": "p", "kind": "card", "note": "", "payload": {"node": "grab-0", "to": "x"}}, before)
     assert none["kind"] == "none" and "lacks" in none["detail"]["reason"] and none["detail"]["proposal"] == "p"
 
 

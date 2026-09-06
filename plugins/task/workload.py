@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib
 import itertools
 from collections.abc import Mapping
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -191,9 +192,21 @@ class EpisodeContext:
         """Idempotent single close -- the mission-end teardown, fired once."""
         if not self.closed:
             self.closed = True
-            self.env.close()
-            for factory in self.factories.values():  # an mcp server is a subprocess
-                getattr(factory, "close", lambda: None)()
+            with ExitStack() as cleanup:
+                for factory in reversed(list(self.factories.values())):
+                    cleanup.callback(getattr(factory, "close", lambda: None))
+                cleanup.callback(self.env.close)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, exc, _traceback):
+        try:
+            self.close()
+        except BaseException as cleanup_error:  # noqa: BLE001 -- retain the original execution failure
+            if exc is None:
+                raise
+            exc.add_note(f"Episode cleanup also failed: {cleanup_error!r}")
 
 
 @dataclass(frozen=True)
@@ -229,11 +242,122 @@ class NodeCtx:
     #: harness.media.SegmentRecorder (brief names a media_dir) or None: segment
     #: clips kept on verify success, dropped on failure; never chain evidence.
     media: Any = None
+    #: Workload-owned dependency provenance, keyed by the actual dispatched id.
+    #: Predicate payloads cannot label themselves as independent world evidence.
+    _provenance: Mapping[str, Mapping] = field(default_factory=dict, repr=False)
 
 
 #: A non-manipulate node seals zero privilege: decide/verify read only sealed
 #: prior facts, never a raw pose. Perceive overrides this with a measured budget.
 _ZERO_PRIV = {"privilege_features": (), "privilege_cost": 0}
+EVIDENCE_POLICY = "world-dependencies-v1"
+
+
+class _ReadAttributes:
+    """Preserve attribute values while recording dependency reads.
+
+    This is an audit of cooperative predicate code, not a Python sandbox. World
+    env/obs remain the original objects; arbitrary in-process mutation is outside
+    this boundary.
+    """
+
+    def __init__(self, read):
+        self._read = read
+
+    def __getattr__(self, name):
+        return self._read(name)
+
+
+class _ReadMapping(Mapping):
+    def __init__(self, values, read, structure):
+        self._values, self._read, self._structure = values, read, structure
+
+    def __getitem__(self, key):
+        return self._read(key)
+
+    def __iter__(self):
+        self._structure()
+        return iter(self._values)
+
+    def __len__(self):
+        self._structure()
+        return len(self._values)
+
+    def copy(self):
+        return dict(self.items())
+
+
+class _DependencyReads:
+    """Single-call, conservative provenance for a predicate's result.
+
+    Only facts from a clean perception and the live world inputs are admitted.
+    Reading a control result returns its original value for execution, but makes
+    the entire predicate result unavailable to independent evaluation. This also
+    catches eager reads whose value happens not to affect the final boolean.
+    """
+
+    def __init__(self, ctx: NodeCtx):
+        self.ctx = ctx
+        self.blocked: set[str] = set()
+
+    def block(self, path):
+        self.blocked.add(path)
+
+    def outputs(self):
+        def read(node_id):
+            path = f"ctx.nodes_out[{node_id!r}]"
+            origin = self.ctx._provenance.get(node_id) or {}
+            if origin.get("kind") != "perceive" or not origin.get("clean"):
+                self.block(path)
+                self.blocked.update(origin.get("blocked_reads") or ())
+                return self.ctx.nodes_out[node_id]
+            row = self.ctx.nodes_out[node_id]
+
+            def field(key):
+                if key != "facts":
+                    self.block(f"{path}[{key!r}]")
+                return row[key]
+
+            # ``nodes_out.get('survey') or {}`` is an existing idiom. The clean
+            # perception row's presence is allowed, but its success is not.
+            return _ReadMapping(row, field, lambda: None)
+
+        # Enumerating or counting the whole ledger exposes execution history.
+        return _ReadMapping(self.ctx.nodes_out, read, lambda: self.block("ctx.nodes_out[*]"))
+
+    def episode(self):
+        ep = self.ctx.episode
+        if ep is None:
+            return None
+
+        def spec_field(name):
+            if name not in ("task", "seed"):
+                self.block(f"ctx.episode.spec.{name}")
+            return getattr(ep.spec, name)
+
+        def read(name):
+            if name == "spec":
+                return _ReadAttributes(spec_field)
+            if name not in ("env", "obs"):
+                self.block(f"ctx.episode.{name}")
+            return getattr(ep, name)
+
+        return _ReadAttributes(read)
+
+    def context(self):
+        def read(name):
+            if name == "nodes_out":
+                return self.outputs()
+            if name == "episode":
+                return self.episode()
+            if name not in ("seed", "env_ref", "predicates"):
+                self.block(f"ctx.{name}")
+            return getattr(self.ctx, name)
+
+        return _ReadAttributes(read)
+
+    def metadata(self):
+        return {"evidence_policy": EVIDENCE_POLICY, "blocked_reads": sorted(self.blocked)}
 
 
 def _predicate(node: Mapping, ctx: NodeCtx):
@@ -253,6 +377,14 @@ def _predicate(node: Mapping, ctx: NodeCtx):
     return load_provider(ref)
 
 
+def _call_predicate(node: Mapping, ctx: NodeCtx):
+    """Evaluate once; retain operational values and audit their dependencies."""
+    predicate = _predicate(node, ctx)
+    reads = _DependencyReads(ctx)
+    raw = predicate(node, reads.context())
+    return raw, reads
+
+
 def _manipulate(node: Mapping, ctx: NodeCtx) -> dict:
     """The TODAY handler, byte-identical: a governed rollout under the node's
     task's assembled bundle. Ignores ``ctx.nodes_out``/``predicates``."""
@@ -268,9 +400,9 @@ def _perceive(node: Mapping, ctx: NodeCtx) -> dict:
     own ``privilege_cost`` (the exact function the episode's privilege gate
     measures against), so a perceive node pays the SAME accounting a critic pays;
     an undeclared feature raises in ``privilege_cost``."""
-    raw = _predicate(node, ctx)(node, ctx)
+    raw, reads = _call_predicate(node, ctx)
     features = tuple(raw.get("privilege", ()))
-    return {"success": bool(raw["success"]), "facts": raw.get("facts"),
+    return {"success": bool(raw["success"]), "facts": raw.get("facts"), **reads.metadata(),
             "governance": {"privilege_features": features,
                            "privilege_cost": privilege_cost(features)}}
 
@@ -278,17 +410,18 @@ def _perceive(node: Mapping, ctx: NodeCtx) -> dict:
 def _decide(node: Mapping, ctx: NodeCtx) -> dict:
     """A PURE function of ``ctx.nodes_out`` (prior facts + faults) -> a route.
     Zero privilege, deterministic in seed -> byte-identical replay."""
-    raw = _predicate(node, ctx)(node, ctx)
-    return {"success": bool(raw["success"]), "decision": raw.get("decision"),
+    raw, reads = _call_predicate(node, ctx)
+    return {"success": bool(raw["success"]), "decision": raw.get("decision"), **reads.metadata(),
             "governance": dict(_ZERO_PRIV)}
 
 
 def _verify(node: Mapping, ctx: NodeCtx) -> dict:
-    """A predicate over a prior node's sealed result (a privileged stage residual
-    thresholded, or a boolean AND of prior successes). Truth = machine predicate
-    over sealed residuals; on ``False`` the loop's existing fault->replan fires."""
-    raw = _predicate(node, ctx)(node, ctx)
-    return {"success": bool(raw["success"]), "governance": dict(_ZERO_PRIV)}
+    """Keep scheduling semantics; withhold evaluator truth after a blocked read."""
+    raw, reads = _call_predicate(node, ctx)
+    return {"success": bool(raw["success"]),
+            "verification_success": None if reads.blocked else protocol.tri(raw["success"]),
+            **reads.metadata(),
+            "governance": dict(_ZERO_PRIV)}
 
 
 def _episode_spec(brief: Mapping, *, seed: int, env_ref: str, policy_ref: str) -> EpisodeSpec:
@@ -583,14 +716,6 @@ def _graph(plan: Mapping, seed: int) -> protocol.ExecutionGraph:
     return plan_to_graph({**plan, "seed": seed})
 
 
-def _graph_sha(plan: Any) -> str | None:
-    """Chain identity of the graph proper: planner/rationale provenance excluded."""
-    if not isinstance(plan, Mapping):
-        return None
-    return protocol.content_id({k: v for k, v in plan.items()
-                                if k not in ("planner", "rationale")})
-
-
 def plans_for(skills, task: str, embodiment: str, arm: str) -> list[protocol.PlanRecord]:
     """The mounted PlanRecords (``kind == "plan"``) for one (task, embodiment,
     arm), best first (highest ``rule.lower``). Read-only over ``skills()``."""
@@ -730,11 +855,16 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
 
     plan: Mapping = {}
     nodes_out: dict[str, dict] = {}
+    node_provenance: dict[str, dict] = {}
     # The workload's OWN ledger of finished work ({id, skill, args} per done
     # node), fed to validate_plan on every replan: the untrusted planner must
     # carry each entry verbatim or the graph is refused (replan stability).
     done_specs: dict[str, dict] = {}
     faults: list[dict] = []
+    # Execution-owned readings for offline evaluation. Only non-actuating
+    # predicates enter this list; controller stopping tests and diagnostics
+    # are not independent task evidence.
+    verification_observations: list[dict] = []
     # protocol.replan_progress ledger: one {graph_sha, node, signature} row per
     # executed graph that faulted (segment retries included -- they are as-is runs).
     history: list[dict] = []
@@ -747,7 +877,7 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
     success = False
     # M7 opt-in: a brief that declares ``episodic`` opens ONE persistent world
     # here and threads it through every node; ``env.close()`` fires once in the
-    # finally below (win, abort, or horizon). Absent -> episode is None, today's
+    # context exit below, including exceptions. Absent -> episode is None, today's
     # fresh-per-node path, byte-identical (every existing card omits it).
     episode: EpisodeContext | None = None
     if brief.get("episodic"):
@@ -755,275 +885,314 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
         espec = _episode_spec(brief, seed=seed, env_ref=env_ref, policy_ref=policy_ref)
         embodiment, env, obs, driver = gov.open_episode(espec)
         episode = EpisodeContext(embodiment, env, driver, espec, obs)
-    # Built ONCE: nodes_out is passed by reference, so a decide/verify node
-    # reached later in the loop reads the facts earlier nodes have sealed;
-    # episode (if any) is the shared persistent world every segment drives.
-    ctx = NodeCtx(seed=seed, env_ref=env_ref, policy_ref=policy_ref,
-                  skills=skills, nodes_out=nodes_out, predicates=predicates,
-                  episode=episode, segment_specs=brief.get("segment_specs"), arm=arm,
-                  scene=scene, media=media.recorder_for(brief, seed))
-    # sigma0 for Legal(G): computed ONCE from the reset world (the persistent
-    # episode's first obs, else the empty pre-episode snapshot) and the card's
-    # declared facts, so Supported/Covered judge against real facts and objects.
-    sigma = episode.obs if episode is not None else {}
-    records = _records(brief, catalogue)
-    facts, objects = _sigma0(brief, scene.snapshot(sigma), sigma, records)
-    visible = sorted({r.name for r in records.values()})  # the planner-visible skill set
-    # The mounted PlanRecords + the embodiment ref they are keyed by, for the
-    # planner_library wrapper harness_runtime mounts; the row's fallback planner
-    # is the wrapped ref (``inner``) when the mount is that wrapper.
-    planner_ref = (kernel.provider_params("task.planner").get("inner")
-                   or kernel.provider_ref("task.planner"))
-    embodiment = str(brief.get("embodiment") or env_ref)   # the binding's ref, not an overlay
-    brief = {**brief, "facts": facts, "objects": objects, "embodiment": embodiment,
-             "plans": [r for r in skills if r.get("kind") == "plan"]}
-    while True:
-        # Pre-episode there is no obs; the empty snapshot is the honest scene
-        # until M2's World bridge feeds a live one. seed rides the brief so a
-        # frozen-graph planner (planner_vlm) can key its per-(task, seed) cache;
-        # deterministic planners ignore it.
-        brief = {**brief, "scene": scene.snapshot({}), "seed": seed,
-                 "budget": max_actuations - actuations}
-        # A low-level segment gets a bounded retry in the same world and on the
-        # same validated graph.  A controller miss is not evidence that the task
-        # decomposition changed, so do not spend a VLM call or a replan on it.
-        # A brief carrying a composed ``graph`` (a mission: tasks with real goals,
-        # nodes labelled by task) is executed as-is; its planner provenance rides
-        # the graph, so the mounted planner is never asked.
-        is_retry = retry_plan is not None
-        plan = retry_plan if is_retry else brief.get("graph") or planner.plan(brief)
-        retry_plan = None
-        ok, msg = validate_plan(
-            plan, catalogue, oracles, done=tuple(done_specs.values()),
-            requirements=brief.get("planning_context"))
-        if ok:
-            problems = _graph_problems(plan, prev_plan, done_specs, brief, catalogue, seed)
-            if problems:
-                ok, msg = False, "; ".join(problems)
-        reason = "invalid_plan"
-        if ok and replans and not is_retry:
-            # The progress rule: the same graph against the same (node, fault) is
-            # re-run as-is at most once; a second identical answer is refused and
-            # the planner is told what must change (NO_PROGRESS_HINT rides the fault).
-            progress, reason = protocol.replan_progress(history, plan, brief.get("fault"))
-            if not progress:
-                ok, msg = False, f"replan rejected: {reason}: {NO_PROGRESS_HINT}"
-        if ok:
-            prev_plan = plan
-        if not is_retry:
-            # One chain row per plan/replan DECISION, legal or not: an illegal
-            # graph is sealed as a negative sample, never dispatched.
-            kernel.note("task.plan", {
-                "replan": replans, "seed": seed, "mission": brief.get("task"),
-                "sigma0": brief["scene"], "skills": skill_ids,
-                "show_evidence": bool(brief.get("show_evidence")),
-                "done": sorted(done_specs), "fault": brief.get("fault"),
-                "graph": plan if isinstance(plan, Mapping) else None,
-                "graph_id": protocol.content_id(plan) if isinstance(plan, Mapping) else None,
-                # The chain link a PlanRecord is minted from: the graph's own id
-                # (meta stripped) plus who planned it -- "library" when a mounted
-                # PlanRecord was replayed, else the mounted planner's ref.
-                "graph_sha": protocol.graph_sha(plan) if isinstance(plan, Mapping) else None,
-                "planner": (dict(plan.get("planner")) if isinstance(plan, Mapping)
-                            and isinstance(plan.get("planner"), Mapping)
-                            else {"provider": planner_ref}),
-                "embodiment": embodiment, "arm": arm,
-                "rationale": plan.get("rationale", "") if isinstance(plan, Mapping) else "",
-                "facts": facts, "objects": objects, "visible": visible,
-                "legal": ok, "problems": [] if ok else [msg], "block": brief.get("block")})
-            if not ok and replans:
-                kernel.note("task.replan_rejected", {"replan": replans, "reason": reason,
-                                                     "problems": [msg]})
-        # Operational feed (harness.opstream; never chain evidence): the FULL
-        # node graph, the moment it exists, so the execution-graph panel draws
-        # the plan while the first node is still running.
-        nodes = list(plan.get("nodes") or []) if ok else []
-        opstream.emit("plan_built", replan=replans, valid=ok, msg=None if ok else msg,
-                      goal=plan.get("goal") if isinstance(plan, Mapping) else None,
-                      nodes=[{"id": n.get("id"), "skill": n.get("skill"),
-                              "args": dict(n.get("args") or {})} for n in nodes],
-                      verify=[dict(v) for v in (plan.get("verify") or [])] if ok else [])
-        fault: dict | None = None
-        if not ok and reason == "no_progress":
-            prev = brief.get("fault") or {}
-            fault = {**prev, "kind": "no_progress", "msg": msg,
-                     "signature": prev.get("signature") or prev.get("kind"),
-                     "graph_sha": protocol.graph_sha(plan)}
-        elif not ok:
-            fault = {"kind": "invalid_plan", "msg": msg}
-        else:
-            # nodes_out accumulates ACROSS replans: a node that already
-            # succeeded is finished work, skipped without re-running or
-            # re-billing -- a model-independent floor, like max_actuations.
-            for node in plan["nodes"]:
-                # The one cancellation checkpoint: BEFORE dispatch, so the node
-                # that already started finishes and the shared episode is never
-                # torn mid-segment.
-                if cancelled is not None and cancelled():
-                    fault = {"kind": "cancelled", "node": node["id"],
-                             "msg": "cancelled by the operator before node "
-                                    f"{node['id']!r}"}
-                    break
-                prior = nodes_out.get(node["id"])
-                if prior is not None and prior["success"]:
-                    continue
-                # The model-independent floor, enforced BEFORE dispatch: no
-                # planner, however eloquent, can mint extra actuations.
-                if actuations >= max_actuations:
-                    fault = {"kind": "budget", "node": node["id"],
-                             "msg": (f"max_actuations={max_actuations} reached "
-                                     f"before dispatching node {node['id']!r}")}
-                    break
-                actuations += 1
-                # ponytail: every dispatched node (any kind) counts one actuation
-                # against the model-independent floor; a heterogeneous mission sets
-                # max_actuations to cover its node count. Split into a separate
-                # counter only if a pure-fn node exhausting the floor ever bites.
-                kind = node.get("kind", "manipulate")
-                opstream.emit("node_start", node=node["id"], skill=node["skill"],
-                              node_kind=kind, actuation=actuations)
-                opstream.emit("actuation_start", node=node["id"], actuation=actuations)
-                # A composed graph namespaces ids by task ("thaw.survey"); a
-                # card's predicates read their OWN nodes by the card's ids, so a
-                # task-labelled node sees its task's entries under those too.
-                task = node.get("task")
-                local = {k[len(task) + 1:]: v for k, v in nodes_out.items()
-                         if task and k.startswith(f"{task}.")}
-                node_ctx = replace(ctx, nodes_out={**nodes_out, **local}) if local else ctx
-                try:
-                    result = _KIND_HANDLERS[kind](node, node_ctx)
-                except ValueError as exc:
-                    # A dispatch-time grounding refusal (an arg with no scene
-                    # binding, an undeclared predicate): the planner's fault,
-                    # not the loop's. With a trusted table planner this was a
-                    # wiring bug worth a crash; behind an untrusted VLM it is
-                    # exactly the boundary's job -- fold the refusal (which
-                    # names the known bindings) back into the next brief so a
-                    # replan can ground itself. Non-ValueError still crashes:
-                    # an env/driver bug is not the planner's to repair.
-                    fault = {"kind": "node_failure", "node": node["id"],
-                             "failed": [node["skill"]], "done": [], "left": [],
-                             "msg": f"node {node['id']!r} refused at dispatch: {exc}"}
-                    opstream.emit("node_failed", node=node["id"],
-                                  failed=[node["skill"]], done=[])
-                    break
-                opstream.emit("actuation_end", node=node["id"], actuation=actuations,
-                              success=bool(result.get("success")),
-                              steps=result.get("steps"),
-                              diagnostics=result.get("diagnostics", {}))
-                stages = result.get("stages", [])
-                done = [s["name"] for s in stages if s["success"]]
-                left = [s["name"] for s in stages if not s["success"]]
-                # At the 1-node loop the declared oracle IS the terminal
-                # boolean the rollout already scored (terminal_label); a
-                # second oracle dialect arrives with a second skill provider.
-                bad_preds = [v["predicate"] for v in plan["verify"]
-                             if v["after"] == node["id"] and not result["success"]]
-                # Protocol verify event: this node's bound predicates on sigma
-                # (its own oracle when none bind); three-valued, None = unknown.
-                results = {v["predicate"]: protocol.tri(result["success"])
-                           for v in plan["verify"] if v["after"] == node["id"]}
-                verify = {"node": node["id"],
-                          "results": results or {node["skill"]: protocol.tri(result["success"])}}
-                for k in ("driver", "executor"):  # which executor (key, ref + handshake) drove it
-                    if k in result:
-                        verify[k] = result[k]
-                kernel.note("task.verify", verify)
-                entry = {"success": bool(result["success"]),
-                         "steps": result.get("steps"),
-                         "stages": stages,
-                         "governance": result["governance"]}
-                # A perceive/decide node's payload (facts / chosen route) is sealed
-                # so a later decide/verify node -- reading ctx.nodes_out -- routes on
-                # it. Manipulate nodes carry neither; the keys stay absent.
-                for extra in ("facts", "decision", "diagnostics", "driver", "executor"):
-                    if extra in result:
-                        entry[extra] = result[extra]
-                nodes_out[node["id"]] = entry
-                if entry["success"]:
-                    done_specs[node["id"]] = {"id": node["id"],
-                                              "skill": node["skill"],
-                                              "args": dict(node["args"])}
-                # A node faults when its own oracle says False, whatever its kind:
-                # a manipulate node surfaces a failed terminal STAGE in `left`; a
-                # perceive/decide/verify node has no stages, so its own
-                # result["success"] IS the signal. `failed` names the offender for
-                # the fold-back brief -- the failed stages+predicates, or the
-                # predicate/skill itself when a kindful node has neither.
-                if left or bad_preds or not result["success"]:
-                    failed = left + bad_preds or [node["skill"]]
-                    fault = {"kind": "node_failure", "node": node["id"],
-                             "failed": failed, "done": done, "left": left,
-                             "failure_mode": (entry.get("diagnostics") or {}).get("failure_mode"),
-                             "msg": (f"node {node['id']!r} failed: stages {left}, "
-                                     f"predicates {bad_preds}; done {done}")}
-                    opstream.emit("node_failed", node=node["id"],
-                                  failed=left + bad_preds, done=done)
-                    break
-                opstream.emit("node_verified", node=node["id"], stages=done)
-            if fault is not None:
-                # Node-id-level attribution alongside the stage-level
-                # done/left above: the planner keeps finished NODES too.
-                nodes_done = [nid for nid, n in nodes_out.items() if n["success"]]
-                fault["nodes_done"] = nodes_done
-                # a done recover-<id> and the strategy it ran (a stateless planner
-                # re-inserts it byte-identically -- protocol.recover_plan)
-                fault["recoveries_done"] = {
-                    nid[len("recover-"):]: done_specs[nid]["skill"]
-                    for nid in nodes_done if nid.startswith("recover-")}
-                fault["nodes_left"] = [n["id"] for n in plan["nodes"]
-                                       if n["id"] not in nodes_done]
-        if fault is None:
-            success = True
-            break
-        faults.append(fault)
-        if ok and fault.get("node") is not None:
-            history.append({"graph_sha": protocol.graph_sha(plan), "node": fault["node"],
-                            "signature": fault["kind"]})
-        if fault.get("node") is not None:
-            kernel.note("task.fault", {"node": fault["node"],
-                                       "failed": list(fault.get("failed") or []),
-                                       "signature": fault["kind"], "msg": fault.get("msg")})
-        # budget and cancelled are TERMINAL faults: replanning around either
-        # would be the loop arguing with a floor the operator (or the budget)
-        # already set.
-        # A planner that answers a no_progress refusal with the same graph again
-        # ends the task honestly: two identical answers to one fault is the ceiling.
-        if fault["kind"] in ("budget", "cancelled") or (
-                fault["kind"] == "no_progress"
-                and (brief.get("fault") or {}).get("kind") == "no_progress"):
-            break
-        failed_node = fault.get("node")
-        failed_spec = next(
-            (n for n in plan.get("nodes", ()) if n.get("id") == failed_node), None)
-        used = segment_retry_counts.get(str(failed_node), 0)
-        if (fault["kind"] == "node_failure" and failed_spec is not None
-                and failed_spec.get("kind", "manipulate") == "segment"
-                and used < segment_retries):
-            segment_retry_counts[str(failed_node)] = used + 1
-            retry_plan = plan
-            opstream.emit("node_retry", node=failed_node, retry=used + 1,
-                          max_retries=segment_retries,
-                          msg="retrying failed segment on the same validated graph")
-            continue
-        if replans >= max_replans:
-            break
-        replans += 1
-        opstream.emit("replan", replan=replans, fault_kind=fault["kind"],
-                      node=fault.get("node"), msg=fault.get("msg"))
-        brief = {**brief, "fault": fault}
+    with (episode if episode is not None else nullcontext()):
+        terminal_start_z = None
+        if episode is not None:
+            try:
+                object_key = episode.embodiment.object_key(episode.spec)
+                terminal_start_z = float(episode.obs[object_key][2])
+            except (AttributeError, KeyError, TypeError, ValueError, AssertionError):
+                # A whole mission may have no single target object. Its terminal
+                # oracle can ignore start_z; a provider needing it must fail as
+                # unavailable instead of receiving an invented reference height.
+                pass
+        # Built ONCE: nodes_out is passed by reference, so a decide/verify node
+        # reached later in the loop reads the facts earlier nodes have sealed;
+        # episode (if any) is the shared persistent world every segment drives.
+        ctx = NodeCtx(seed=seed, env_ref=env_ref, policy_ref=policy_ref,
+                      skills=skills, nodes_out=nodes_out, predicates=predicates,
+                      episode=episode, segment_specs=brief.get("segment_specs"), arm=arm,
+                      scene=scene, media=media.recorder_for(brief, seed),
+                      _provenance=node_provenance)
+        # sigma0 for Legal(G): computed ONCE from the reset world (the persistent
+        # episode's first obs, else the empty pre-episode snapshot) and the card's
+        # declared facts, so Supported/Covered judge against real facts and objects.
+        sigma = episode.obs if episode is not None else {}
+        records = _records(brief, catalogue)
+        facts, objects = _sigma0(brief, scene.snapshot(sigma), sigma, records)
+        visible = sorted({r.name for r in records.values()})  # the planner-visible skill set
+        # The mounted PlanRecords + the embodiment ref they are keyed by, for the
+        # planner_library wrapper harness_runtime mounts; the row's fallback planner
+        # is the wrapped ref (``inner``) when the mount is that wrapper.
+        planner_ref = (kernel.provider_params("task.planner").get("inner")
+                       or kernel.provider_ref("task.planner"))
+        embodiment = str(brief.get("embodiment") or env_ref)   # the binding's ref, not an overlay
+        brief = {**brief, "facts": facts, "objects": objects, "embodiment": embodiment,
+                 "plans": [r for r in skills if r.get("kind") == "plan"]}
+        while True:
+            # Replanning observes the world left by the preceding attempt. The
+            # reset facts used to validate the complete graph remain unchanged.
+            brief = {**brief, "scene": scene.snapshot(episode.obs if episode is not None else {}), "seed": seed,
+                     "budget": max_actuations - actuations}
+            # A low-level segment gets a bounded retry in the same world and on the
+            # same validated graph.  A controller miss is not evidence that the task
+            # decomposition changed, so do not spend a VLM call or a replan on it.
+            # A brief carrying a composed ``graph`` (a mission: tasks with real goals,
+            # nodes labelled by task) is executed as-is; its planner provenance rides
+            # the graph, so the mounted planner is never asked.
+            is_retry = retry_plan is not None
+            plan = retry_plan if is_retry else brief.get("graph") or planner.plan(brief)
+            retry_plan = None
+            ok, msg = validate_plan(
+                plan, catalogue, oracles, done=tuple(done_specs.values()),
+                requirements=brief.get("planning_context"))
+            if ok:
+                problems = _graph_problems(plan, prev_plan, done_specs, brief, catalogue, seed)
+                if problems:
+                    ok, msg = False, "; ".join(problems)
+            reason = "invalid_plan"
+            if ok and replans and not is_retry:
+                # The progress rule: the same graph against the same (node, fault) is
+                # re-run as-is at most once; a second identical answer is refused and
+                # the planner is told what must change (NO_PROGRESS_HINT rides the fault).
+                progress, reason = protocol.replan_progress(history, plan, brief.get("fault"))
+                if not progress:
+                    ok, msg = False, f"replan rejected: {reason}: {NO_PROGRESS_HINT}"
+            if ok:
+                prev_plan = plan
+            if not is_retry:
+                # One chain row per plan/replan DECISION, legal or not: an illegal
+                # graph is sealed as a negative sample, never dispatched.
+                kernel.note("task.plan", {
+                    "replan": replans, "seed": seed, "mission": brief.get("task"),
+                    "sigma0": brief["scene"], "skills": skill_ids,
+                    "show_evidence": bool(brief.get("show_evidence")),
+                    "done": sorted(done_specs), "fault": brief.get("fault"),
+                    "graph": plan if isinstance(plan, Mapping) else None,
+                    "graph_id": protocol.content_id(plan) if isinstance(plan, Mapping) else None,
+                    # The chain link a PlanRecord is minted from: the graph's own id
+                    # (meta stripped) plus who planned it -- "library" when a mounted
+                    # PlanRecord was replayed, else the mounted planner's ref.
+                    "graph_sha": protocol.graph_sha(plan) if isinstance(plan, Mapping) else None,
+                    "planner": (dict(plan.get("planner")) if isinstance(plan, Mapping)
+                                and isinstance(plan.get("planner"), Mapping)
+                                else {"provider": planner_ref}),
+                    "embodiment": embodiment, "arm": arm,
+                    "rationale": plan.get("rationale", "") if isinstance(plan, Mapping) else "",
+                    "facts": facts, "objects": objects, "visible": visible,
+                    "legal": ok, "problems": [] if ok else [msg], "block": brief.get("block")})
+                if not ok and replans:
+                    kernel.note("task.replan_rejected", {"replan": replans, "reason": reason,
+                                                         "problems": [msg]})
+            # Operational feed (harness.opstream; never chain evidence): the FULL
+            # node graph, the moment it exists, so the execution-graph panel draws
+            # the plan while the first node is still running.
+            nodes = list(plan.get("nodes") or []) if ok else []
+            opstream.emit("plan_built", replan=replans, valid=ok, msg=None if ok else msg,
+                          goal=plan.get("goal") if isinstance(plan, Mapping) else None,
+                          nodes=[{"id": n.get("id"), "skill": n.get("skill"),
+                                  "args": dict(n.get("args") or {})} for n in nodes],
+                          verify=[dict(v) for v in (plan.get("verify") or [])] if ok else [])
+            fault: dict | None = None
+            if not ok and reason == "no_progress":
+                prev = brief.get("fault") or {}
+                fault = {**prev, "kind": "no_progress", "msg": msg,
+                         "signature": prev.get("signature") or prev.get("kind"),
+                         "graph_sha": protocol.graph_sha(plan)}
+            elif not ok:
+                fault = {"kind": "invalid_plan", "msg": msg}
+            else:
+                # nodes_out accumulates ACROSS replans: a node that already
+                # succeeded is finished work, skipped without re-running or
+                # re-billing -- a model-independent floor, like max_actuations.
+                for node in plan["nodes"]:
+                    # The one cancellation checkpoint: BEFORE dispatch, so the node
+                    # that already started finishes and the shared episode is never
+                    # torn mid-segment.
+                    if cancelled is not None and cancelled():
+                        fault = {"kind": "cancelled", "node": node["id"],
+                                 "msg": "cancelled by the operator before node "
+                                        f"{node['id']!r}"}
+                        break
+                    prior = nodes_out.get(node["id"])
+                    if prior is not None and prior["success"]:
+                        continue
+                    # The model-independent floor, enforced BEFORE dispatch: no
+                    # planner, however eloquent, can mint extra actuations.
+                    if actuations >= max_actuations:
+                        fault = {"kind": "budget", "node": node["id"],
+                                 "msg": (f"max_actuations={max_actuations} reached "
+                                         f"before dispatching node {node['id']!r}")}
+                        break
+                    actuations += 1
+                    # ponytail: every dispatched node (any kind) counts one actuation
+                    # against the model-independent floor; a heterogeneous mission sets
+                    # max_actuations to cover its node count. Split into a separate
+                    # counter only if a pure-fn node exhausting the floor ever bites.
+                    kind = node.get("kind", "manipulate")
+                    opstream.emit("node_start", node=node["id"], skill=node["skill"],
+                                  node_kind=kind, actuation=actuations)
+                    opstream.emit("actuation_start", node=node["id"], actuation=actuations)
+                    # A composed graph namespaces ids by task ("thaw.survey"); a
+                    # card's predicates read their OWN nodes by the card's ids, so a
+                    # task-labelled node sees its task's entries under those too.
+                    task = node.get("task")
+                    local = {k[len(task) + 1:]: v for k, v in nodes_out.items()
+                             if task and k.startswith(f"{task}.")}
+                    local_provenance = {k[len(task) + 1:]: v for k, v in node_provenance.items()
+                                        if task and k.startswith(f"{task}.")}
+                    node_ctx = replace(ctx, nodes_out={**nodes_out, **local},
+                                       _provenance={**node_provenance, **local_provenance}) if local else ctx
+                    try:
+                        result = _KIND_HANDLERS[kind](node, node_ctx)
+                    except ValueError as exc:
+                        # A dispatch-time grounding refusal (an arg with no scene
+                        # binding, an undeclared predicate): the planner's fault,
+                        # not the loop's. With a trusted table planner this was a
+                        # wiring bug worth a crash; behind an untrusted VLM it is
+                        # exactly the boundary's job -- fold the refusal (which
+                        # names the known bindings) back into the next brief so a
+                        # replan can ground itself. Non-ValueError still crashes:
+                        # an env/driver bug is not the planner's to repair.
+                        fault = {"kind": "node_failure", "node": node["id"],
+                                 "failed": [node["skill"]], "done": [], "left": [],
+                                 "msg": f"node {node['id']!r} refused at dispatch: {exc}"}
+                        opstream.emit("node_failed", node=node["id"],
+                                      failed=[node["skill"]], done=[])
+                        break
+                    opstream.emit("actuation_end", node=node["id"], actuation=actuations,
+                                  success=bool(result.get("success")),
+                                  steps=result.get("steps"),
+                                  diagnostics=result.get("diagnostics", {}))
+                    stages = result.get("stages", [])
+                    done = [s["name"] for s in stages if s["success"]]
+                    left = [s["name"] for s in stages if not s["success"]]
+                    # At the 1-node loop the declared oracle IS the terminal
+                    # boolean the rollout already scored (terminal_label); a
+                    # second oracle dialect arrives with a second skill provider.
+                    bad_preds = [v["predicate"] for v in plan["verify"]
+                                 if v["after"] == node["id"] and not result["success"]]
+                    # Protocol verify event: this node's bound predicates on sigma
+                    # (its own oracle when none bind); three-valued, None = unknown.
+                    results = {v["predicate"]: protocol.tri(result["success"])
+                               for v in plan["verify"] if v["after"] == node["id"]}
+                    verify = {"node": node["id"],
+                              "results": results or {node["skill"]: protocol.tri(result["success"])}}
+                    if node.get("kind") == "verify":
+                        observation = {
+                            "node": {"id": node["id"], "kind": "verify", "skill": node["skill"],
+                                     "args": dict(node.get("args") or {})},
+                            "authority": "predicate", "source": predicates[node["skill"]],
+                            "success": result.get("verification_success"),
+                            "evidence_policy": result.get("evidence_policy"),
+                            "blocked_reads": result.get("blocked_reads")}
+                        verification_observations.append(observation)
+                        verify["observation"] = observation
+                    if result.get("evidence_policy") == EVIDENCE_POLICY:
+                        verify["dependency_audit"] = {key: result[key]
+                                                       for key in ("evidence_policy", "blocked_reads")}
+                    for k in ("driver", "executor"):  # which executor (key, ref + handshake) drove it
+                        if k in result:
+                            verify[k] = result[k]
+                    kernel.note("task.verify", verify)
+                    entry = {"success": bool(result["success"]),
+                             "steps": result.get("steps"),
+                             "stages": stages,
+                             "governance": result["governance"]}
+                    # A perceive/decide node's payload (facts / chosen route) is sealed
+                    # so a later decide/verify node -- reading ctx.nodes_out -- routes on
+                    # it. Manipulate nodes carry neither; the keys stay absent.
+                    for extra in ("facts", "decision", "diagnostics", "driver", "executor",
+                                  "evidence_policy", "blocked_reads"):
+                        if extra in result:
+                            entry[extra] = result[extra]
+                    nodes_out[node["id"]] = entry
+                    node_provenance[node["id"]] = {
+                        "kind": kind,
+                        "clean": (result.get("evidence_policy") == EVIDENCE_POLICY
+                                  and result.get("blocked_reads") == []),
+                        "blocked_reads": list(result.get("blocked_reads") or ())}
+                    if entry["success"]:
+                        done_specs[node["id"]] = {**node, "args": dict(node["args"]),
+                            "after": list(node["after"]),
+                            "task": node.get("task", (plan.get("tasks") or [{"id": "main"}])[0]["id"])}
+                    # A node faults when its own oracle says False, whatever its kind:
+                    # a manipulate node surfaces a failed terminal STAGE in `left`; a
+                    # perceive/decide/verify node has no stages, so its own
+                    # result["success"] IS the signal. `failed` names the offender for
+                    # the fold-back brief -- the failed stages+predicates, or the
+                    # predicate/skill itself when a kindful node has neither.
+                    if left or bad_preds or not result["success"]:
+                        failed = left + bad_preds or [node["skill"]]
+                        fault = {"kind": "node_failure", "node": node["id"],
+                                 "failed": failed, "done": done, "left": left,
+                                 "failure_mode": (entry.get("diagnostics") or {}).get("failure_mode"),
+                                 "msg": (f"node {node['id']!r} failed: stages {left}, "
+                                         f"predicates {bad_preds}; done {done}")}
+                        opstream.emit("node_failed", node=node["id"],
+                                      failed=left + bad_preds, done=done)
+                        break
+                    opstream.emit("node_verified", node=node["id"], stages=done)
+                if fault is not None:
+                    # Node-id-level attribution alongside the stage-level
+                    # done/left above: the planner keeps finished NODES too.
+                    nodes_done = [nid for nid, n in nodes_out.items() if n["success"]]
+                    fault["nodes_done"] = nodes_done
+                    # a done recover-<id> and the strategy it ran (a stateless planner
+                    # re-inserts it byte-identically -- protocol.recover_plan)
+                    fault["recoveries_done"] = {
+                        nid[len("recover-"):]: done_specs[nid]["skill"]
+                        for nid in nodes_done if nid.startswith("recover-")}
+                    fault["nodes_left"] = [n["id"] for n in plan["nodes"]
+                                           if n["id"] not in nodes_done]
+            if fault is None:
+                success = True
+                break
+            faults.append(fault)
+            if ok and fault.get("node") is not None:
+                history.append({"graph_sha": protocol.graph_sha(plan), "node": fault["node"],
+                                "signature": fault["kind"]})
+            if fault.get("node") is not None:
+                kernel.note("task.fault", {"node": fault["node"],
+                                           "failed": list(fault.get("failed") or []),
+                                           "signature": fault["kind"], "msg": fault.get("msg")})
+            # budget and cancelled are TERMINAL faults: replanning around either
+            # would be the loop arguing with a floor the operator (or the budget)
+            # already set.
+            # A planner that answers a no_progress refusal with the same graph again
+            # ends the task honestly: two identical answers to one fault is the ceiling.
+            if fault["kind"] in ("budget", "cancelled") or (
+                    fault["kind"] == "no_progress"
+                    and (brief.get("fault") or {}).get("kind") == "no_progress"):
+                break
+            failed_node = fault.get("node")
+            failed_spec = next(
+                (n for n in plan.get("nodes", ()) if n.get("id") == failed_node), None)
+            used = segment_retry_counts.get(str(failed_node), 0)
+            if (fault["kind"] == "node_failure" and failed_spec is not None
+                    and failed_spec.get("kind", "manipulate") == "segment"
+                    and used < segment_retries):
+                segment_retry_counts[str(failed_node)] = used + 1
+                retry_plan = plan
+                opstream.emit("node_retry", node=failed_node, retry=used + 1,
+                              max_retries=segment_retries,
+                              msg="retrying failed segment on the same validated graph")
+                continue
+            if replans >= max_replans:
+                break
+            replans += 1
+            opstream.emit("replan", replan=replans, fault_kind=fault["kind"],
+                          node=fault.get("node"), msg=fault.get("msg"))
+            brief = {**brief, "fault": fault}
 
-    # ONE close for the ONE persistent world, at the loop's single exit (every
-    # path -- win, budget, exhausted replans -- breaks to here). No try/finally
-    # around the loop: harness_runtime owns crash-safety (its docstring), and
-    # wrapping would force a 100-line re-indent for a sim-env leak the GC reaps.
-    # ponytail: single-exit close; add try/finally if run() ever grows a raising
-    # path the runtime does not already contain.
-    if episode is not None:
-        episode.close()
+        terminal_observation = {"authority": "embodiment.terminal_success", "source": embodiment,
+                                "mounted_ref": env_ref, "success": None}
+        if episode is not None:
+            terminal = getattr(episode.embodiment, "terminal_success", None)
+            if callable(terminal):
+                try:
+                    terminal_observation["success"] = protocol.tri(
+                        terminal(episode.obs, episode.spec, terminal_start_z, episode.env))
+                except Exception as exc:  # the measurement is unavailable, never a fabricated failure
+                    terminal_observation["error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                terminal_observation["error"] = "embodiment has no terminal_success oracle"
+            kernel.note("task.terminal_observation", terminal_observation)
     goal = plan.get("goal") if isinstance(plan, Mapping) else None
     out = {"success": success, "goal": goal, "replans": replans,
-           "actuations": actuations, "nodes": nodes_out, "faults": faults}
+           "actuations": actuations, "nodes": nodes_out, "faults": faults,
+           "verification_observations": verification_observations,
+           "terminal_observation": terminal_observation}
     opstream.emit("plan_complete", success=success, goal=goal,
                   replans=replans, actuations=actuations)
     kernel.note("task.plan_complete", {

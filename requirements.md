@@ -40,9 +40,10 @@ Dependency groups from [`pyproject.toml`](pyproject.toml):
 Run the base lane isolated (a fresh process where `robosuite` is genuinely
 unimportable) — never as a subset of a full green run. Snapshot format and the
 two isolation methods are in
-[docs/project-documentation.md](docs/project-documentation.md) §3; keep the
-pass/skip counts in `README.md`, `README.zh.md` and that snapshot synced **in one
-commit**.
+[docs/project-documentation.md](docs/project-documentation.md) §3. The docs carry
+the lane command and never the counts — `tests/test_docs_counts_e2e.py` fails on a
+hand-synced `NNN passed` in `README.md`, `README.zh.md`,
+`docs/project-documentation.md` or `CLAUDE.md`.
 
 ## 2. robosuite sim card (same venv, optional extra)
 

@@ -1,58 +1,12 @@
-"""The lightweight RSI loop: look -> try -> re-run -> publish, one round at a time.
+"""Online program-policy RSI: bounded exploration and frozen paired evaluation.
 
-Spawned by ``scripts/harness_runtime._run_evolve`` (an ``evolve`` brief, evolution
-mode only) as its own process group. One round: run the task's seed suite in-process
-(the SAME ``_mount_plan``/``task_brief``/``workload.run`` a task brief uses), read
-each seed's first-death node + fault signature + per-node executor, let the LLM
-proposer (scripts/evolve_llm: the model reads the round's trails + log excerpt and
-answers a tunables / executor / code-as-policy card / driver-patch proposal, repairing a rejected one
-up to 3 times from the exact error -- a card is preflighted on the first seed alone;
-``--proposer rules`` or an unreachable endpoint falls back to) the built-in rules proposer pick ONE change -- the first-death node's executor (a bound policy whose
-``evidence.by_executor`` beats the measured rate) else a one-dimensional +/-20%
-tunables perturbation of that node's driver (its card's mount params, applied via
-``PH_MOUNT_PARAMS_OVERRIDE``) else nothing, with the honest reason -- re-run the
-same seeds (the TARGET NODE'S CLUSTER first: a trial that does not make that node
-pass stops there and never spends the rest of the suite), and score the result as
-``(successes, milestones, target_pass)`` (``score``). Two levels follow from it: the
-round is ACCEPTED -- its change joins ``accepted_stack``/``applied`` and becomes the
-next round's baseline -- when the score rose and no node that passed stopped passing
-(``regressions``); it is PUBLISHED, whole-task evidence into the skill record, only
-when the success count itself improves: the skill record with
-the measured ``by_executor`` row folded in goes through the evolution-only skills
-root door (``InMemorySkillGraph.publish``, the same one scripts/publish_plans.py
-uses). Every round lands atomically in ``campaigns/evolve-<task>/campaign.json``
-(rounds[], best, cursor, status, ``reference`` = the last successful pass of every
-plan segment) -- BOUNDED: the header plus the last ``ROUNDS_KEPT`` rounds in full,
-every older round written once to ``rounds/<round>.json`` and left in the file as a
-compact ``index_row`` (see ``EvolveStore``). The same bound is kept on the two other
-things that grew without one -- the llm audits (``prune_audits``) and the candidate
-cards (``gc_candidates``, also ``--gc``) -- and a round does not start at all when
-``disk_guard`` says the disk or the campaign dir is over the line (``paused_disk``).
-The round row carries the kept suite's per-seed summary
-(``per_seed``) and, when nothing was tried, ``needs`` -- what would unblock the
-proposer, plus ``stuck`` when the round's node has taken ``STUCK_ROUNDS`` rounds
-without improving (the brief then widens what may be patched there). A trial that
-improves is re-scored over its ORIGIN FAILURE CLUSTER (``regression``, the baseline
-seeds that shared its first missing milestone) before the fresh-seed confirm and is
-not published when it lost one of them; a confirm seed that blocks a publish is burned
-into the dev seeds (``burned``) and fresh confirm seeds are drawn above them. The
-model's causal ``layer`` and its notebook ``notes`` ride the round row too; the runtime seals the ``rsi_step`` rows off it. The same file carries a
-``live`` block (phase / seed / node / partial per-seed, rewritten at every phase and
-seed boundary): live state the board's rsi_run shows, never sealed.
-With ``PH_RSI_FRAMES`` set (the runtime passes its frame.jpg when --frames is on)
-the suite's episodes are mirrored to that file, same one-writer lock as an rsi chain.
-The ``proposals/`` inbox (board.store.submit_proposal) comes first: a pending entry
-for this task is consumed at the start of the round (``rsi_proposal_applied``) and
-tried instead of the built-in proposer -- a ``card`` proposal mounts its candidate
-dir through ``PH_PLUGINS_EXTRA`` for that round's suite and, if it wins, its
-binding is published into the record.
-Cancel is checked at the round boundary (``--cancel-marker``); a resubmitted task
-resumes from ``cursor``. Media never enters this file's outputs beyond paths read
-from ``media/<task>/<seed>/index.json``.
+The runtime starts this process for an evolution-mode brief. The original task
+binding supplies the evaluator; candidate controllers and inserted actions cannot
+edit its objectives. Accepted development overlays stay inside their campaign.
+Installation requires the independent verification battery in plugins/rsi.
 
-    scripts/evolve.py --mode evolution --task kitchen_thaw --session runs/session-x \\
-        --skills-root runs/session-x/skills --seeds 1 2 --rounds 3 --arm auto
-    scripts/evolve.py --gc [--dry-run]        # the maintenance pass alone, for the operator
+Round artifacts retain logs, before/after trajectories, media paths and model
+feedback. Runtime seals completed rounds; cancellation is a separate outcome.
 """
 
 from __future__ import annotations
@@ -79,22 +33,22 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from board import store as bs
+from harness import media
 from harness.config import Mount, Patch, Profile, resolve_plan, sha_json
 from harness.definitions import CAPABILITIES
 from harness.events import SessionLog
-from harness import media
 from harness.kernel import Kernel
 from harness.manifest import discover, mount_params
 from harness.protocol import SkillRecordV0, to_plain
 from harness.registry import load_provider
-from harness.skill_library import rearm, segment_specs
-from plugins.graphs import InMemorySkillGraph
+from plugins.rsi import diagnosis, evaluation, experience, interventions
+from plugins.rsi.learner import ProgramLearner, intervention_summary
 from plugins.task import workload
+from scripts import evolve_llm
 from scripts import harness_runtime as hr
 from scripts.brief_drop import drop
-from scripts import evolve_llm
 from scripts.rsi_campaign import _maybe_arm_frames
-from board import store as bs
 
 MODES = ("execution", "evolution")
 #: JSON ``{provider ref: {param: value}}`` merged over a card's mount params by
@@ -105,20 +59,6 @@ OVERRIDE_ENV = "PH_MOUNT_PARAMS_OVERRIDE"
 EXTRA_ENV = "PH_PLUGINS_EXTRA"
 _BASE_EXTRA = os.environ.get(EXTRA_ENV, "")
 PLANNER_REF = "scripts.evolve:planner_provider"
-#: Consecutive rounds with nothing tried that end a BOUNDED loop (--rounds > 0: status
-#: done, needs on the row). An unbounded loop (--rounds 0, the console's 开始/继续)
-#: never stops on its own -- the operator's 停止 is the only end -- so a model that has
-#: nothing to try is throttled instead: wait NONE_BACKOFF_S[0] after the first empty
-#: round, doubling up to NONE_BACKOFF_S[1], reset by the next real try.
-MAX_NONE = 2
-NONE_BACKOFF_S = (float(os.environ.get("PH_NONE_BACKOFF_S", "60")), 600.0)
-#: Rounds that targeted ONE node without improving before the round is called stuck
-#: (brief keys ``stuck_rounds`` / ``stuck``): the brief then says parameter tweaks on
-#: that node are exhausted and widens the patchable modules to the card's whole stage
-#: pipeline (``pipeline_modules``), so the model changes code or targets another node.
-STUCK_ROUNDS = 6
-
-
 #: Full round rows kept in campaign.json; older rounds live in ``rounds/<round>.json``
 #: and stand in the file as an index row. The live recycle_cans campaign reached 42 MB
 #: over 490 rounds -- 19 MB of it per-seed node trails nothing reads twice.
@@ -141,9 +81,10 @@ MAX_CAMPAIGN_BYTES = 2 * 1024 ** 3
 _INDEX_KEYS = ("round", "before", "after", "best", "parent", "layer", "notes", "outcome",
                "accepted", "accepted_reason", "published", "before_score", "after_score",
                "usage", "proposer", "needs", "confirm", "trial", "stuck", "regression",
-               "burned", "suite_sha", "proposal", "ts")
+               "burned", "suite_sha", "proposal", "ts", "evaluation", "transfer", "experiments",
+               "policy", "run_budget", "cycle_budget", "cycle_outcome", "stop_reason", "memo")
 _TRIED_KEYS = ("skill", "ref", "path", "from", "to", "module", "executor", "reason",
-               "hint", "error", "layer", "needs", "match", "name", "patch_sha")
+               "hint", "error", "layer", "needs", "match", "name", "patch_sha", "artifact_sha")
 _SEED_KEYS = ("seed", "success", "first_death", "failure_mode")
 
 
@@ -180,7 +121,9 @@ def index_row(r: dict, baseline: bool = False) -> dict:
                       "detail": _clip({k: v for k, v in (t.get("detail") or {}).items()
                                        if k in _TRIED_KEYS}, "reason", "error")},
             "llm": _clip({k: v for k, v in (r.get("llm") or {}).items()
-                          if k in ("model", "summary", "reason")}, "summary", "reason") or None,
+                          if k in ("model", "requested_model", "effort", "summary", "reason", "status", "error", "method", "calls",
+                                   "evidence_reads", "trial_calls", "budget", "usage_complete", "stop_reason", "decision_flow")},
+                         "summary", "reason") or None,
             "node_rate": {"before": nb, "after": na},
             "by_task": {k: {"before": tb.get(k), "after": ta.get(k)} for k in sorted({*tb, *ta})},
             "per_seed": [{**s, **({"nodes": full.get("nodes") or []} if baseline else {})}
@@ -249,8 +192,9 @@ class EvolveStore:
 
 # ── maintenance: the three things that grow without a bound ──────────────────────
 
-_AUDIT_KEEP = ("round", "model", "prompt_sha", "raw_sha", "summary", "rationale",
-               "reason", "usage", "calls")
+_AUDIT_KEEP = ("round", "experiment_id", "model", "requested_model", "effort", "prompt_sha", "raw_sha", "summary", "rationale",
+               "reason", "usage", "calls", "status", "error", "requests", "events", "method",
+               "evidence_reads", "evidence_refs", "trial_calls", "budget", "usage_complete", "stop_reason", "decision_flow")
 
 
 def _round_no(p: Path) -> int:
@@ -279,6 +223,14 @@ def prune_audits(llm_dir: Path, keep: int = AUDITS_KEPT, dry_run: bool = False) 
             continue
         t = a.get("tried") or {}
         small = {k: a[k] for k in _AUDIT_KEEP if k in a}
+        # Keep the request/result identities after archival, not a second copy
+        # of all source, traces and model messages forever.
+        if 'requests' in small:
+            small['requests'] = [{k: v for k, v in request.items() if k not in ('messages', 'raw')}
+                                 for request in small['requests']]
+        if 'events' in small:
+            small['events'] = [{k: v for k, v in event.items() if k != 'result'}
+                              for event in small['events']]
         small |= {"pruned": True, "decision": t.get("kind"), "node": t.get("node"),
                   "layer": (t.get("detail") or {}).get("layer"),
                   "tried": {"kind": t.get("kind"), "node": t.get("node"),
@@ -325,7 +277,7 @@ def _referenced(runs: Path) -> set[str]:
         # answer for a campaign written before the stack existed (evolve_llm._accepted).
         # ponytail: campaigns are the index -- a card published by a campaign whose
         # campaign.json has been deleted is not seen. Scan runs/*/skills if that happens.
-        blob = json.dumps([doc.get("applied"), doc.get("accepted_stack"),
+        blob = json.dumps([doc.get("applied"), doc.get("accepted_stack"), doc.get("working_candidates"),
                            [r for r in doc.get("rounds") or ()
                             if r.get("accepted") or r.get("published")]], default=str)
         names |= set(re.findall(r"candidates[./\\]([A-Za-z_]\w*)", blob))
@@ -396,11 +348,11 @@ def maintain(store: EvolveStore, session: Path, dry_run: bool = False) -> list[s
 # ── the executor-switch seam: a planner wrapper that stamps node.executor ────────
 
 class _Forced:
-    def __init__(self, inner, executors: dict) -> None:
-        self._inner, self._executors = inner, dict(executors)
+    def __init__(self, inner, executors: dict, graph=None) -> None:
+        self._inner, self._executors, self._graph = inner, dict(executors), graph
 
     def plan(self, brief):
-        plan = dict(self._inner.plan(brief))
+        plan = copy.deepcopy(self._graph) if self._graph else dict(self._inner.plan(brief))
         plan["nodes"] = [{**n, "executor": self._executors[n["id"]]}
                          if n.get("id") in self._executors else n
                          for n in plan.get("nodes") or ()]
@@ -410,8 +362,8 @@ class _Forced:
         return getattr(self._inner, name)
 
 
-def planner_provider(inner: str, inner_params=None, executors=None) -> _Forced:
-    return _Forced(load_provider(inner, dict(inner_params or {})), executors or {})
+def planner_provider(inner: str, inner_params=None, executors=None, graph=None) -> _Forced:
+    return _Forced(load_provider(inner, dict(inner_params or {})), executors or {}, graph)
 
 
 def node_group(node: dict, graph: dict) -> str:
@@ -452,14 +404,14 @@ class _Tap(SessionLog):
         return seq
 
 
-def _mount(binding: dict, skills_root: Path, executors: dict):
+def _mount(binding: dict, skills_root: Path, executors: dict, graph=None):
     plan = hr._mount_plan(binding, skills_root, frames=_maybe_arm_frames())
-    if not executors:
+    if not executors and not graph:
         return plan
     m = next(m for m in plan.mounts if m.capability == "task.planner")
     forced = Mount("task.planner", PLANNER_REF,
                    {"inner": m.provider, "inner_params": dict(m.params),
-                    "executors": dict(executors)})
+                    "executors": dict(executors), "graph": graph})
     return resolve_plan(Profile("evolve", plan.mounts),
                         patches=(Patch("evolve", override=(forced,)),))
 
@@ -474,16 +426,19 @@ def _get(budgets, binding: dict, key: str, default):
 
 def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_root: Path,
               applied: dict, media_dir: Path | None = None, budgets: dict | None = None,
-              progress=None, seed_list: list | None = None) -> dict:
+              progress=None, seed_list: list | None = None, media_prefix: str = "media") -> dict:
     """{count, seeds: {seed: {success, first_death, fault, nodes}}, sha}. ``media_dir``
     (<session>/media) turns on the workload's segment recorder: kept-on-success clips.
     ``progress(**live)`` is called at every seed boundary and node change.
     ``seeds`` is the inclusive range [lo, hi]; ``seed_list`` names the seeds explicitly
-    instead (a focused trial's cluster is not contiguous)."""
+    instead. Development acceptance always compares the complete paired suite."""
     os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
     cards = applied.get("cards") or {}
+    for card in cards.values():
+        if card.get('artifact_sha') != evolve_llm.candidate_digest(card['path']):
+            raise ValueError('candidate source changed after validation')
     os.environ[EXTRA_ENV] = ":".join(r for r in (_BASE_EXTRA, *(c["path"] for c in cards.values())) if r)
-    per, logs = {}, []
+    per, logs, graphs = {}, [], []
     brief = {**hr.task_brief(task, binding), "arm": arm}
     if cards:   # a candidate card's executor: bind it into this suite's records (the plan
         # validator's view) and segment specs (rearm's route) -- in memory, never on disk
@@ -503,11 +458,11 @@ def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_roo
         range(int(seeds[0]), int(seeds[1]) + 1))
     for i, seed in enumerate(seq):
         t_seed = time.time()
-        tick(seed_index=i, seed=seed, node=None, nodes=[], seed_started_at=t_seed)
+        tick(seed_index=i, seed=seed, seeds_total=len(seq), node=None, nodes=[], seed_started_at=t_seed)
         log = _Tap(lambda nodes: tick(nodes=nodes, node=next(
             (n["id"] for n in nodes if n["ok"] is not True), None)))
         kernel = Kernel(CAPABILITIES, log=log)
-        kernel.mount(_mount(binding, skills_root, applied["executors"]))
+        kernel.mount(_mount(binding, skills_root, applied["executors"], applied.get("graph")))
         out = workload.run(dict(brief), kernel, seed=seed,
                            max_replans=int(_get(budgets, binding, "max_replans", 3)),
                            max_actuations=int(_get(budgets, binding, "max_actuations", 3)),
@@ -515,11 +470,15 @@ def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_roo
         skills = {}
         for r in log.rows():
             if r["kind"] == "task.plan" and r["data"].get("graph"):
+                if not graphs:
+                    graphs.append(copy.deepcopy(r["data"]["graph"]))
                 skills.update({n["id"]: n["skill"] for n in r["data"]["graph"].get("nodes") or []})
         nodes, faults = out["nodes"], out.get("faults") or []
         dead = next((nid for nid, n in nodes.items() if not n["success"]), None)
         per[str(seed)] = {
             "success": bool(out["success"]),
+            "verification_observations": out.get("verification_observations", []),
+            "terminal_observation": out.get("terminal_observation"),
             "elapsed_s": round(time.time() - t_seed, 1),
             "trail": [{k: n[k] for k in ("id", "ok", "steps", "failure_mode", "after", "kind", "task")}
                       for n in log.nodes],
@@ -527,11 +486,12 @@ def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_roo
             "failure_mode": (nodes[dead].get("diagnostics") or {}).get("failure_mode") if dead else None,
             "fault": {k: faults[0].get(k) for k in ("kind", "node", "msg")} if faults else None,
             # the first-death node's failure keyframes (session-relative paths; the LLM brief's images)
-            "keyframes": [f"media/{task}/{seed}/{f}" for f in (media.dropped_of(media_dir, task, seed)
+            "keyframes": [f"{media_prefix}/{task}/{seed}/{f}" for f in (media.dropped_of(media_dir, task, seed)
                                                                 .get(dead) or {}).get("keyframes", [])]
             if media_dir is not None and dead else [],
             "nodes": {nid: {"skill": skills.get(nid), "success": bool(n["success"]),
                             "executor": n.get("executor") or "scripted",
+                            **({'driver': n['driver']} if n.get('driver') else {}),
                             "tunables_sha": (n.get("diagnostics") or {}).get("tunables_sha")}
                       for nid, n in nodes.items()}}
         for n in per[str(seed)]["trail"]:   # final state from the result: a replan reset the live
@@ -540,26 +500,26 @@ def run_suite(task: str, binding: dict, seeds: list | None, arm: str, skills_roo
             if n["ok"] is None and "success" in r:
                 n["ok"] = bool(r["success"])
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
-            # ``failure_mode`` only when somebody measured it: an executor that seals none
-            # leaves NO key (D.merge_executor_diagnostics), and that absence has to survive
-            # all the way to _trial_line, which renders it "测不到". A None here reads as
-            # "no stall" -- the fake cure every candidate round used to be told about.
+            # Missing executor observations stay absent through projection and inspection;
+            # absence must never become a measured "no stall" claim.
             if "failure_mode" in diag or n["failure_mode"] is not None:
                 n["failure_mode"] = n["failure_mode"] or diag.get("failure_mode")
             else:
                 del n["failure_mode"]
             if (diag.get("trace") or {}).get("end"):   # where this segment ENDED, every node:
                 n["trace_end"] = diag["trace"]["end"]  # the reference index + the upstream row
-            if diag.get("trace") and n["id"] == dead:
-                n["trace"] = diag["trace"]   # the stall geometry (with the per-step ``series``)
-                n["geometry"] = diag.get("geometry")   # and the target's provenance.
+            if diag.get("trace"):
+                # Passed upstream actions can cause downstream failure. Keep their
+                # observed response available to the model instead of preselecting a cause.
+                n["trace"] = diag["trace"]
+                n["geometry"] = diag.get("geometry")
         _link_upstream(per[str(seed)]["trail"], dead, skills)
         logs += evolve_llm._log_excerpt(seed, log.rows(), dead,
                                         evolve_llm.MAX_LOG_LINES // len(seq))
         tick(per_seed_partial=per_seed({"seeds": per}))
     return {"count": sum(s["success"] for s in per.values()), "seeds": per, "sha": sha_json(per),
             "elapsed_s": round(time.time() - t_suite, 3),
-            "logs": logs}   # the dying nodes' fault/verify rows: the LLM proposer's log excerpt
+            "logs": logs, "plan": graphs[0] if graphs else None}
 
 
 def _merge(a: dict, b: dict) -> dict:
@@ -616,6 +576,9 @@ def per_seed(suite: dict) -> list[dict]:
     lives only in this process."""
     return [{"seed": int(seed), **{k: s.get(k) for k in ("success", "first_death", "failure_mode")},
              "elapsed_s": s.get("elapsed_s"), "nodes": s.get("trail") or [],
+             "evaluation": s.get("evaluation"),
+             "verification_observations": s.get('verification_observations') or [],
+             "terminal_observation": s.get('terminal_observation'),
              "tunables_sha": (s["nodes"].get(s["first_death"]) or {}).get("tunables_sha")
              if s.get("first_death") else None}
             for seed, s in suite["seeds"].items()]
@@ -862,215 +825,57 @@ def _binding(c: dict) -> dict:
 
 
 def death_nodes(before: dict, history: list | None = None) -> list[dict]:
-    """The DISTINCT first-death nodes of this round's seeds, LEAST-RECENTLY-TARGETED
-    first: ``[{node, seeds, failure_mode, rounds_targeted, last_round}]``. Rotating over
-    this list is what keeps one node (the commonest death) from eating the campaign --
-    with 4243 dying at drop-can1 and 4244 at nav-can1, nav-can1 never got a round.
-    Ties (nothing targeted yet) go to the node the most seeds die at, then by name."""
+    """Observed failure locations and their history, without selecting an intervention.
+
+    An upstream actuator linked to a failed verification is an attribution hypothesis.
+    The model can select another evidenced action from its installed capability catalog.
+    """
     rows: dict[str, dict] = {}
     for seed, s in sorted(before["seeds"].items(), key=lambda kv: int(kv[0])):
-        if not s.get("first_death"):
+        node = s.get("first_death")
+        observed_node = node
+        by_id = {n['id']: n for n in s.get('trail') or []}
+        if node in by_id and by_id[node].get('kind') in ('verify', 'decide', 'perceive'):
+            pending, seen = list(by_id[node].get('after') or []), set()
+            while pending:
+                parent = pending.pop()
+                if parent in seen or parent not in by_id:
+                    continue
+                seen.add(parent)
+                if by_id[parent].get('kind', 'manipulate') in ('segment', 'manipulate'):
+                    node = parent
+                    break
+                pending.extend(by_id[parent].get('after') or [])
+        if node is None and s.get('terminal_mismatch'):
+            node = next((n['id'] for n in reversed(s.get('trail') or [])
+                         if n.get('kind', 'manipulate') in ('segment', 'manipulate')), None)
+        if not node:
             continue
-        d = rows.setdefault(s["first_death"], {"node": s["first_death"], "seeds": [],
+        d = rows.setdefault(node, {"node": node, "seeds": [],
                                                "failure_mode": None, "rounds_targeted": 0,
-                                               "last_round": 0})
+                                               "last_round": 0, "failed_observations": []})
         d["seeds"].append(int(seed))
+        if observed_node and observed_node not in d['failed_observations']:
+            d['failed_observations'].append(observed_node)
         d["failure_mode"] = d["failure_mode"] or s.get("failure_mode")
     for r in history or ():
         d = rows.get((r.get("tried") or {}).get("node"))
         if d is not None:
             d["rounds_targeted"] += 1
             d["last_round"] = max(d["last_round"], int(r.get("round") or 0))
-    return sorted(rows.values(), key=lambda d: (d["last_round"], -len(d["seeds"]), d["node"]))
+    return sorted(rows.values(), key=lambda d: d["node"])
 
 
 def _first_death(before: dict, history: list | None = None):
-    """The node this round targets: the least-recently-targeted first-death node
-    (without ``history``, the commonest -- the fallback for a call that has none)."""
+    """A stable first failure observation for legacy readers; never a proposal default."""
     nodes = death_nodes(before, history)
     return nodes[0]["node"] if nodes else None
 
-
-def stuck_on(node, history: list | None, rounds: int | None = None) -> dict | None:
-    """``{node, rounds}`` when the last ``rounds`` (``STUCK_ROUNDS``) rounds that targeted
-    ``node`` all failed to improve -- rounds on other nodes do not break the streak, or
-    rotation would hide it. None while the streak is shorter."""
-    streak = 0
-    for r in reversed(history or ()):
-        if (r.get("tried") or {}).get("node") != node:
-            continue
-        if r.get("published") or r.get("outcome") == "improved":
-            break
-        streak += 1
-    return {"node": node, "rounds": streak} if node and streak >= (rounds or STUCK_ROUNDS) else None
-
-
-def cluster_seeds(rounds: list, before: dict, milestone) -> list[int]:
-    """The ORIGIN CLUSTER of a milestone: the seeds that shared it as their first missing
-    milestone in the campaign's BASELINE round (round 1's per_seed) -- the cohort a fix has
-    to keep, seeds it has already won included.
-
-    The fallback below CHANGES that meaning, and only where the origin cluster cannot be
-    read at all: with no trail in round 1 there is no baseline cohort, so this scores the
-    cluster of THIS round instead -- a seed already repaired has left the cluster and stops
-    being guarded against a later round losing it again. Weaker than the origin cluster,
-    stronger than the empty list a baseline-only reading returns."""
-    if not milestone:   # nothing died: there is no cluster to regress against
-        return []
-    # round 1's rows can EXIST and carry no trail (the live campaign's baseline row is
-    # [{seed: 4243, nodes: []}, {seed: 4244, nodes: []}]), and an empty trail has no first
-    # missing milestone -- so this returned [] for all 588 rounds of evolve-recycle_cans.
-    # That is NOT why the historical regression never ran there: regression() is only
-    # reached under ``if published``, and that campaign published 0 rounds (0 accepted,
-    # best 0). An empty cluster silently skipping the check is a second way to lose it.
-    r0 = (rounds[0].get("per_seed") if rounds else None) or []
-    rows = r0 if any(r.get("nodes") for r in r0) else per_seed(before)
-    return sorted(int(r["seed"]) for r in rows
-                  if evolve_llm.first_missing(r.get("nodes")) == milestone)
-
-
-def regression(rounds: list, before: dict, after: dict, milestone) -> dict | None:
-    """HISTORICAL REGRESSION over the origin cluster (Zetta's acceptance step before the
-    fresh-seed confirm): ``{seeds, before, after, lost}`` = how many of that cluster's seeds
-    succeed under the accepted state vs under the trial, and WHICH ones the trial lost. The
-    retest re-runs EVERY dev seed and the dev range only ever grows (a burned confirm seed
-    joins it), so the cluster is always inside both suites and this reads their results --
-    no seed is re-run twice. A non-empty ``lost`` blocks the publish (a net win that swaps
-    one cluster seed for two is still a regression). None when the cluster is empty."""
-    cs = cluster_seeds(rounds, before, milestone)
-    ok = lambda suite, s: bool((suite["seeds"].get(str(s)) or {}).get("success"))
-    hit = lambda suite: sum(ok(suite, s) for s in cs)
-    return {"seeds": cs, "before": hit(before), "after": hit(after),
-            "lost": [s for s in cs if ok(before, s) and not ok(after, s)]} if cs else None
-
-
-def verdict(tried: dict, trial_row: dict | None, regs: list, confirm: dict | None,
-            published: bool, bs_score: tuple, as_score: tuple) -> tuple[bool, str]:
-    """ACCEPT, level one: ``(accepted, why)`` for a round that ran -- the score rose and
-    nothing that passed stopped passing. (Level two, the publish, is decided upstream.)
-
-    A FOCUSED trial is judged by the SAME score as a full one. Refusing it outright --
-    "focused trial: <node> passed on no seed of its cluster", without ever reading the
-    score -- ended 347 of the recycle_cans campaign's 588 rounds (nav-can1 196,
-    drop-can1 151); nothing written in those rounds could have been accepted.
-    ``regressions`` already skips the seeds a focused trial never ran (they carry no
-    evidence either way) and the publish still demands scope == "full". What a focused
-    accept CANNOT be is the next round's baseline: its suite is ``_merge(before, done)``,
-    so every seed the trial never ran keeps a row measured under the previous state, and
-    downstream nothing tells those rows from fresh ones (they ride under the round's own
-    ``suite_sha``). ``next_baseline`` drops it instead -- one extra suite for the round
-    after a focused accept, against a stale row that would otherwise propagate forever."""
-    if tried["kind"] == "none" or trial_row is None:
-        return False, "nothing tried"
-    if regs:
-        return False, "regressed: " + ", ".join(f"{g['seed']}/{g['node']}" for g in regs[:4])
-    if confirm and not published:   # the fresh seeds refused it: not a baseline either
-        return False, f"confirm {confirm['before']} -> {confirm['after']}"
-    if as_score > bs_score:
-        return True, f"score {list(bs_score)} -> {list(as_score)}, no node regressed"
-    return False, f"score {list(bs_score)} -> {list(as_score)}"
-
-
-def next_baseline(accepted: bool, trial_row: dict | None, kept: dict) -> dict | None:
-    """The suite the next round starts from -- None means "re-run it". Only a FOCUSED
-    accept returns None: its suite carries baseline rows for every seed the trial never
-    ran (see ``verdict``), so the round after it pays one full retest under the accepted
-    state rather than scoring against rows the accepted change was never run on."""
-    return None if accepted and (trial_row or {}).get("scope") == "focused" else kept
-
-
-# ── score: the gradient. Whole-task success alone is flat (0/2 for 90 rounds) ─────
 
 def _ok_map(suite: dict) -> dict[str, dict[str, bool]]:
     """``{seed: {node: passed?}}`` from each seed's node trail."""
     return {str(seed): {n["id"]: n.get("ok") is True for n in (s.get("trail") or [])}
             for seed, s in suite["seeds"].items()}
-
-
-def _recoveries(*suites: dict) -> set[str]:
-    """The node ids that are REPAIRS: the planner inserts a ``recover-<node>`` only after
-    ``<node>`` failed. Read from EVERY suite given, so a kind known on one side only (the
-    trial replanned, the baseline did not) is still known."""
-    return {n["id"] for su in suites for s in (su.get("seeds") or {}).values()
-            for n in (s.get("trail") or []) if n.get("kind") == "recovery"}
-
-
-def _repair(nid: str, rec: set) -> bool:
-    """Is this node a repair -- ``recover-<node>`` by the planner's naming, or a trail
-    row the task validator kinded ``recovery`` (``_recoveries``)?"""
-    return nid.startswith("recover-") or nid in rec
-
-
-def score(suite: dict, node=None) -> tuple[int, int, int]:
-    """The suite's LEXICOGRAPHIC score ``(successes, milestones, target_pass)``:
-    whole-task wins first, then the furthest-progress signal (nodes passed, summed over
-    seeds), then how many seeds pass the round's TARGET node. Success alone is flat --
-    0/2 on every candidate for 90 rounds -- so a change that moves a death EARLIER
-    scores strictly lower and a change that moves it later scores strictly higher.
-
-    REPAIR nodes do not count as milestones: a recovery exists only because something
-    failed, so counting it scored a run that NEEDED a recovery above the same run that
-    no longer needs one -- and paid a patch for inserting repairs."""
-    oks, rec = _ok_map(suite), _recoveries(suite)
-    return (sum(bool(s.get("success")) for s in suite["seeds"].values()),
-            sum(sum(ok for nid, ok in m.items() if not _repair(nid, rec)) for m in oks.values()),
-            sum(bool(m.get(node)) for m in oks.values()) if node else 0)
-
-
-def regressions(before: dict, after: dict) -> list[dict]:
-    """``[{seed, node, was_ok_now_not}]`` -- every node that PASSED under the accepted
-    state and no longer passes under the trial. A non-empty list refuses acceptance,
-    whatever the score did.
-
-    Two things are NOT regressions. A seed the trial never ran (a focused scope keeps
-    the baseline's rows for the rest) carries no evidence either way. And a REPAIR that
-    is gone from the trial's plan BECAUSE THE NODE IT REPAIRS NOW PASSES: the planner
-    inserts ``recover-<node>`` only after ``<node>`` failed, so the fix working makes the
-    repair vanish -- reading that as a loss refused eight measurably improving rounds of
-    the recycle_cans campaign (131..389, milestones 9 -> 13..18, target_pass 0 -> 1).
-
-    Everything else still counts: a repair that RAN AGAIN and failed, a repair whose
-    target still fails, and any ordinary node the trial's plan dropped -- a plan that
-    silently drops work is not a win."""
-    a, rec, out = _ok_map(after), _recoveries(before, after), []
-    for seed, m in sorted(_ok_map(before).items(), key=lambda kv: int(kv[0])):
-        now = a.get(seed)
-        if now is None:
-            continue        # the trial never ran this seed: it says nothing about its nodes
-        for nid, ok in m.items():
-            if not ok or now.get(nid):
-                continue
-            if nid not in now and _repair(nid, rec) \
-                    and now.get(nid.removeprefix("recover-"), True):
-                continue    # the repair is gone because its target passes -- that is the win
-            out.append({"seed": int(seed), "node": nid, "was_ok_now_not": True})
-    return out
-
-
-def focus_seeds(rounds: list, before: dict, node, seeds: list) -> list[int]:
-    """The FOCUSED trial's scope: the target node's failure cluster (``cluster_seeds``,
-    else the seeds dying there this round), inside the dev range. Empty when it is the
-    whole range -- there is nothing to save by narrowing."""
-    full = list(range(int(seeds[0]), int(seeds[1]) + 1))
-    cs = [s for s in cluster_seeds(rounds, before, node) if s in full] or \
-         sorted(int(s) for s, v in before["seeds"].items()
-                if v.get("first_death") == node and int(s) in full)
-    return cs if 0 < len(cs) < len(full) else []
-
-
-def pipeline_modules(ref: str, binding: dict) -> list[str]:
-    """The other modules of the card's stage pipeline, patchable once a node is stuck:
-    the stage-table module (``ref``), its package's shared ``drivers``, and the mission
-    planner. Only the importable ones (``write_patch`` imports what it is given)."""
-    out = set()
-    mod = ref.partition(":")[0]
-    for m in {mod, f"{mod.rpartition('.')[0]}.drivers", (binding.get("planner") or "").partition(":")[0]}:
-        try:
-            if m and importlib.util.find_spec(m):
-                out.add(m)
-        except (ImportError, ValueError):
-            pass
-    return sorted(out)
 
 
 def take_proposal(session: Path, task: str, round_no: int) -> dict | None:
@@ -1086,21 +891,22 @@ def take_proposal(session: Path, task: str, round_no: int) -> dict | None:
     return None
 
 
-def from_proposal(p: dict, before: dict, node_default: str | None = None) -> dict:
-    """A proposal as this round's ``tried`` -- the same {kind, node, detail} shape the
-    built-in proposer emits (so apply/publish need no second path), plus
-    ``detail.proposal`` (id) and ``detail.note``. ``payload.node`` else ``node_default``
-    (the round's rotated target, handed in so the caller and this do not each compute a
-    first-death node of their own) else the commonest first-death node; a node the suite
-    never ran is an honest ``none``."""
+def from_proposal(p: dict, before: dict) -> dict:
+    """Normalize an explicit model/operator candidate without choosing its target."""
     pay = dict(p["payload"])
-    node = pay.pop("node", None) or node_default or _first_death(before)
-    runs = [s["nodes"][node] for s in before["seeds"].values() if node in s["nodes"]]
+    node = pay.pop("node", None)
+    runs = [s["nodes"][node] for s in before["seeds"].values()
+            if isinstance(node, str) and node in s["nodes"]]
     tag = {"proposal": p["id"], "note": p["note"]}
-    if not runs:
+    if p['kind'] == 'plan':
+        if not isinstance(pay.get('graph'), dict):
+            return _none('plan proposal requires a graph object', node)
+        return {'kind': 'plan', 'node': node, 'detail': {**tag, **pay}}
+    if not isinstance(node, str) or not runs:
         return {"kind": "none", "node": node,
-                "detail": {**tag, "reason": f"proposal names no node the suite ran ({node!r})"}}
-    need = {"tunables": ("ref", "path", "to"), "executor": ("to",), "card": ("path", "to", "ref")}[p["kind"]]
+                "detail": {**tag, "reason": f"proposal requires an explicit node the suite ran ({node!r})"}}
+    need = {"tunables": ("ref", "path", "to"), "executor": ("to",),
+            "card": ("path", "to", "ref"), "plan": ("graph",)}[p["kind"]]
     if missing := [k for k in need if k not in pay]:
         return {"kind": "none", "node": node,
                 "detail": {**tag, "reason": f"{p['kind']} proposal lacks {missing}"}}
@@ -1115,81 +921,12 @@ def from_proposal(p: dict, before: dict, node_default: str | None = None) -> dic
                        "from": frm, **tag, **pay}}
 
 
-def _tunables(params: dict) -> tuple[dict, list]:
-    """Numeric knobs + the key path they live under (``[tunables]`` table or top-level)."""
-    t = params.get("tunables")
-    nested = isinstance(t, dict)
-    src = t if nested else params
-    num = {k: v for k, v in src.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-    return num, (["tunables"] if nested else [])
-
-
-def propose(before: dict, records: dict, emb: str, arm: str, binding: dict,
-            round_no: int, applied: dict, history: list | None = None) -> dict:
-    """``history`` = earlier round rows: an executor switch already tried on the
-    first-death node (won or lost) is not proposed again, nor is a (knob,
-    direction) tunables step. Knobs the card's ``[tunable_hints]`` ties to the
-    node's failure_mode go first, each in both directions (-30% then +30%)."""
-    node = _first_death(before, history)   # rotates over the distinct first-death nodes
-    if node is None:
-        return _none("no first death: every seed succeeded", needs=())
-    modes = Counter(s.get("failure_mode") for s in before["seeds"].values()
-                    if s["first_death"] == node and s.get("failure_mode"))
-    mode = modes.most_common(1)[0][0] if modes else None
-    runs = [s["nodes"][node] for s in before["seeds"].values() if node in s["nodes"]]
-    skill, current = runs[0]["skill"], runs[0]["executor"]
-    rate = sum(r["success"] for r in runs) / len(runs)
-    rec = records.get(skill)
-    if rec is None:
-        return _none(f"no skill record for {skill!r}", node)
-    spec = segment_specs({skill: rec}, emb).get(skill) or {}
-    bound = {"scripted", *(spec.get("policies") or {})}
-    ev = rec.evidence.get(emb)
-    cands = {k: v for k, v in (ev.by_executor if ev else {}).items()
-             if k in bound and k != current and v.get("n")}
-    if cands:
-        best = max(sorted(cands), key=lambda k: cands[k]["k"] / cands[k]["n"])
-        if cands[best]["k"] / cands[best]["n"] > rate:
-            return {"kind": "executor", "node": node,
-                    "detail": {"skill": skill, "from": current, "to": best,
-                               "evidence": dict(cands[best]), "measured": rate}}
-    # no evidence says another bound executor is better: one honest attempt at any
-    # not yet tried on this node beats none
-    tried = {r["tried"]["detail"].get("to") for r in history or ()
-             if r["tried"]["kind"] in ("executor", "card") and r["tried"]["node"] == node}
-    if untried := sorted(bound - {current} - tried):
-        return {"kind": "executor", "node": node,
-                "detail": {"skill": skill, "from": current, "to": untried[0],
-                           "evidence": dict(cands.get(untried[0]) or {}), "measured": rate}}
-    ref = (rearm(spec, arm, current if current in bound else None).get("policy_provider")
-           or binding["policy"])
-    params = mount_params(ref)
-    tun, path = _tunables(params)
-    hinted = [k for k in (params.get("tunable_hints") or {}).get(mode) or () if k in tun]
-    done = set()   # (knob, went up?) steps already tried on this node (a proposal's row has no numeric from)
-    for r in history or ():
-        d = r["tried"]["detail"]
-        if r["tried"]["kind"] == "tunables" and r["tried"]["node"] == node \
-                and isinstance(d.get("from"), (int, float)) and isinstance(d.get("to"), (int, float)):
-            done.add((d["path"][-1], d["to"] > d["from"]))
-    for key in [*hinted, *sorted(set(tun) - set(hinted))]:
-        for f in (0.7, 1.3):
-            # the card re-types the overlay (int stays int): a knob the step leaves
-            # where it is (0, a small int) is no trial -- skip it rather than burn a suite
-            to = type(tun[key])(tun[key] * f)
-            if to == tun[key] or (key, to > tun[key]) in done:
-                continue
-            return {"kind": "tunables", "node": node,
-                    "detail": {"skill": skill, "executor": current, "ref": ref, "path": [*path, key],
-                               "from": tun[key], "to": to, "hint": mode if key in hinted else None}}
-    return _none(f"no untried executor for {skill!r} and no untried tunables step on {ref!r}",
-                 node, needs=(f"tunables on {ref}", "evidence for another executor", "proposal"))
-
-
 def apply(tried: dict, applied: dict) -> dict:
     out = {"executors": dict(applied["executors"]),
            "tunables": json.loads(json.dumps(applied["tunables"])),
            "cards": dict(applied.get("cards") or {})}
+    if applied.get("graph"):
+        out["graph"] = copy.deepcopy(applied["graph"])
     d = tried["detail"]
     if tried["kind"] == "executor":
         out["executors"][tried["node"]] = d["to"]
@@ -1197,61 +934,40 @@ def apply(tried: dict, applied: dict) -> dict:
         out["executors"][tried["node"]] = d["to"]
         out["cards"][d["to"]] = {"skill": d["skill"], "path": d["path"], "ref": d["ref"],
                                  "params": dict(d.get("params") or {}),
-                                 "transport": d.get("transport", "inproc")}
+                                 "transport": d.get("transport", "inproc"),
+                                 "artifact_sha": d.get('artifact_sha') or evolve_llm.candidate_digest(d['path'])}
     elif tried["kind"] == "tunables":
         cur = out["tunables"].setdefault(d["ref"], {})
         for p in d["path"][:-1]:
             cur = cur.setdefault(p, {})
         cur[d["path"][-1]] = d["to"]
+    elif tried["kind"] == "plan":
+        out["graph"] = copy.deepcopy(d["graph"])
     return out
 
 
-# ── publish: evidence write-back through the evolution-only skills-root door ───────
-
-def publish(skills_root: Path, rec, emb: str, tried: dict, after: dict) -> tuple[str, dict]:
-    d = to_plain(rec)
-    node, det = tried["node"], tried["detail"]
-    key = det["to"] if tried["kind"] in ("executor", "card") else det["executor"]
-    runs = [s["nodes"][node] for s in after["seeds"].values() if node in s["nodes"]]
-    ev = d.setdefault("evidence", {}).setdefault(emb, {"n": 0, "k": 0})
-    row = ev.setdefault("by_executor", {}).setdefault(key, {"n": 0, "k": 0})
-    row["n"] += len(runs)
-    row["k"] += sum(r["success"] for r in runs)
-    if tried["kind"] == "card":   # the candidate's binding earns its place in the record
-        b = d.setdefault("bindings", {}).setdefault(emb, {})
-        b.setdefault("policies", {})[key] = _binding(det)
-    if tried["kind"] == "tunables":
-        b = d.setdefault("bindings", {}).setdefault(emb, {})
-        slot = b.get("policies", {}).get(key, b)   # the policy entry; scripted rides the binding
-        cur = slot.setdefault("params", {})
-        for p in det["path"][:-1]:
-            cur = cur.setdefault(p, {})
-        cur[det["path"][-1]] = det["to"]
-    return InMemorySkillGraph(root=str(skills_root)).publish(d), d
-
-
-def _media(session: Path, task: str, seeds: list) -> list[str]:
+def _media(session: Path, task: str, seeds: list, prefix: str = 'media') -> list[str]:
     """Session-relative paths of the clips kept so far (harness.media index), the
     list the board's rsi_frames face returns verbatim."""
-    return [f"media/{task}/{seed}/{ent['file']}"
+    return [f"{prefix}/{task}/{seed}/{ent['file']}"
             for seed in range(int(seeds[0]), int(seeds[1]) + 1)
-            for ent in media.index_of(session / "media", task, seed).values()]
+            for ent in media.index_of(session / prefix, task, seed).values()]
 
 
-def _dropped(session: Path, task: str, seeds: list) -> dict[str, dict]:
+def _dropped(session: Path, task: str, seeds: list, prefix: str = 'media') -> dict[str, dict]:
     """``{"<seed>/<node>": {reason, keyframes: [session-relative paths]}}`` of the
     segments that left no clip -- the honest side of ``media`` (rsi_frames' ``dropped``)."""
     return {f"{seed}/{node}": {"reason": d["reason"],
-                               "keyframes": [f"media/{task}/{seed}/{f}" for f in d["keyframes"]]}
+                               "keyframes": [f"{prefix}/{task}/{seed}/{f}" for f in d["keyframes"]]}
             for seed in range(int(seeds[0]), int(seeds[1]) + 1)
-            for node, d in media.dropped_of(session / "media", task, seed).items()}
+            for node, d in media.dropped_of(session / prefix, task, seed).items()}
 
 
 # ── the round loop ────────────────────────────────────────────────────────────────
 
 _ZH = {"idle": "等待", "baseline": "基线评测", "propose": "选试验", "retest": "同种子复测",
        "confirm": "新种子确认", "publish": "发布", "done": "完成", "cancelled": "已取消",
-       "paused_disk": "磁盘不足，已暂停"}
+       "failed": "失败", "paused_disk": "磁盘不足，已暂停"}
 
 
 def _message(live: dict) -> str:
@@ -1259,13 +975,12 @@ def _message(live: dict) -> str:
     head = f"第 {live['round']} 轮 {_ZH.get(live['phase'], live['phase'])}"
     if live["phase"] == "paused_disk":
         return live.get("disk") or head
+    if live['phase'] == 'failed':
+        return f"LLM 提案失败，第 {live['round']} 轮已停止：{live.get('error') or '查看模型审计'}"
     if live["phase"] == "propose" and live.get("proposer") == "llm":
         head = f"LLM 分析第 {live['round']} 轮…"
     if live["phase"] == "done":
         return f"已完成 {live['round']} 轮"
-    if live["phase"] == "waiting":
-        return (f"第 {live['round']} 轮没有可试方案，{live.get('wait_s', 0)} 秒后继续"
-                f"（连续第 {live.get('nones', 1)} 次，按停止结束）")
     if live["phase"] == "cancelled":
         return f"第 {live['round']} 轮边界取消"
     t = live.get("tried")
@@ -1278,340 +993,603 @@ def _message(live: dict) -> str:
                  + f"，{live['seed_index'] + 1}/{live['seeds_total']}")
     return head
 
+def _evaluate_suite(out: dict, contract: dict) -> dict:
+    """Attach only execution-owned verification observations to a fixed ruler."""
+    out = copy.deepcopy(out)
+    for row in out['seeds'].values():
+        row['execution_success'] = row['success']
+        row['evaluation'] = evaluation.evaluate(
+            contract, row.get('verification_observations'), row.get('terminal_observation'))
+        row['success'] = row['evaluation']['complete']
+        if row['execution_success'] and not row['success']:
+            row['terminal_mismatch'] = True
+    out['count'] = sum(row['success'] for row in out['seeds'].values())
+    out['sha'] = sha_json(out['seeds'])
+    return out
+
+
+def _diagnose_suite(out: dict) -> dict:
+    findings, fingerprint, traces = [], set(), []
+    for seed, row in out['seeds'].items():
+        for observation in row.get('verification_observations') or []:
+            if observation.get('blocked_reads'):
+                findings.append({'kind': 'untrusted_verifier_dependency', 'channel': 'evaluation',
+                                 'seed': seed, 'node': observation['node']['id'],
+                                 'evidence': {'source': observation['source'],
+                                              'blocked_reads': observation['blocked_reads']}})
+                fingerprint.add('evaluation:untrusted_verifier_dependency')
+        if row.get('terminal_mismatch'):
+            findings.append({'kind': 'terminal_mismatch', 'channel': 'evaluation', 'seed': seed,
+                             'evidence': {'execution_success': True, 'terminal': row['evaluation']['terminal']}})
+            fingerprint.add('evaluation:terminal_mismatch')
+        for node in row.get('trail') or []:
+            if not node.get('trace'):
+                continue
+            diag = diagnosis.analyze_trace(node['trace'])
+            traces.append({'seed': seed, 'node': node['id'], **diag})
+            fingerprint.update(diag.get('fingerprint') or [])
+            findings.extend({**f, 'seed': seed, 'node': node['id']} for f in diag['findings'])
+    return {'status': 'observed' if findings else 'unknown', 'findings': findings,
+            'fingerprint': sorted(fingerprint), 'traces': traces,
+            'limits': 'Sampled controller observations support hypotheses, never reward or proof of physical impossibility.'}
+
+
+def _validate_try(tried: dict, projection: dict, brief_data: dict, reference: dict) -> None:
+    """Validate an explicit candidate against installed capabilities and the frozen task."""
+    kind, detail = tried['kind'], tried['detail']
+    if kind == 'none':
+        return
+    if kind == 'plan':
+        interventions.validate_candidate(detail['graph'], reference, brief_data)
+        return
+    driver = (projection.get('drivers') or {}).get(tried['node'])
+    if driver is None:
+        raise ValueError('candidate must explicitly select an observed action from intervention_space')
+    if kind == 'tunables':
+        knobs = driver.get('tunables') or {}
+        path = detail.get('path') or []
+        values = knobs.get('values') or {}
+        if (detail.get('ref') != knobs.get('ref') or not path
+                or path[:-1] != knobs.get('path', []) or path[-1] not in values
+                or type(detail.get('to')) not in (int, float) or not math.isfinite(detail['to'])):
+            raise ValueError('tunables must name a finite installed driver parameter from intervention_space')
+    elif kind == 'executor':
+        if detail.get('to') not in driver.get('executors', {}):
+            raise ValueError('executor must be bound to the target skill')
+    elif kind == 'card':
+        path = Path(detail['path'])
+        if not path.is_dir():
+            raise ValueError('candidate card directory is missing')
+        if why := evolve_llm._doctor(path, detail['ref'], detail):
+            raise ValueError(why)
+        if why := self_check(tried):
+            raise SelfCheckError(why)
+        digest = evolve_llm.candidate_digest(path)
+        if detail.get('artifact_sha') and detail['artifact_sha'] != digest:
+            raise ValueError('candidate content differs from its proposal identity')
+        detail['artifact_sha'] = digest
+    else:
+        raise ValueError(f'unsupported intervention {kind!r}')
+
+
+def evaluator_identity(binding: dict, records: dict) -> dict:
+    """Bind experiments to installed source and configuration, excluding generated candidates."""
+    roots = {REPO_ROOT / 'harness', REPO_ROOT / 'plugins' / 'task', REPO_ROOT / 'plugins' / 'rsi'}
+    for ref in binding.values():
+        if isinstance(ref, str) and ':' in ref:
+            spec = importlib.util.find_spec(ref.partition(':')[0])
+            if spec and spec.origin and Path(spec.origin).is_file():
+                roots.add(Path(spec.origin).parent)
+    files = {str(p.relative_to(REPO_ROOT)) if p.is_relative_to(REPO_ROOT) else str(p): sha_json(p.read_text())
+             for root in roots for p in root.iterdir() if p.is_file() and p.suffix in ('.py', '.toml')}
+    for p in (REPO_ROOT / 'scripts' / name for name in ('evolve.py', 'evolve_llm.py', 'evolve_evidence.py')):
+        files[str(p.relative_to(REPO_ROOT))] = sha_json(p.read_text())
+    return {'binding': binding, 'records': {k: to_plain(v) for k, v in records.items()},
+            'sources': files}
+
+
+def _policy_ancestor(learner: ProgramLearner, policy_id: str) -> bool:
+    current = learner.selected_id
+    while current is not None:
+        if current == policy_id:
+            return True
+        current = learner.policies[current]['parent_id']
+    return False
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--mode", choices=MODES, default="execution")
-    ap.add_argument("--task")
-    ap.add_argument("--gc", action="store_true",
-                    help="run the maintenance pass alone (prune audits + GC candidate cards) "
-                         "and exit; --dry-run prints what it would do and changes nothing")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--session", type=Path)
-    ap.add_argument("--skills-root", type=Path)
-    ap.add_argument("--seeds", type=int, nargs=2, default=None)
-    ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--arm", default="auto")
-    ap.add_argument("--cancel-marker", type=Path, default=None)
-    ap.add_argument("--max-replans", type=int, default=None)
-    ap.add_argument("--max-actuations", type=int, default=None)
-    ap.add_argument("--confirm-seeds", type=int, default=2,
-                    help="fresh scratch seeds (above the block) a debug-seed win must hold on "
-                         "before publish; 0 disables")
-    ap.add_argument("--proposer", choices=("llm", "rules"), default="llm",
-                    help="llm: the model_endpoint card reads the round and answers the try "
-                         "(rules fallback when unreachable/invalid); rules: the built-in proposer only")
+    ap = argparse.ArgumentParser(description='Bounded online program-policy learning with fixed verification objectives')
+    ap.add_argument('--mode', choices=MODES, default='execution')
+    ap.add_argument('--task')
+    ap.add_argument('--session', type=Path)
+    ap.add_argument('--skills-root', type=Path)
+    ap.add_argument('--seeds', type=int, nargs=2)
+    ap.add_argument('--rounds', type=int, default=None,
+                    help='Completed learning cycles in this brief; 0 means no cycle-count limit')
+    ap.add_argument('--continuous', action='store_true',
+                    help='Renew bounded cycle budgets until cancellation, error, or the round limit')
+    ap.add_argument('--arm', default='auto')
+    ap.add_argument('--cancel-marker', type=Path)
+    ap.add_argument('--max-replans', type=int)
+    ap.add_argument('--max-actuations', type=int)
+    ap.add_argument('--confirm-seeds', type=int, default=2,
+                    help='Additional development seeds for a task-success gain; never held-out installation evidence')
+    ap.add_argument('--proposer', choices=('llm',), default='llm')
+    ap.add_argument('--llm-model', help='Model ID served by the installed model endpoint')
+    ap.add_argument('--llm-effort', default='off', help='Effort declared by the installed model endpoint')
+    ap.add_argument('--max-model-calls', type=int, default=8)
+    ap.add_argument('--max-input-bytes', type=int, default=96000)
+    ap.add_argument('--max-output-tokens', type=int, default=4096)
+    ap.add_argument('--max-probe-episodes', type=int, default=3)
+    ap.add_argument('--gc', action='store_true')
+    ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
-    if args.gc:   # the operator's door: no task, no session, no round
-        log = gc_candidates(runs=(args.session.parent if args.session else REPO_ROOT / "runs"),
-                            dry_run=args.dry_run)
+    if args.rounds is None:
+        args.rounds = 0 if args.continuous else 3
+    if args.rounds < 0:
+        ap.error('rounds must be nonnegative')
+    if min(args.max_model_calls, args.max_input_bytes, args.max_probe_episodes) < 0 or args.max_output_tokens < 1:
+        ap.error('model/input/probe budgets must be nonnegative; output tokens must be positive')
+    try:
+        llm_params, _ = evolve_llm.model_request_config(args.llm_model, args.llm_effort)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.gc:
+        messages = gc_candidates(runs=args.session.parent if args.session else REPO_ROOT / 'runs',
+                                 dry_run=args.dry_run)
         if args.session and args.task:
-            log = prune_audits(EvolveStore(args.session, args.task).dir / "llm",
-                               dry_run=args.dry_run) + log
-        print("\n".join(log) or "gc: nothing to do")
+            messages += prune_audits(EvolveStore(args.session, args.task).dir / 'llm', dry_run=args.dry_run)
+        print('\n'.join(messages) or 'gc: nothing to do')
         return 0
-    if missing := [f"--{k}" for k in ("task", "session", "skills_root")
-                   if getattr(args, k) is None]:
-        ap.error("the following arguments are required: " + ", ".join(missing))
-    budgets = {"max_replans": args.max_replans, "max_actuations": args.max_actuations}
-    if args.mode != "evolution":
-        print(json.dumps({"error": f"evolve writes a skills root: refused in mode "
-                                   f"{args.mode!r}; assert --mode evolution"}))
+    if missing := [f'--{k}' for k in ('task', 'session', 'skills_root') if getattr(args, k) is None]:
+        ap.error('required: ' + ', '.join(missing))
+    if args.mode != 'evolution':
+        print(json.dumps({'error': f'evolve refused in mode {args.mode!r}; assert --mode evolution'}))
         return 3
     binding = discover().task_bindings.get(args.task)
     if binding is None:
-        raise SystemExit(f"no task binding for {args.task!r}")
-    records = hr._binding_records(binding)
-    emb = hr.task_brief(args.task, binding)["embodiment"]
-    if keys := Counter(k for r in records.values() for k in r.bindings if emb not in r.bindings):
-        emb = keys.most_common(1)[0][0]   # robocasa: the records bind under the card's short name, not the env ref
-
+        raise SystemExit(f'no task binding for {args.task!r}')
+    brief_data = hr.task_brief(args.task, binding)
+    records, emb = hr._binding_records(binding), brief_data['embodiment']
+    identity = evaluator_identity(binding, records)
+    if keys := Counter(k for record in records.values() for k in record.bindings if emb not in record.bindings):
+        emb = keys.most_common(1)[0][0]
     store = EvolveStore(args.session, args.task)
-    doc = store.load() or {"task": args.task, "session": args.session.name,
-                           "seeds": list(args.seeds or [0, 1]), "arm": args.arm,
-                           "rounds": [], "best": 0, "cursor": 0, "status": "running",
-                           "applied": {"executors": {}, "tunables": {}}}
-    seeds, arm, applied = doc["seeds"], doc["arm"], doc["applied"]
-    # ``rounds`` counts rounds with a REAL try (a rejected / empty round is not an idea
-    # tried); a resume whose --rounds does not reach past the tries so far means "N more"
-    # (the console's 开始/继续 sends a task-only brief, so rounds is the default):
-    # otherwise the round loop is empty and the brief "finishes" in a blink.
-    tries = sum(r["tried"]["kind"] != "none" for r in doc["rounds"])
-    unbounded = args.rounds <= 0
-    target = float("inf") if unbounded else (args.rounds if args.rounds > tries else tries + args.rounds)
-    doc["status"] = "running"
-    # live = where the loop is RIGHT NOW (rsi_run's ``live``): rewritten with the
-    # doc at every phase/seed/node boundary. One writer, tmp+rename -> no race.
+    doc = store.load() or {'task': args.task, 'session': args.session.name,
+                           'seeds': list(args.seeds or [0, 1]), 'arm': args.arm,
+                           'rounds': [], 'best': 0, 'cursor': 0,
+                           'applied': {'executors': {}, 'tunables': {}}}
+    if (doc.get('protocol_id') != evaluation.VERSION
+            or (doc.get('evaluation_contract') or {}).get('context') != identity):
+        # Old observations remain hypotheses across a source/evaluator change.
+        # They never populate this decision's executable working policies or
+        # comparisons. Tag legacy replay before clearing its original contract.
+        for observation in doc.get('learning_replay', []):
+            observation.setdefault('contract_sha', (doc.get('evaluation_contract') or {}).get('sha'))
+            observation.setdefault('task', args.task)
+        # The former ruler and its accepted state cannot silently become this experiment.
+        if doc['rounds']:
+            doc.setdefault('prior_protocols', []).append({
+                'through_round': doc['cursor'], 'applied': doc['applied'],
+                'accepted_stack': doc.get('accepted_stack', []), 'best': doc['best'],
+                'reason': 'New frozen verifier protocol; historical rows retain their original meaning.'})
+        doc.update(protocol_id=evaluation.VERSION, applied={'executors': {}, 'tunables': {}},
+                   accepted_stack=[], best=0, epoch_start=int(doc['cursor']) + 1,
+                   evaluation_contract=None, reference_plan=None, reference={}, confirm_base=None)
+        doc.pop('memory_prefix', None)
+        doc.pop('last_outcome', None)
+        doc.pop('cycle_context', None)
+    seeds, arm, applied = doc['seeds'], doc['arm'], doc['applied']
+    epoch_start = doc['epoch_start']
+    epoch_rows = lambda: [row for row in doc['rounds'] if row['round'] >= epoch_start]
+    cycles = 0
+    target = float('inf') if args.rounds == 0 else args.rounds
+    doc.update(status='running', continuous=args.continuous, stop_reason=None)
+    doc['llm_config'] = {'model': llm_params.get('model'), 'effort': args.llm_effort}
+    doc['working_candidates'] = []  # Process-local measurements never become restored executable authority.
+    doc['score_definition'] = ('Frozen independent verification vector; accept a strict component gain on paired seeds '
+                               'only when no true component regresses. Node count and controller targets carry no reward.')
+    contract = doc.get('evaluation_contract')
+    reference_plan = doc.get('reference_plan')
+    memory_path = args.session.parent / 'rsi-experience.json'
+    memory_rows = experience.read_experiences(memory_path)
+    memory_prefix = doc.setdefault('memory_prefix', max((r['sequence'] for r in memory_rows), default=0) + 1)
+    prior_tasks = len({r['task'] for r in memory_rows if r['sequence'] < memory_prefix
+                       and r['task'] != args.task
+                       and r.get('evidence', {}).get('protocol_id') == evaluation.VERSION
+                       and r.get('evidence', {}).get('evidence_policy') == evaluation.EVIDENCE_POLICY})
     now = time.time()
-    live = doc["live"] = {"phase": "idle", "round": doc["cursor"], "seeds_total": int(seeds[1]) - int(seeds[0]) + 1,
-                          "seed_index": None, "seed": None, "node": None, "started_at": now,
-                          "round_started_at": None, "phase_started_at": now, "last_round_s": None,
-                          "per_seed_partial": [], "tried": None, "message": "", "messages": [],
-                          "nodes": [], "seed_started_at": None, "proposer": args.proposer,
-                          "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in doc["rounds"]), 3)}
+    live = doc['live'] = {'phase': 'idle', 'round': doc['cursor'], 'seeds_total': seeds[1] - seeds[0] + 1,
+                          'seed_index': None, 'seed': None, 'node': None, 'nodes': [], 'messages': [],
+                          'message': '', 'started_at': now, 'round_started_at': now, 'phase_started_at': now,
+                          'seed_started_at': None, 'last_round_s': None, 'per_seed_partial': [],
+                          'tried': None, 'proposer': args.proposer,
+                          'sim_s': sum((row.get('usage') or {}).get('sim_s', 0) for row in doc['rounds'])}
+    budgets = {'max_replans': args.max_replans, 'max_actuations': args.max_actuations}
+    run_budget = {'scope': 'submitted_brief', 'limits': {
+        'model_calls': None if args.continuous else args.max_model_calls,
+        'input_bytes': None if args.continuous else args.max_input_bytes,
+        'output_tokens_per_call': args.max_output_tokens,
+        'probe_episodes': None if args.continuous else args.max_probe_episodes},
+        'used': {'model_calls': 0, 'input_bytes': 0, 'probe_episodes': 0, 'full_evaluations': 0}}
+    doc['run_budget'] = run_budget
 
-    def suite(seed_range, overlay, media=True, seed_list=None):
-        out = run_suite(args.task, binding, seed_range, arm, args.skills_root, overlay,
-                        media_dir=args.session / "media" if media else None, budgets=budgets,
-                        progress=tick, seed_list=seed_list)
-        live["sim_s"] = round(live["sim_s"] + out["elapsed_s"], 3)
-        return out
-
-    def tick(**kw) -> None:
-        if kw.get("phase", live["phase"]) != live["phase"]:
-            kw = {"phase_started_at": time.time(), "seed": None, "seed_index": None, "node": None,
-                  "nodes": [], "seed_started_at": None, "per_seed_partial": [], **kw}
-        live.update(kw)
-        msg = _message(live)
-        if msg != live["message"]:   # rolling operator log: the last 20 distinct messages
-            live["message"] = msg
-            live["messages"] = (live["messages"] + [{"ts": time.time(), "text": msg}])[-20:]
-        store.save(doc)
-
-    def preflight(tried: dict) -> None:
-        """A card's trial on the FIRST seed alone, before the suite: an exception inside
-        the executor comes back to the model as a repair, not a burned suite. The seed's
-        result is kept and merged into the retest (never run twice). The static
-        ``self_check`` runs first -- an attribute the class never assigns costs no sim at
-        all -- and either way the raise is kept whole in ``pre["exc"]`` for the round's
-        ``trial_evidence``, not only in the repair text."""
-        pre.pop("exc", None)   # a later attempt's outcome, not the last one's
-        if why := self_check(tried):
-            try:
-                raise SelfCheckError(why)
-            except SelfCheckError as exc:
-                pre["exc"] = _exception(exc)
-                raise
-        try:
-            pre["out"] = suite([int(seeds[0]), int(seeds[0])], apply(tried, applied))
-        except Exception as exc:  # noqa: BLE001 -- the executor's own failure IS the finding
-            pre["exc"] = _exception(exc)
-            raise
-        finally:   # mount_params reads the accepted overlay again, not the trial's
-            os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])
-
-    tick()
-    base, pre, r, nones = None, {}, doc["cursor"], 0
-    # stop: the target reached, or MAX_NONE rounds in a row with nothing tried (a stuck
-    # model cannot loop forever); a none whose ``needs`` is empty (nothing could unblock
-    # it: every seed succeeded) ends the loop at once.
-    def cancelled() -> bool:
+    def cancelled():
         return args.cancel_marker is not None and args.cancel_marker.exists()
 
-    while tries < target and (unbounded or nones < MAX_NONE):
+    def tick(**kw):
+        if kw.get('phase', live['phase']) != live['phase']:
+            kw = {'phase_started_at': time.time(), 'seed': None, 'seed_index': None,
+                  'node': None, 'nodes': [], 'seed_started_at': None, 'per_seed_partial': [], **kw}
+        live.update(kw)
+        msg = _message(live)
+        if msg != live['message']:
+            live['message'] = msg
+            live['messages'] = (live['messages'] + [{'ts': time.time(), 'text': msg}])[-20:]
+        store.save(doc)
+
+    def suite(seed_range, overlay, *, media_enabled=True, label=None):
+        prefix = f"media/rsi/{args.task}/epoch-{epoch_start}/round-{live['round']}/{label or live['phase']}"
+        out, started_episodes = None, 0
+        started_sampling = time.monotonic()
+
+        def sampling_tick(**kw):
+            nonlocal started_episodes
+            if kw.get('seed_started_at') is not None:
+                started_episodes += 1
+            tick(**kw)
+
+        try:
+            out = run_suite(args.task, binding, seed_range, arm, args.skills_root, overlay,
+                            media_dir=args.session / prefix if media_enabled else None,
+                            budgets=budgets, progress=sampling_tick, media_prefix=prefix)
+        finally:
+            # Failed sampling still costs time and started episodes. Reused
+            # baselines never enter this wrapper and therefore cost nothing twice.
+            elapsed = out['elapsed_s'] if out is not None else time.monotonic() - started_sampling
+            attempts = max(started_episodes, len(out.get('seeds', {})) if out is not None else 0)
+            round_sampling['episode_attempts'] += attempts
+            round_sampling['sim_s'] += elapsed
+            live['sim_s'] += elapsed
+        out['experiment_id'] = sha_json({'binding': binding, 'arm': arm, 'budgets': budgets,
+                                         'overlay': overlay, 'seeds': seed_range,
+                                         'evaluator': contract['sha'] if contract else None})
+        out['media'] = _media(args.session, args.task, seed_range, prefix) if media_enabled else []
+        out['media_dropped'] = _dropped(args.session, args.task, seed_range, prefix) if media_enabled else {}
+        return _evaluate_suite(out, contract) if contract else out
+
+    tick()
+    base, learner = None, None
+    while cycles < target:
         if cancelled():
-            doc["status"] = "cancelled"
-            tick(phase="cancelled")
+            doc.update(status='cancelled', stop_reason='cancelled')
+            tick(phase='cancelled')
             return 3
-        # bounded growth, checked before anything is spent: the loud stop first, then the
-        # cheap housekeeping (this campaign's old audits, the candidate cards nothing needs)
-        if msg := disk_guard(args.session, store.dir):
-            doc["status"] = "paused_disk"
-            doc["rounds"].append(
-                {"round": r + 1, "tried": _none(msg, None, needs=("disk",)), "before": doc["best"],
-                 "after": doc["best"], "best": doc["best"], "outcome": "none", "accepted": False,
-                 "published": False, "accepted_reason": "paused_disk", "paused_disk": msg,
-                 "needs": ["disk"], "per_seed": [], "ts": time.time()})
-            tick(phase="paused_disk", round=r + 1, disk=msg)
-            print(msg, file=sys.stderr)
+        cycle_limits = {key: maximum if args.continuous else max(0, maximum - run_budget['used'][key])
+                        for key, maximum in (('model_calls', args.max_model_calls),
+                                             ('input_bytes', args.max_input_bytes),
+                                             ('probe_episodes', args.max_probe_episodes))}
+        cycle_budget = doc['cycle_budget'] = {
+            'scope': 'learning_cycle', 'cycle': cycles + 1,
+            'limits': {**cycle_limits, 'output_tokens_per_call': args.max_output_tokens},
+            'used': {'model_calls': 0, 'input_bytes': 0, 'probe_episodes': 0, 'full_evaluations': 0}}
+        if not all(cycle_limits.values()):
+            doc['stop_reason'] = 'budget_exhausted'
+            break
+        if why := disk_guard(args.session, store.dir):
+            doc.update(status='paused_disk', stop_reason='paused_disk')
+            doc['cursor'] = int(doc['cursor']) + 1
+            doc['rounds'].append({'round': doc['cursor'], 'tried': _none(why, needs=('disk',)),
+                                  'before': doc['best'], 'after': doc['best'], 'best': doc['best'],
+                                  'outcome': 'none', 'accepted': False, 'published': False,
+                                  'accepted_reason': 'paused_disk', 'paused_disk': why,
+                                  'needs': ['disk'], 'per_seed': [], 'ts': time.time()})
+            tick(phase='paused_disk', round=doc['cursor'], disk=why)
             return 4
         for line in maintain(store, args.session):
             print(line, file=sys.stderr)
-        if unbounded and nones:
-            # Throttle, never stop: an empty round costs one model call and no sim.
-            wait = min(NONE_BACKOFF_S[0] * 2 ** (nones - 1), NONE_BACKOFF_S[1])
-            tick(phase="waiting", wait_s=int(wait), nones=nones)
-            t_wait = time.time()
-            while time.time() - t_wait < wait:
-                if cancelled():
-                    doc["status"] = "cancelled"
-                    tick(phase="cancelled")
-                    return 3
-                time.sleep(min(2.0, wait))
-        r += 1
-        t_round = time.time()
-        tick(phase="baseline" if base is None else "propose", round=r, round_started_at=t_round, tried=None)
-        sim_s0 = live["sim_s"]
-        before = base or suite(seeds, applied)
-        tick(phase="propose")
-        os.environ[OVERRIDE_ENV] = json.dumps(applied["tunables"])  # mount_params: the accepted overlay, not the last trial's
-        prop = take_proposal(args.session, args.task, r)
-        proposer, llm, tried = "inbox", None, None
-        pre.clear()
+        rnd, started = int(doc['cursor']) + 1, time.time()
+        round_started = time.monotonic()
+        round_sampling = {'episode_attempts': 0, 'sim_s': 0.0}
+        previous_efficiency = experience.development_report(epoch_rows(), epoch_start=epoch_start)
+        tick(phase='baseline' if base is None else 'propose', round=rnd, round_started_at=started,
+             cycle=cycles + 1, tried=None)
+        try:
+            before = base or suite(seeds, applied)
+        except Exception as exc:
+            doc.update(status='failed', stop_reason='infrastructure_error')
+            tick(phase='failed', error=f'{type(exc).__name__}: {exc}')
+            raise
+        if contract is None:
+            reference_plan = before.get('plan')
+            if not reference_plan:
+                raise ValueError('baseline produced no server plan from which to freeze evaluation')
+            contract = evaluation.compile_contract(reference_plan, records, task=args.task,
+                                                   predicates=brief_data.get('predicates'),
+                                                   terminal_ref=brief_data['embodiment'], identity=identity)
+            doc['evaluation_contract'], doc['reference_plan'] = contract, reference_plan
+            doc.setdefault('evaluation_contracts', {})[contract['sha']] = contract
+            before = _evaluate_suite(before, contract)
+            before['experiment_id'] = sha_json({'binding': binding, 'arm': arm, 'budgets': budgets,
+                                                 'overlay': applied, 'seeds': seeds,
+                                                 'evaluator': contract['sha']})
+        tick(phase='propose')
+        os.environ[OVERRIDE_ENV] = json.dumps(applied['tunables'])
+        diag = _diagnose_suite(before)
+        retrieved = experience.retrieve_experiences(memory_path, task=args.task, diagnosis=diag,
+                                                    before_sequence=memory_prefix,
+                                                    protocol_id=evaluation.VERSION,
+                                                    evidence_policy=evaluation.EVIDENCE_POLICY)
+        doc['diagnosis'], doc['experience'] = diag, {'retrieved': retrieved}
+        doc['plan_space'] = interventions.plan_space(reference_plan, brief_data)
+
+        def project_policy(overlay, observed, *, previous_efficiency=previous_efficiency,
+                           round_sampling=round_sampling):
+            # Resolve source/parameters against the actual working parent. Source
+            # evidence for the incumbent cannot authorize an unrelated branch.
+            os.environ[OVERRIDE_ENV] = json.dumps(overlay.get('tunables', {}))
+            try:
+                view = evolve_llm.rsi_projection({**doc, 'applied': overlay}, observed, records, emb,
+                                                 arm, binding, observed.get('logs') or [])
+            finally:
+                os.environ[OVERRIDE_ENV] = json.dumps(applied.get('tunables', {}))
+            view.update(plan_space=doc['plan_space'], diagnosis=_diagnose_suite(observed),
+                        experience={'retrieved': retrieved}, learning_replay=doc.get('learning_replay', []),
+                        cycle_context={**doc.get('cycle_context', {}), 'continuous': args.continuous,
+                                       'cycle': cycles + 1},
+                        declared_development_seeds=list(range(seeds[0], seeds[1] + 1)),
+                        development_cost={'accepted_updates': previous_efficiency['accepted_updates'],
+                                          'previous_rounds': previous_efficiency['cost'],
+                                          'current_round': copy.deepcopy(round_sampling)})
+            return view
+
+        probe_media, probe_dropped = [], {}
+
+        def run_policy(seed_range, overlay, scope):
+            if cancelled():
+                raise RuntimeError('experiment cancelled')
+            index = len(learner.probes)
+            label = f'probe-{index}' if scope == 'probe' else 'retest'
+            tick(phase='retest', experiment_scope=scope, probe_index=index,
+                 **({'tried': learner.probes[-1]['tried']} if scope == 'probe' else {}))
+            try:
+                out = suite(seed_range, overlay, label=label)
+                if scope == 'probe':
+                    probe_media.extend(out.get('media', []))
+                    probe_dropped.update({f'{label}/{k}': v for k, v in out.get('media_dropped', {}).items()})
+                return out
+            finally:
+                os.environ[OVERRIDE_ENV] = json.dumps(applied['tunables'])
+                tick(phase='propose', experiment_scope=None)
+
+        if (learner is not None and learner.initial_id == learner._identity(applied)
+                and learner.seeds == seeds and learner.contract['sha'] == contract['sha']
+                and learner.baseline.get('experiment_id') == before.get('experiment_id')):
+            learner.begin_cycle(max_probes=cycle_limits['probe_episodes'], project=project_policy, run=run_policy)
+        else:
+            learner = ProgramLearner(applied=applied, baseline=before, contract=contract, seeds=seeds,
+                project=project_policy, validate=lambda t, p: _validate_try(t, p, brief_data, reference_plan),
+                apply=apply, run=run_policy, observations=per_seed,
+                max_probes=cycle_limits['probe_episodes'])
+            evidence_working_set = evolve_llm.EvidenceWorkingSet(evolve_llm.AGENT_BUDGET['max_working_set_bytes'])
+        projection = learner.projection()
+
+        prop, llm, proposer = take_proposal(args.session, args.task, rnd), None, 'inbox'
         if prop:
-            tried = from_proposal(prop, before, _first_death(before, doc["rounds"]))
-        elif args.proposer == "llm":
-            proposer = "llm"
+            tick(proposer='inbox')
+            tried = from_proposal(prop, before)
+        else:
+            proposer = 'llm'
+            tick(proposer='llm')
+            tried, llm = evolve_llm.llm_propose(None, projection, before, rnd,
+                store.dir / 'llm', session=args.session, max_tokens=args.max_output_tokens,
+                agent_tools={'trial': learner.trial, 'choose': learner.choose,
+                             'projection': learner.projection, 'baseline': learner.observations},
+                evidence=evidence_working_set,
+                model=args.llm_model, effort=args.llm_effort,
+                budget={'max_calls': cycle_limits['model_calls'],
+                        'max_input_bytes': cycle_limits['input_bytes'],
+                        'max_output_tokens': args.max_output_tokens})
+            used = (llm.get('budget') or {}).get('used') or {}
+            cycle_budget['used']['model_calls'] = used.get('calls', 0)
+            cycle_budget['used']['input_bytes'] = used.get('input_bytes', 0)
+            run_budget['used']['model_calls'] += used.get('calls', 0)
+            run_budget['used']['input_bytes'] += used.get('input_bytes', 0)
+        cycle_budget['used']['probe_episodes'] = len(learner.probes)
+        cycle_budget['used']['full_evaluations'] = learner.full_calls
+        run_budget['used']['probe_episodes'] += len(learner.probes)
+        run_budget['used']['full_evaluations'] += learner.full_calls
+        model_error = (llm or {}).get('status') == 'error'
+        after, trial, trial_row, exc_info, confirm = before, applied, None, None, None
+        try:
+            if tried['kind'] != 'none':
+                if proposer == 'llm':
+                    if learner.selected_suite is None:
+                        raise ValueError('model candidate lacks a selected full paired evaluation')
+                    trial, after = learner.selected_overlay, learner.selected_suite
+                else:
+                    _validate_try(tried, projection, brief_data, reference_plan)
+                    trial = apply(tried, applied)
+                    tick(phase='retest', tried=tried)
+                    after = suite(seeds, trial)
+                    run_budget['used']['full_evaluations'] += 1
+                    cycle_budget['used']['full_evaluations'] += 1
+                trial_row = {'scope': 'full', 'seeds': list(range(seeds[0], seeds[1] + 1)),
+                             'target_pass': sum(m.get(tried['node'], False) for m in _ok_map(after).values())}
+        except Exception as exc:  # noqa: BLE001 -- candidate failures are experimental outcomes
+            exc_info = _exception(exc)
+            tried['detail']['error'] = str(exc)
+        compared = evaluation.compare(before, after, contract)
+        accepted = tried['kind'] != 'none' and exc_info is None and compared['accepted']
+        why = compared['reason'] if exc_info is None else f"candidate rejected: {exc_info['message']}"
+        if tried['kind'] == 'none':
+            why = tried['detail'].get('reason') or 'no candidate proposed'
+        if accepted and after['count'] > before['count'] and args.confirm_seeds > 0:
+            # These are additional DEVELOPMENT seeds. Installation remains a separate battery.
+            cs = [seeds[1] + 1, seeds[1] + args.confirm_seeds]
+            tick(phase='confirm')
             try:
-                ep = evolve_llm.endpoint()
-                tried, llm = evolve_llm.llm_propose(
-                    ep, evolve_llm.rsi_projection(doc, before, records, emb, arm, binding, before.get("logs") or []),
-                    before, r, store.path.parent / "llm", session=args.session, preflight=preflight)
-            except Exception as exc:  # noqa: BLE001 -- no endpoint card / mount error: the rules take over
-                llm = {"model": None, "prompt_sha": None, "raw_sha": None, "summary": None,
-                       "rationale": None, "reason": f"{type(exc).__name__}: {exc}"[:300]}
-        if tried is None:
-            proposer = "rules"
-            tried = propose(before, records, emb, arm, binding, r, applied, doc["rounds"])
-        tick(tried=tried)
-        after, published, confirm, regr, burned = before, False, None, None, []
-        trial_row, saved_s, trial_exc = None, 0.0, pre.get("exc")
-        if tried["kind"] != "none":
-            trial = apply(tried, applied)
-            tick(phase="retest")
-            full = list(range(int(seeds[0]), int(seeds[1]) + 1))
-            focus = focus_seeds(doc["rounds"], before, tried["node"], seeds)
-            done = pre.get("out")   # the preflight seed already ran under this trial
-            ran = {int(x) for x in (done or {"seeds": {}})["seeds"]}
-
-            def run_seeds(want, trial=trial, ran=ran):   # the seeds of ``want`` not already run
-                nonlocal done
-                todo = [x for x in want if x not in ran]
-                if todo:
-                    out = suite(None, trial, seed_list=todo)
-                    done = _merge(done, out) if done else out
-                    ran.update(todo)
-                return done
-
-            scope, target_pass = "full", 0
-            try:
-                if focus:   # NODE-FOCUSED TRIAL: the cluster of the target node first
-                    scope, foc = "focused", run_seeds(focus)
-                    target_pass = sum(bool((_ok_map(foc).get(str(x)) or {}).get(tried["node"]))
-                                      for x in focus)
-                # ``set(full) <= ran`` : the preflight seed plus the focus already covered
-                # the whole dev range, so run_seeds(full) below is a no-op and the round is
-                # a full retest under any name -- round 556 ran 4243 in preflight and 4244
-                # in the focus (usage.sim_s 59.8, two whole seeds) and was still filed
-                # "focused". It was not robbed of an accept -- its score stood still
-                # ([0,9,1] -> [0,9,1]) and it is refused on the score either way; what the
-                # old filing cost was the TRUTH of the refusal, which said the node passed
-                # on no seed of its cluster instead of saying the score did not move.
-                if scope == "full" or target_pass or set(full) <= ran:
-                    after = run_seeds(full)
-                    scope, target_pass = "full", score(after, tried["node"])[2]
-                else:   # the target still does not pass: the rest of the suite is not spent.
-                    # Seeds outside the focus keep their baseline result, so the score compares.
-                    after = _merge(before, done)
-                    saved_s = round((before.get("elapsed_s") or 0.0)
-                                    * (len(full) - len(focus)) / len(full), 3)
-            except Exception as exc:  # noqa: BLE001 -- the trial's failure is the round's finding
-                tried["detail"]["error"] = repr(exc)
-                trial_exc = _exception(exc)   # type/message/where/traceback tail, not a repr
-                after, scope, target_pass = before, "full", 0
-            trial_row = {"scope": scope, "seeds": focus if scope == "focused" else full,
-                         "target_pass": target_pass}
-            published = scope == "full" and after["count"] > before["count"]
-            if published:   # the whole origin cluster first, then the fresh seeds
-                regr = regression(doc["rounds"], before, after, tried["node"])
-                if regr and regr["lost"]:
-                    published = False   # it fixed this round's seed and broke one the cluster had
-            if published and args.confirm_seeds > 0:
-                # ASPIRE's debug-vs-eval split, light: the win must hold on fresh scratch seeds
-                # right above the block (never the ledger), SAME overlay, against the accepted
-                # state's count on those seeds (measured once per accepted state)
-                cs = [int(seeds[1]) + 1, int(seeds[1]) + args.confirm_seeds]
-                tick(phase="confirm")
-                cb = doc.get("confirm_base")
-                if not cb or cb["seeds"] != cs:
-                    cb = doc["confirm_base"] = {"seeds": cs, "count": suite(cs, applied, media=False)["count"]}
-                try:
-                    ca = suite(cs, trial, media=False)["count"]
-                except Exception as exc:  # noqa: BLE001
-                    tried["detail"]["error"] = repr(exc)
-                    trial_exc = trial_exc or _exception(exc)
-                    ca = -1
-                confirm = {"seeds": cs, "before": cb["count"], "after": ca}
-                published = ca >= cb["count"]
-                if published:
-                    cb["count"] = ca   # the trial is the next accepted state on these seeds too
-                elif ca >= 0:
-                    # the held-out seed forced another edit: it is burned as held-out. It joins
-                    # the dev list (the range grows over it) and the next round draws fresh
-                    # confirm seeds above -- confirm_base re-measures itself on the new pair.
-                    burned = list(range(cs[0], cs[1] + 1))
-                    seeds[1] = cs[1]   # ``seeds`` IS doc["seeds"]
-                    tick(seeds_total=int(seeds[1]) - int(seeds[0]) + 1)
-            if published:
-                tick(phase="publish")
-                skill = tried["detail"]["skill"]
-                tried["detail"]["digest"], d = publish(
-                    args.skills_root, records[skill], emb, tried, after)
-                records[skill] = SkillRecordV0.from_dict(d)   # later rounds build on what was published
-        # what the model's own code DID in the simulator: the target node's per-step
-        # evidence under the trial, its diff against the baseline seed, and any raise
-        evidence = trial_evidence(before, after, tried["node"],
-                                  (trial_row or {}).get("seeds") or [], trial_exc) \
-            if (trial_row or trial_exc) else None
-        # ── ACCEPT: the two levels. A partial win (the score rose and nothing that passed
-        # stopped passing) joins the campaign's accepted state and becomes the next round's
-        # baseline; only a whole-task win also publishes evidence into the skill record.
-        bs_score, as_score = score(before, tried["node"]), score(after, tried["node"])
-        regs = regressions(before, after)
-        accepted, why = verdict(tried, trial_row, regs, confirm, published, bs_score, as_score)
-        if published and not accepted:   # a whole-task win is the accepted state by definition
-            accepted, why = True, f"published: {before['count']} -> {after['count']} ({why})"
+                cb, ca = suite(cs, applied, media_enabled=False), suite(cs, trial, media_enabled=False)
+                check = evaluation.compare(cb, ca, contract)
+                confirm = {'seeds': cs, 'before': cb['count'], 'after': ca['count']}
+                confirm['evaluation'] = {'objective_id': contract['sha'],
+                                          'before': per_seed(cb), 'after': per_seed(ca)}
+                confirm['experiments'] = {'before': cb['experiment_id'], 'after': ca['experiment_id']}
+                missing_terminal = any(s['evaluation']['terminal'] is None
+                                       for su in (cb, ca) for s in su['seeds'].values())
+                if check['regressions'] or check['before'] is None or missing_terminal:
+                    accepted, why = False, 'additional development seeds regressed'
+                    if missing_terminal:
+                        why = 'additional development task-terminal evidence unavailable'
+            except Exception as exc:  # noqa: BLE001 -- failed measurement must reject and retain evidence
+                exc_info = _exception(exc)
+                accepted, why = False, 'additional development evaluation failed'
+                confirm = {'seeds': cs, 'before': None, 'after': None, 'error': exc_info['message']}
+            seeds[1] = cs[1]
+            tick(seeds_total=seeds[1] - seeds[0] + 1)
+            base = None
+        recorded = None
+        if trial_row and exc_info is None:
+            ancestry = [state['tried'] for key, state in learner.policies.items()
+                        if state['tried'] is not None and _policy_ancestor(learner, key)] or [tried]
+            strategies = [experience.intervention_strategy(
+                {**atom, 'detail': {**atom['detail'], 'reference_graph': reference_plan}},
+                summary=((llm or {}).get('summary') or atom['detail'].get('note', '')) if len(ancestry) == 1 else '',
+                reference=f'{args.session.name}/{args.task}#round-{rnd}') for atom in ancestry]
+            strategy = strategies[0] if len(strategies) == 1 else {
+                'kind': 'composition', 'scope': 'program', 'reference': strategies[0]['reference'],
+                'summary': 'Jointly evaluated program edits; individual causal effects are not established. '
+                           + ' '.join(s['summary'] for s in strategies)}
+            recorded = experience.record_experience(memory_path, task=args.task, diagnosis=diag,
+                intervention=strategy,
+                accepted=accepted, evidence={'before_sha': before['sha'], 'after_sha': after['sha'],
+                    'round': rnd, 'session': args.session.name, 'suite_scope': 'full',
+                    'protocol_id': evaluation.VERSION, 'evidence_policy': evaluation.EVIDENCE_POLICY})
         if accepted:
             applied = trial
-            doc.setdefault("accepted_stack", []).append(
-                {"round": r, "kind": tried["kind"],
-                 "detail": {"node": tried["node"],
-                            **{k: tried["detail"][k] for k in
-                               ("skill", "ref", "path", "from", "to", "module", "edits")
-                               if k in tried["detail"]}},
-                 "score": list(as_score)})
+            doc['accepted_stack'].append({'round': rnd, 'kind': tried['kind'],
+                'detail': {'node': tried['node'], **tried['detail']},
+                'policy_id': learner.selected_id,
+                'ancestry': [{**{k: state[k] for k in ('parent_id', 'tried')}, 'policy_id': key}
+                             for key, state in learner.policies.items() if state['tried'] is not None
+                             and _policy_ancestor(learner, key)]})
         kept = after if accepted else before
-        doc["best"] = max(int(doc["best"] or 0), kept["count"])
-        update_reference(doc, kept, r)   # the successful-reference index, campaign-wide
-        doc["rounds"].append({
-            "round": r, "tried": tried, "before": before["count"], "after": after["count"],
-            # the streak the brief widened on (None while the node is not stuck)
-            "stuck": stuck_on(tried["node"], doc["rounds"]),
-            # the diagnosis: which causal layer the try claims, what the round taught, the
-            # origin cluster re-scored under it, and the confirm seeds it burned into dev
-            "layer": tried["detail"].get("layer"), "notes": tried["detail"].get("notes"),
-            "regression": regr, "burned": burned,
-            "best": doc["best"], "suite_sha": after["sha"], "published": published,
-            # the hypothesis tree: which accepted state this try grew from, and how it went
-            "parent": max((x["round"] for x in doc["rounds"]
-                           if x.get("accepted") or x.get("published")), default=0),
-            # outcome on the SCORE TUPLE, not the success count: a death that moves earlier
-            # is ``worse``, never ``same`` -- that is the gradient
-            "outcome": ("none" if tried["kind"] == "none" else "improved" if as_score > bs_score
-                        else "worse" if as_score < bs_score else "same"),
-            "before_score": list(bs_score), "after_score": list(as_score),
-            "accepted": accepted, "accepted_reason": why, "trial": trial_row,
-            "trial_evidence": evidence, "confirm": confirm,
-            "usage": {"llm_tokens": llm.pop("usage", None) if llm else None,
-                      "sim_s": round(live["sim_s"] - sim_s0, 3), "sim_s_saved": saved_s},
-            "per_seed": per_seed(kept), "after_seeds": per_seed(after),
-            "needs": tried["detail"].get("needs", []) if tried["kind"] == "none" else [],
-            "media": _media(args.session, args.task, seeds),
-            "media_dropped": _dropped(args.session, args.task, seeds), "ts": time.time(),
-            "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
-            "proposer": proposer, "llm": llm})
-        # what the model is told plainly next round: what this try did to the score, and
-        # which seed/node it pushed backwards
-        doc["last_outcome"] = {
-            "round": r, "layer": tried["detail"].get("layer"), "kind": tried["kind"],
-            "summary": (llm or {}).get("summary") or tried["detail"].get("reason")
-                       or f"{tried['kind']} @ {tried['node']}",
-            "before_score": list(bs_score), "after_score": list(as_score),
-            "outcome": doc["rounds"][-1]["outcome"], "accepted": accepted,
-            "accepted_reason": why, "regressions": regs,
-            "trial_evidence": _evidence_summary(evidence)}
-        doc["cursor"], doc["applied"] = r, applied
-        tick(phase="idle", last_round_s=round(time.time() - t_round, 1))
-        base = next_baseline(accepted, trial_row, kept)
-        if tried["kind"] != "none":
-            tries, nones = tries + 1, 0
-        elif not tried["detail"].get("needs"):
-            break   # nothing could unblock it: every seed succeeded -- genuinely done
-        else:
-            nones += 1
-    doc["status"] = "done"
-    tick(phase="done")
+        measured_after = trial_row is not None
+        before_sum = evaluation.summary(before, contract)
+        after_sum = evaluation.summary(after, contract) if measured_after else None
+        before_score = [before_sum['successes'], before_sum['progress']]
+        after_score = [after_sum['successes'], after_sum['progress']] if after_sum else None
+        outcome = 'error' if model_error else 'none' if tried['kind'] == 'none' else ('improved' if compared['accepted'] else
+                  'worse' if compared['regressions'] else 'same')
+        eval_row = {'protocol_id': evaluation.VERSION, 'objective_id': contract['sha'],
+                    'before': before_sum, 'after': after_sum,
+                    'acceptance': {'accepted': accepted, 'reason': why},
+                    'installation': {'status': 'not_evaluated',
+                        'reason': 'Paired development evidence only; blind twin, held-out and sensing degradation battery required.'}}
+        prior = epoch_rows()
+        evidence = trial_evidence(before, after, tried['node'], (trial_row or {}).get('seeds', []), exc_info)
+        candidate_id = learner.selected_id or (learner._identity(trial) if measured_after else None)
+        cycle_reason = (llm or {}).get('stop_reason')
+        cycle_outcome = ('error' if model_error else 'updated' if accepted else
+                         'budget_exhausted' if cycle_reason == 'budget_exhausted' else
+                         'no_update' if tried['kind'] != 'none' or learner.probes
+                         or (llm or {}).get('status') == 'rejected' else 'abstained')
+        row = {'round': rnd, 'tried': tried, 'before': before['count'],
+               'after': after['count'] if measured_after else None,
+               'best': max(doc['best'], kept['count']), 'suite_sha': after['sha'] if measured_after else None,
+               'experiments': {'before': before.get('experiment_id'),
+                               'after': after.get('experiment_id') if measured_after else None},
+               'published': False, 'accepted': accepted, 'accepted_reason': why,
+               'before_score': before_score, 'after_score': after_score, 'outcome': outcome,
+               'parent': max((r['round'] for r in prior if r.get('accepted')), default=0),
+               'layer': tried['detail'].get('layer'), 'notes': tried['detail'].get('notes'),
+               'trial': trial_row, 'trial_evidence': evidence, 'confirm': confirm,
+               'regression': {'lost': compared['regressions']}, 'burned': [],
+               'evaluation': eval_row, 'diagnosis': diag,
+               'experience': {'retrieved': retrieved, 'recorded': recorded},
+               'learning': learner.report(), 'run_budget': copy.deepcopy(run_budget),
+               'cycle_budget': copy.deepcopy(cycle_budget), 'cycle_outcome': cycle_outcome,
+               'stop_reason': cycle_reason, 'memo': str((llm or {}).get('memo') or '')[-1000:],
+               'policy': {'before_id': learner.initial_id, 'candidate_id': candidate_id,
+                          'active_id': candidate_id if accepted else learner.initial_id,
+                          'parent_id': learner.policies[learner.selected_id]['parent_id'] if learner.selected_id
+                                       else learner.initial_id if candidate_id else None,
+                          'updated': accepted, 'representation': 'program_overlay'},
+               'usage': {'llm_tokens': (llm or {}).pop('usage', None),
+                         'model_calls': llm.get('calls') if llm is not None else 0,
+                         'input_bytes': ((llm.get('budget') or {}).get('used', {}).get('input_bytes')
+                                         if llm is not None else 0),
+                         'episode_attempts': round_sampling['episode_attempts'],
+                         'sim_s': round(round_sampling['sim_s'], 3), 'sim_s_saved': 0.0,
+                         'wall_s': round(time.monotonic() - round_started, 3)},
+               'per_seed': per_seed(before), 'after_seeds': per_seed(after) if measured_after else [],
+               'needs': tried['detail'].get('needs', []) if tried['kind'] == 'none' else [],
+               'media': list(dict.fromkeys([*before.get('media', []), *probe_media, *after.get('media', [])])),
+               'media_dropped': {**probe_dropped, **{f'before/{k}': v for k, v in before.get('media_dropped', {}).items()},
+                                 **({f'after/{k}': v for k, v in after.get('media_dropped', {}).items()}
+                                    if measured_after else {})},
+               'proposal': {k: prop[k] for k in ('id', 'kind', 'note')} if prop else None,
+               'proposer': proposer, 'llm': llm, 'ts': time.time()}
+        if row['usage']['model_calls'] == 0:
+            row['usage']['llm_tokens'] = {'prompt': 0, 'completion': 0}
+        transfer = row['transfer'] = {**experience.development_report([*prior, row], epoch_start=epoch_start),
+                    'prior_tasks': prior_tasks, 'memory_prefix': memory_prefix,
+                    'condition': 'warm' if prior_tasks else 'cold',
+                    'claim': 'One development task; no paired transfer or scale claim.'}
+        doc['rounds'].append(row)
+        cycles += 1
+        previous_context = doc.get('cycle_context') or {}
+        doc['cycle_context'] = {'previous_round': rnd, 'cycle_outcome': cycle_outcome,
+                                'stop_reason': cycle_reason, 'reason': why[:1000], 'memo': row['memo'],
+            'cycles_without_update': 0 if accepted else previous_context.get('cycles_without_update', 0) + 1,
+            'cycles_without_sample': 0 if learner.probes else previous_context.get('cycles_without_sample', 0) + 1,
+            'cycles_without_full_evaluation': 0 if learner.full_calls else previous_context.get('cycles_without_full_evaluation', 0) + 1}
+        doc.update(cursor=rnd, applied=applied, best=row['best'], evaluation=eval_row, transfer=transfer,
+                   last_outcome={k: row[k] for k in ('round', 'layer', 'outcome', 'accepted', 'accepted_reason',
+                                                   'before_score', 'after_score', 'trial_evidence')})
+        doc['last_outcome']['regressions'] = compared['regressions']
+        doc['last_outcome']['trial_evidence'] = _evidence_summary(evidence)
+        replay = doc.setdefault('learning_replay', [])
+        for p in learner.probes:
+            previous = next((r for r in replay if r.get('contract_sha') == contract['sha']
+                             and r.get('policy_id') == p['policy_id'] and r.get('seeds') == p['seeds']), None)
+            if previous:
+                replay.remove(previous)
+            replay.append({'round': rnd, 'task': args.task, 'contract_sha': contract['sha'], 'seeds': p['seeds'],
+                'tried': intervention_summary(p['tried']), 'parent_id': p['parent_id'],
+                'comparison': p.get('comparison'), 'error': p.get('error'),
+                'measurement_sha': p.get('measurement_sha'), 'policy_id': p['policy_id'],
+                'sample_count': (previous or {}).get('sample_count', 0) + 1})
+        doc['learning_replay'] = replay[-24:]
+        doc['working_candidates'] = [intervention_summary(s['tried']) for s in learner.policies.values()
+                                     if s['tried'] is not None]
+        update_reference(doc, kept, rnd)
+        if model_error:
+            doc.update(status='failed', stop_reason='model_error')
+            tick(phase='failed', error=llm.get('reason'), last_round_s=round(time.time() - started, 1))
+            print(json.dumps({'task': args.task, 'cursor': rnd, 'status': 'failed',
+                              'error': llm.get('error'), 'reason': llm.get('reason')}), file=sys.stderr)
+            return 5
+        tick(phase='idle', last_round_s=round(time.time() - started, 1))
+        base = None if confirm else kept
+        if cycles >= target:
+            doc['stop_reason'] = 'round_limit'
+            break
+        if (not args.continuous and any(run_budget['used'][key] >= run_budget['limits'][key]
+                                      for key in ('model_calls', 'input_bytes', 'probe_episodes'))):
+            doc['stop_reason'] = 'budget_exhausted'
+            break
+        if proposer == 'llm' and not any(cycle_budget['used'].values()):
+            # A request that cannot fit even once will not become executable by
+            # resetting an identical allowance. Never spin through empty cycles.
+            doc['stop_reason'] = 'budget_exhausted'
+            break
+    doc['status'] = 'done'
+    tick(phase='done')
+    print(json.dumps({'task': args.task, 'cursor': doc['cursor'], 'best': doc['best'],
+                      'protocol_id': evaluation.VERSION, 'status': doc['status']}))
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    raise SystemExit(main())

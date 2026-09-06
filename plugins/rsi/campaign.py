@@ -34,7 +34,7 @@ import numpy as np
 
 from harness.spec import EpisodeSpec, StageSpec
 from plugins.rsi.gate import PairedResult, ablation_curve, paired_gate
-from plugins.rsi.governed import DEFAULT_PERCEPT_REF, Bundle, RecoverySpec, Rule
+from plugins.rsi.governed import DEFAULT_ENV_REF, DEFAULT_PERCEPT_REF, Bundle, RecoverySpec, Rule
 from plugins.rsi.stats.search import DEFAULT_EARLINESS, DEFAULT_FP_PENALTY, Trigger, search_triggers
 
 #: Threshold a `gt` trigger can never fail, so the twin fires the moment it arms.
@@ -162,16 +162,8 @@ class Preregistration:
     #: drifted since sealing cannot silently reroot this campaign. None (folded
     #: out) when parent_store is None.
     parent_final_sha: str | None = None
-    #: R7: the identity of the reasoner that PROPOSED this campaign's rules. The
-    #: deterministic search proposer declares none (None folds OUT of the content
-    #: hash, so every campaign sealed before this field rebuilds byte-identical),
-    #: but an LLM reasoner (plugins.model_qwen) reports its transport/model
-    #: identity here -- which model, at which endpoint, under which decode. Until
-    #: now that identity was smuggled in via QWEN38_MODEL/QWEN38_BASE_URL env vars
-    #: and never entered any hash, so two campaigns run against different models
-    #: were indistinguishable. run_campaign stamps `reasoner.identity` onto the
-    #: prereg before hashing, closing that hole. Before the provider triple, which
-    #: stays the literal tail the seam guard pins.
+    #: Model identity is required for new runs and sealed before experiments.
+    #: None folds out only for rebuilding historical preregistrations.
     reasoner: str | None = None
     #: R2 stage chain the governed rollout scores (harness/stages.py). In the
     #: preregistration because "what stage chain this bundle was scored
@@ -334,10 +326,8 @@ def propose_rule(
 ) -> Rule | None:
     """Deterministic proposer: the best admissible trigger over residual failures.
 
-    Zero external API calls by construction. The LLM proposer is a drop-in with
-    the same ``(traces, labels) -> Rule`` contract; making the deterministic one
-    the reference implementation keeps the loop runnable and reproducible
-    without a network.
+    Historical research helper with zero external API calls. It is never the
+    default proposer of run_campaign or the mounted reasoner card.
 
     With `dev_specs` and an `executor`, the round-88 repair tie-break applies to
     the in-sample ranked path: the objective is blind to fire time, so many arm
@@ -395,27 +385,6 @@ def propose_rule(
         trigger=trigger,
         recovery=RecoverySpec(name=prereg.recovery_name, sensor_sd=prereg.recovery_sensor_sd),
     )
-
-
-class _DeterministicReasoner:
-    """run_campaign's default reasoner: the deterministic search seam.
-
-    Until R7 the campaign loop called ``propose_rule`` directly and the mounted
-    ``reasoner.proposer`` was never consulted -- a dead seam. run_campaign now
-    drives a reasoner OBJECT every generation (a fake mount in tests, the qwen
-    card in dogfood); when the caller passes none, this default wraps
-    ``propose_rule`` with the identical arguments, so the reference path stays
-    byte-for-byte what it was and every sealed campaign still rebuilds. It
-    declares NO ``identity`` on purpose: the default carries no reasoner field
-    into the prereg, so shas sealed before that field never move.
-    """
-
-    def propose(self, brief: Mapping) -> Mapping:
-        return {"rule": propose_rule(
-            brief["traces"], brief["labels"], generation=brief["generation"],
-            prereg=brief["prereg"], dev_specs=brief.get("dev_specs"),
-            executor=brief.get("executor"), workers=brief.get("workers", 10),
-            parent=brief.get("parent"), store=brief.get("store"))}
 
 
 @dataclass
@@ -483,17 +452,18 @@ def run_campaign(
 ) -> dict:
     """Drive generations until nothing further clears the dev gate.
 
-    ``reasoner`` is the mounted ``reasoner.proposer`` (``harness.contracts.Reasoner``):
-    the seam this loop resolves a candidate through each generation. None uses the
-    deterministic search proposer -- byte-identical to the old direct
-    ``propose_rule`` call -- while a reasoner declaring an ``identity`` (the qwen
-    card) has that identity stamped into the preregistration, so which model
-    proposed the rules enters the content hash instead of being smuggled via env.
+    ``reasoner`` must be supplied explicitly by the workload's mounted seam.
+    Model proposals still pass the existing development, blind-twin, held-out,
+    and sensor-degradation measurements. No search replaces a model candidate.
     """
-    reasoner = reasoner if reasoner is not None else _DeterministicReasoner()
+    if reasoner is None:
+        raise ValueError("run_campaign requires an explicit LLM reasoner")
+    if prereg.search_recovery:
+        raise ValueError("search_recovery is unavailable in LLM-only campaigns")
     identity = getattr(reasoner, "identity", None)
-    if identity is not None:
-        prereg = replace(prereg, reasoner=identity)
+    if not isinstance(identity, str) or not identity.strip():
+        raise ValueError("run_campaign requires a non-empty reasoner.identity")
+    prereg = replace(prereg, reasoner=identity)
     prereg_sha = store.put("preregistration", prereg._hash_payload())
     if verbose:
         print(f"preregistration {prereg_sha[:12]}  dev={len(prereg.dev)} heldout={len(prereg.heldout)}")
@@ -577,22 +547,20 @@ def run_campaign(
         # brief carries live objects -- this is an in-process seam, not a
         # serialized one -- so a reasoner may return either a Rule or its
         # canonical dict; both are accepted.
-        from plugins.rsi.repertoire import names as strategy_names
+        from plugins.rsi.repertoire import strategies_for
+        provider_parts = (prereg.env_provider or DEFAULT_ENV_REF).partition(":")[0].split(".")
+        card = provider_parts[1] if len(provider_parts) > 1 and provider_parts[0] == "plugins" else ""
         brief = {"traces": [r["trace"] for r in cur], "labels": labels,
                  "generation": gen, "prereg": prereg, "dev_specs": dev_specs,
                  "executor": ex, "workers": workers, "parent": bundle, "store": store,
-                 # The recovery vocabulary an LLM reasoner may name; the
-                 # deterministic default ignores it. See plugins.model_qwen.
-                 "strategies": tuple(strategy_names())}
+                 # The installed recovery vocabulary the model may name.
+                 "strategies": tuple(strategies_for(card))}
         proposed = reasoner.propose(brief).get("rule")
         if isinstance(proposed, Mapping):
             from plugins.rsi.rebuild import rule_from_canonical
             rule = rule_from_canonical(proposed)
         else:
             rule = proposed
-        if rule is not None and prereg.search_recovery:
-            rule = _maybe_search_recovery(rule, bundle, dev_specs, prereg, store, gen,
-                                          workers=workers, verbose=verbose)
         if rule is None:
             if verbose:
                 print("  proposer produced no admissible candidate; stopping")
@@ -691,51 +659,3 @@ def run_campaign(
                 print(f"  sensor_sd={sd:.3f}  {r.line()}  [{tag}]")
         store.put("campaign_result", result)
     return result
-
-
-def _maybe_search_recovery(rule: Rule, parent: Bundle, dev_specs, prereg: Preregistration,
-                           store: CampaignStore, gen: int, *, workers: int, verbose: bool) -> Rule:
-    """Search a recovery program for `rule`, and adopt it only if it clears the gate.
-
-    Round 6 measured what happens without that guard: a coordinate descent found
-    a program worth +5pp on the 60 dev seeds it was searched on, and +4.0pp on
-    held-out at p=0.096 -- directionally right, not significant. Adopting it on
-    the dev number alone would have been exactly the failure this project's
-    methodology exists to prevent, so the searched program has to earn its place
-    against the hand-written one on the same paired test.
-    """
-    from plugins.rsi.recovery_search import program_of, search_recovery
-
-    # The recovery gate must not include the seeds the recovery was searched on.
-    # It did until round 8, and the consequence was measurable: the same searched
-    # program cleared the half-in-sample dev gate at +5.8% p=0.039 while a clean
-    # held-out comparison put it at +4.0% p=0.096 (round-6 sweep, local archive).
-    all_dev = list(dev_specs)
-    subset = all_dev[: prereg.recovery_search_n]
-    gate_specs = all_dev[prereg.recovery_search_n:]
-    if len(gate_specs) < 20:
-        raise ValueError(
-            f"dev has {len(all_dev)} seeds and recovery_search_n={prereg.recovery_search_n}; "
-            "fewer than 20 seeds are left to gate the searched recovery out of sample"
-        )
-    found = search_recovery(subset, rule.trigger, sensor_sd=prereg.recovery_sensor_sd,
-                            critic_budget=prereg.critic_budget,
-                            action_budget=prereg.action_budget, workers=workers, verbose=verbose)
-    candidate = Rule(rule.rule_id, rule.trigger,
-                     RecoverySpec(program=program_of(found.durations),
-                                  sensor_sd=prereg.recovery_sensor_sd))
-    hand_bundle = parent.append(rule)
-    found_bundle = parent.append(candidate)
-    verdict = paired_gate(gate_specs, found_bundle, baseline=hand_bundle, workers=workers)
-    adopt = verdict.p_value < prereg.alpha and verdict.fixed > verdict.broken
-    store.put("recovery_search", {
-        "generation": gen, "durations": found.durations, "search_subset_rate": found.rate,
-        "search_seeds": [s.seed for s in subset], "gate_seeds": [s.seed for s in gate_specs],
-        "evaluations": found.evaluations, "gate": asdict(verdict), "adopted": adopt,
-    })
-    if verbose:
-        print(f"  recovery search: {found.evaluations} evals on {len(subset)} seeds, "
-              f"subset rate {found.rate:.1%}")
-        print(f"  recovery gate on {len(gate_specs)} DISJOINT seeds: {verdict.line()} -> "
-              f"{'adopted' if adopt else 'rejected, keeping hand-written'}")
-    return candidate if adopt else rule
