@@ -1075,7 +1075,9 @@ def main(argv=None) -> int:
             raise RuntimeError("cancelled")
         err = (err_buf[0] if err_buf else "") or ""
         if proc.returncode != 0 or not out_path.exists():
-            raise RuntimeError(f"suite exited {proc.returncode}:\n{err.strip()[-3000:]}")
+            # the traceback, not the simulator's import warnings that pad stderr around it
+            tb = err.rfind("Traceback (most recent call last)")
+            raise RuntimeError(f"suite exited {proc.returncode}:\n{(err[tb:] if tb >= 0 else err).strip()[-3000:]}")
         out = json.loads(out_path.read_text())
         out.update(task=args.task, arm=arm, media=_media(args.session, args.task, seed_list, prefix) if media_on else [],
                    media_dropped=_dropped(args.session, args.task, seed_list, prefix) if media_on else {})
