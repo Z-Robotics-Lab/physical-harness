@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1010,6 +1011,14 @@ def main(argv=None) -> int:
 
     def cancelled() -> bool:
         return args.cancel_marker is not None and args.cancel_marker.exists()
+
+    def on_term(signum, frame):   # the runtime kills the process group on cancel: leave the truth behind
+        doc.update(status="cancelled", stop_reason="cancelled")
+        live.update(phase="cancelled", message=f"第 {live['round']} 轮被停止")
+        store.save(doc)
+        raise SystemExit(3)
+
+    signal.signal(signal.SIGTERM, on_term)
 
     def tick(**kw) -> None:
         if kw.get("phase", live["phase"]) != live["phase"]:
