@@ -534,10 +534,10 @@ clone 合法地显示**更多跳过，绝不是失败**：
 3. **agent 会话**：系统提示给出方法（一次一个假设；先在能解释现象的最高层定位——恢复/
    接近策略先于数值旋钮；最小改动；跑失败种子验证；笔记本里记过的实验不重复）。用户消息给
    基线证据、副本文件表、当前 tunables、上一轮为止的**笔记本**、待处理的 operator proposal
-   和失败关键帧（视觉模型时）。每回合模型回一个 JSON 动作：
+   和失败关键帧（视觉模型时）。每回合模型回一个 JSON 动作，或一组动作 `{"actions": [...]}`（依次执行，遇错或遇 run 停下，结果合成一条消息返回）：
    `read / grep / edit(old→new，必须唯一命中，写前编译) / write / tunable / trace(某节点的
    逐步运动序列) / run(seed) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
-   消息返回，对话在一轮内累积（超过 400 KB 时最早的工具结果被折叠成一行）。`run` 在副本上跑
+   消息返回，对话在一轮内累积（超过 12 万字符时最早的工具结果一次折叠到 6 万，关键帧图片只保留最新一条消息里的）。`run` 在副本上跑
    一个开发种子，返回同种子相对 incumbent 的里程碑增减和关键帧。预算是 `max_steps`
    （动作数，默认 40）和 `max_probes`（单种子试跑，默认 6）——不再按字节或调用数限流。
    动作用完而副本已有改动时，按 finish 处理。
@@ -548,8 +548,8 @@ clone 合法地显示**更多跳过，绝不是失败**：
    用 `confirm_seeds`（默认 2）个新开发种子复核一次，退化则拒绝。接受后该副本成为 incumbent
    （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
 5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
-   每次 probe 的结果一行、相对父副本的 unified diff、每个种子的前后一行。下一轮的提示把它整个
-   带上（超过 60 KB 时旧轮次折叠成标题行）。这是跨轮记忆的唯一载体，原始轨迹不进提示。
+   每次 probe 的结果一行、相对父副本的 unified diff、每个种子的前后一行。下一轮的提示带上它的精简视图
+   （最近 2 轮带 diff，更早的只留标题和结论，上限 12 KB）。这是跨轮记忆的唯一载体，原始轨迹不进提示。
 
 **为什么是子进程 + 模块覆盖。** 每次 suite 都在 `python scripts/evolve.py --suite <spec>`
 子进程里跑，子进程启动时（任何 import 之前）用 `PH_MODULE_OVERLAY={"<卡包>": "<副本目录>"}`
@@ -558,6 +558,8 @@ clone 合法地显示**更多跳过，绝不是失败**：
 `PH_MOUNT_PARAMS_OVERRIDE`，键可以是卡包名（对该卡承载的所有 provider 生效）。子进程用
 `@@{json}` 行流回进度，父进程写进 `campaign.json.live`（phase 基线评测/LLM 分析/单种子试跑/
 同种子复测/新种子确认/完成；种子 i/n；当前节点；节点轨迹；最近 20 条消息）。
+
+**模型接口的鲁棒性。** 请求超时 300 s；瞬时错误重试 3 次；thinking 把输出预算吃光返回空内容时，重试关闭 thinking，连续 3 次空回复只结束本轮；模型报错或沉默时副本里已有的改动照样跑配对评测再封存。usage 记录 prompt / completion / cache_hit（DeepSeek 前缀缓存命中，按低价计费），面板显示计费量和缓存占比。
 
 **每轮封存什么。** `campaign.json.rounds[]` 一行：`round, tried{kind: edit|none, node, detail{summary,
 files, tunables, diff, reason, error}}, before/after（成功数）, before_score/after_score
