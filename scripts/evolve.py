@@ -629,7 +629,7 @@ class Agent:
             self.last_runs[seed] = baseline
         self.probes: list[dict] = []
         self.ran: dict[int, tuple] = {}   # seed -> (copy digest, knobs) of its last run
-        self.usage = {"prompt": 0, "completion": 0}
+        self.usage = {"prompt": 0, "completion": 0, "cache_hit": 0}
         self.calls = 0
         self.actions: dict[str, int] = {}
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
@@ -705,7 +705,7 @@ class Agent:
             self.calls += 1
             u = getattr(self.ep, "last_usage", None) or {}
             for k in self.usage:
-                self.usage[k] += int(u.get(k) or 0)
+                self.usage[k] += int(u.get(k) or 0)   # cache_hit stays 0 on servers that report none
             finish = getattr(self.ep, "last_finish", None)
             self.finishes[str(finish)] = self.finishes.get(str(finish), 0) + 1
             if not (raw or "").strip():
@@ -811,7 +811,7 @@ class Agent:
 
 _INDEX_KEYS = ("round", "before", "after", "best", "parent", "outcome", "accepted", "accepted_reason",
                "published", "before_score", "after_score", "usage", "proposer", "needs", "confirm",
-               "suite_sha", "proposal", "ts", "workspace", "llm")
+               "suite_sha", "proposal", "ts", "workspace", "llm", "evaluation")
 _SEED_KEYS = ("seed", "success", "first_death", "failure_mode")
 
 
@@ -1155,6 +1155,13 @@ def main(argv=None) -> int:
                         "improved" if accepted else "worse" if compared and compared["regressions"] else
                         "same" if compared else "error")
         files = sorted({l[6:] for l in diff.split("\n") if l.startswith("+++ b/")})
+        # the console's learning chart reads evaluation.{before,after}.{progress,successes,episodes}
+        # and segments epochs by (protocol_id, objective_id)
+        sample = lambda suite: {"successes": score(suite)[0], "episodes": len(suite["seeds"]), "progress": score(suite)[1]}
+        eval_row = {"protocol_id": "milestones-v1",
+                    "objective_id": sha_json({"task": args.task, "card": pkg, "milestones": "verify nodes + terminal success"}),
+                    "before": sample(before), "after": sample(after) if after else None,
+                    "acceptance": {"accepted": accepted, "reason": why}}
         row = {"round": rnd, "ts": time.time(), "proposer": "llm",
                "tried": {"kind": tried_kind, "node": before["seeds"][str(seeds[0])].get("first_death"),
                          "detail": {"summary": outcome.get("summary") or outcome.get("reason"), "files": files,
@@ -1163,6 +1170,7 @@ def main(argv=None) -> int:
                "best": max(int(doc["best"]), kept["count"]), "suite_sha": after["sha"] if after else None,
                "before_score": score(before), "after_score": score(after) if after else None,
                "outcome": outcome_word, "accepted": accepted, "accepted_reason": why, "published": False,
+               "evaluation": eval_row,
                "parent": parent_round,
                "regression": {"lost": compared["regressions"] if compared else []}, "confirm": confirm,
                "workspace": ws_rel, "needs": [] if tried_kind != "none" else ["edit"],

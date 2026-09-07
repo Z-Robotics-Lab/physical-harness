@@ -194,7 +194,11 @@ class OpenAICompatEndpoint:
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             reply = json.load(resp)
         u = reply.get("usage") or {}
-        self.last_usage = ({"prompt": u.get("prompt_tokens"), "completion": u.get("completion_tokens")}
+        # DeepSeek adds prompt_cache_hit_tokens / prompt_cache_miss_tokens (a cached prefix
+        # is billed at a fraction); other servers omit them and the keys stay absent.
+        self.last_usage = ({"prompt": u.get("prompt_tokens"), "completion": u.get("completion_tokens"),
+                            **{k: u[f"prompt_{k}_tokens"] for k in ("cache_hit", "cache_miss")
+                               if isinstance(u.get(f"prompt_{k}_tokens"), int)}}
                            if u else None)
         self.last_finish = (reply["choices"][0] or {}).get("finish_reason")
         return reply["choices"][0]["message"]["content"]

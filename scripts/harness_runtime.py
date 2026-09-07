@@ -1068,7 +1068,7 @@ def _seal_rounds(rt: Runtime, brief_id: str, task: str, path: Path) -> None:
                                                                  "parent", "outcome", "confirm", "usage",
                                                                  "regression", "accepted", "accepted_reason",
                                                                  "after_seeds", "before_score", "after_score",
-                                                                 "probes", "workspace")}})
+                                                                 "probes", "workspace", "evaluation")}})
 
 
 def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
