@@ -144,10 +144,13 @@ def mount_params(ref: str, root: Path = PLUGINS_ROOT) -> dict:
     tun = next((data.get("tunables") for name, data in cards if name == card), None)
     if tun and "tunables" not in params:
         params["tunables"] = dict(tun)
-    # PH_MOUNT_PARAMS_OVERRIDE: {ref: {param: value}} -- an evolve trial's tunables
-    # perturbation reaching the driver (scripts/evolve.py); one level of nesting
-    # merges ([tunables] tables), anything else replaces.
-    for k, v in json.loads(os.environ.get("PH_MOUNT_PARAMS_OVERRIDE") or "{}").get(ref, {}).items():
+    # PH_MOUNT_PARAMS_OVERRIDE: {ref | card package: {param: value}} -- an evolve
+    # round's tunables reaching the driver (scripts/evolve.py); a key naming the
+    # card PACKAGE (``plugins.embodiment_robocasa``) applies to every provider it
+    # hosts. One level of nesting merges ([tunables] tables), anything else replaces.
+    override = json.loads(os.environ.get("PH_MOUNT_PARAMS_OVERRIDE") or "{}")
+    package = ref.partition(":")[0].rpartition(".")[0]
+    for k, v in {**override.get(package, {}), **override.get(ref, {})}.items():
         params[k] = {**params[k], **v} if isinstance(v, dict) and isinstance(params.get(k), dict) else v
     return params
 

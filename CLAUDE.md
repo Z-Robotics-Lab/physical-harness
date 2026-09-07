@@ -65,47 +65,29 @@ These select a model and declared effort on the installed endpoint; they do not
 select providers or change robot bindings. `board.store.rsi_model_options()`
 returns the available model IDs and configured efforts without credentials.
 
-`kind:"evolve"` is online program-policy learning inside the offline simulation
-laboratory (evolution mode only). Each sampling decision allows at most two batched evidence calls. The LLM samples a
-single development seed with `trial`, and may compose edits on a measured working
-parent across bounded cycles before `choose` runs the full paired seed suite.
-Working branches and policy/seed measurements survive cycles within the same run,
-incumbent, evaluator and seed range; exact repeated probes reuse their receipts.
-Process restarts retain compact experimental memory, not executable branches.
-Historical branches do not force a new cycle into selection before fresh sampling.
-Capabilities include editable module names; node-scoped catalogs expose exact source
-symbols. Invalid read arguments still cost model calls, but do not consume the
-successful-inspection allowance. Bounded literal source pages survive cycles only
-while their policy, binding and content remain valid; other evidence is refreshed.
-Use `board.store.rsi_command_summary` for bounded command/refusal counts without
-reading full experiment audits.
-Probes never promote a
-policy. Only a strict frozen verification gain without regression updates the
-campaign's program overlay. Finite briefs share call, input-byte and probe budgets. Explicit
-`continuous:true` renews bounded learning-cycle budgets until cancellation or
-a terminal error; cumulative run costs never reset. `rounds>0` caps completed
-cycles in this submission, including abstentions; `rounds:0` removes that cap.
-Each completed cycle proceeds directly to the next; full trajectories/source stay outside prompts until requested. This does
-not train model weights or install skills. The GOAL verification battery remains
-required for installation. Logs, before/after trajectories, videos and keyframes
-remain available through the board. See `docs/project-documentation.md` §4.0.
-Outside proposals use `submit_proposal`, with kind tunables|executor|card|plan;
-the same installed-authority validation applies. Cancel and resubmit use the
-brief lifecycle. A changed evaluator/source identity starts a new epoch without
-reinterpreting historical scores. Autonomous evolve proposals are LLM-only: omit
-`proposer` or use `llm`; `rules` is rejected. Endpoint failures seal an error and
-stop, never trigger a substitute candidate. A model abstention or exhausted
-candidate-repair budget ends only the learning cycle. The scheduler continues within the finite brief budget or opens a new
-bounded cycle in explicit continuous mode. A stop reason for the entire run is
-recorded separately from the cycle outcome. No trial means
-no after measurement. Outside proposals remain an explicit submission interface
-for agents/operators; action candidates must name their node.
+`kind:"evolve"` is the LLM repair loop (evolution mode only). One round = one
+agent session over a WORKING COPY of the card package that drives the task: the
+model reads the card's source, edits it, runs single development seeds (`run`),
+reads the milestone trail / stall geometry / failure keyframes, and calls
+`finish`. `finish` runs the full paired development suite against the incumbent;
+the copy is accepted iff some frozen verify milestone (or task success) is newly
+gained on a seed and none regresses on any seed; a whole-task gain is re-checked
+on fresh development seeds. Accepted copies are the next round's starting point;
+`campaigns/evolve-<task>/notebook.md` (hypothesis, diff, measured outcome per
+round) is the memory the next round reads. `predicates.py` and the mission
+planner are frozen; the harness never trains weights or installs skills. Budgets
+are `max_steps` (agent actions) and `max_probes` (single-seed runs) per round;
+`rounds:0` or `continuous:true` runs until cancelled. Suites run in a child
+process whose imports map the card package onto the copy (`PH_MODULE_OVERLAY`).
+Outside proposals (`submit_proposal`) are handed to the agent as an instruction
+in its next brief. `board.store.rsi_command_summary` gives one round's action
+counts. See `docs/project-documentation.md` §4.0.
 
 Intervention and verification boundaries:
 
-- **In evolve, the model selects the intervention node** from observed installed
-  actions; first-death attribution is evidence, not a target-selection policy.
-  The older preregistered recovery campaign has its own attribution gate.
+- **In evolve, the model chooses what to edit** inside the card copy; the
+  first-death node and its stall geometry are evidence, not a target it is
+  assigned. The older preregistered recovery campaign has its own attribution gate.
 - **Verification thresholds stay frozen.** The model may propose a trigger threshold
   inside the declared candidate grammar; it cannot change the statistical gates.
 - **If an embodiment has no registered recovery primitive, say "nothing to work

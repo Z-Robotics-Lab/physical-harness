@@ -1,10 +1,10 @@
-"""Existing robot predicates cannot launder a controller's success into reward."""
+"""The workload marks a verify that read a controller's self-report (``blocked_reads``);
+its execution verdict is unchanged, its world-only reading stays None."""
 import importlib
 from types import SimpleNamespace
 
 import pytest
 
-from plugins.rsi import evaluation
 from plugins.task import workload
 
 
@@ -25,9 +25,6 @@ def test_actual_grasp_predicate_keeps_execution_semantics_without_rewarding_self
     monkeypatch.setattr(module, '_obj_z', lambda *args: 1.0)  # no world motion
     ref = f'{module_name}:v_grasped_{item}'
     node = {'id': f'grasped-{item}', 'kind': 'verify', 'skill': f'v_grasped_{item}', 'args': {}}
-    contract = evaluation.compile_contract({'nodes': [node]}, predicates={node['skill']: ref},
-                                           terminal_ref='test:world')
-    measured = []
     for controller_claim in (False, True):
         ctx = workload.NodeCtx(
             seed=1, env_ref='test:world', policy_ref='test:controller', skills=(),
@@ -41,15 +38,7 @@ def test_actual_grasp_predicate_keeps_execution_semantics_without_rewarding_self
         assert result['success'] is controller_claim  # the installed execution contract is unchanged
         assert result['verification_success'] is None
         assert any(f'grasp-{item}' in path for path in result['blocked_reads'])
-        observation = {'node': node, 'authority': 'predicate', 'source': ref,
-                       'success': result['verification_success'],
-                       'evidence_policy': result['evidence_policy'],
-                       'blocked_reads': result['blocked_reads']}
-        reading = evaluation.evaluate(contract, [observation], {
-            'authority': 'embodiment.terminal_success', 'source': 'test:world', 'success': False})
-        measured.append({'seeds': {'1': {'evaluation': reading}}})
     assert len(calls) == 2  # one predicate call for each world, never a second scoring run
-    assert evaluation.compare(*measured, contract)['accepted'] is False
 
 
 def test_actual_world_only_predicate_remains_measurable(monkeypatch):

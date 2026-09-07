@@ -1,0 +1,3 @@
+# the card manifest (frozen in the copy; tunables live in the installed card)
+[tunables]
+stop = 0.65

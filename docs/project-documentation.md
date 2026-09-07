@@ -91,9 +91,7 @@ physical-harness/
 ├── scripts/          常驻进程和入口
 │     harness_runtime.py   常驻 runtime，盯 inbox
 │     cockpit             一键启动一切（含拉起 ph-station）
-│     evolve.py            evolve 环路：轮次、计分、判定（§4.0）
-│     evolve_llm.py        LLM 取证/采样/选择、预算与审计（§4.0）
-│     evolve_evidence.py   按需证据与源码分页（§4.0）
+│     evolve.py            evolve：LLM agent 修卡副本、配对里程碑验收、笔记本（§4.0）
 │     rsi_campaign.py      RSI 八步链
 │     frame_dump.py        画面、keyframe 和最新 rollout MP4
 │     plugin_doctor.py     card 体检
@@ -472,7 +470,6 @@ test_rsi_workload.py         runs/campaign-pj-scripted not present
 test_skill_planning.py       generated unified_skill_graph.json not present
 test_planning_faces.py       generated unified_skill_graph.json not present
 test_unified_skill_graph.py  generated unified_skill_graph.json not present
-test_evolve_llm_e2e.py       opt-in: one real DeepSeek call
 test_libero_marker.py        libero unimportable (libero venv only)
 AST green                    test_boundaries + test_kernel
 deselected                   robosuite- 与 robocasa-marked items
@@ -509,49 +506,75 @@ clone 合法地显示**更多跳过，绝不是失败**：
 实现：`scripts/rsi_campaign.py`（链本体）+ `scripts/harness_runtime.py`（brief 面）。
 通用路径里**没有任何任务名 if 分支**——任务是参数，加任务仍然是装一张卡。
 
-### 4.0 仿真中的在线程序策略学习
+### 4.0 LLM 修复循环（`kind:"evolve"`）
 
-`kind:"evolve"` 使用执行 harness 作为实验器，在仿真中采样、读取真实奖励反馈并更新高层程序策略。LLM 决定读取哪些证据、试验什么修改、沿哪个候选继续以及何时提交完整评估。在线更新限于仿真开发环路；`kind:"rsi"` 的预注册、blind twin、held-out 和感知降级验证仍是正式安装所需的独立流程。开发接受不会写入技能库，也不会把短期成功冒充安装证据。
+`kind:"evolve"` 让一个 LLM agent 在仿真里修驱动这个任务的卡（robocasa 任务是
+`plugins.embodiment_robocasa`）。它不是一个"每轮给模型一个 JSON 决策"的协议，而是一次
+带工具的会话：模型在卡包的**工作副本**里读代码、改代码、跑单个开发种子、看结果、再改，
+直到它认为该交卷。实现只有一个文件 `scripts/evolve.py`。
 
 ```json
-{"kind":"evolve","task":"kitchen_thaw","seeds":[420011,420012],"continuous":true,"rounds":0,"arm":"auto","max_model_calls":8,"max_input_bytes":96000,"max_probe_episodes":3}
+{"kind":"evolve","task":"recycle_cans","seeds":[4243,4244],"rounds":0,"arm":"auto","max_steps":40,"max_probes":6}
 ```
 
-只有 evolution runtime 接受此 brief（`scripts/harness_runtime.py` 的 `_run_evolve` 把它起成一个受看管的 `scripts/evolve.py` 子进程；LLM proposer 本体是 `scripts/evolve_llm.py`）。自主提案只使用 LLM；`proposer` 可省略或写 `llm`，`rules` 会被拒绝，没有规则回退。`rounds>0` 限制本次提交完成的学习周期数（包括无更新的周期），历史 cursor 只作编号；`rounds:0` 不设周期数上限。`continuous:true` 显式开启持续运行，每周期使用独立小预算，直到用户取消或出现服务、执行基础设施、磁盘等终止条件。省略或设置 `continuous:false` 时，多周期共享本次提交的总预算，预算耗尽结束。控制台默认明确提交持续模式，也可选择有限周期。`llm_propose` 必须接入实测 trial、choose 和 projection 回调，不再保留独立的单轮提案执行路径。模型使用 `inspect → trial → choose/stop` 协议；`stop`、选择 incumbent、拒绝候选或本周期预算耗尽只结束当前周期。外层调度器决定是否继续，模型不能终止整个持续任务。每周期保留已验证 incumbent、实测工作分支和简短 `cycle_context`；总结携带上轮 memo、原因以及连续未采样、未验收、未更新周期数，完整聊天不跨周期复制；有界源码工作集只保留仍匹配策略、绑定和内容哈希的原文页，随工作区重置失效。每个周期结束后直接进入下一周期，没有额外等待；周期边界检查用户取消，零额度或无法容纳一次模型请求的预算仍会终止，避免无有效调用的空转。模型加载或 API 调用失败则封存 `outcome:error`、`llm.status:error` 及错误阶段/类型/信息，campaign 标为 failed，brief 失败；不会产生替代候选或新经验。`cancel_brief` 的取消有独立结束状态，绝不计作实验失败。续投从 campaign cursor 继续；代码、绑定或评测协议变化会开启新 epoch，原始轮次和旧 applied 状态保留在历史中，不沿用旧分数。
+只有 evolution runtime 接受它（`scripts/harness_runtime.py` 的 `_run_evolve` 把
+`scripts/evolve.py` 起成一个受看管的子进程）。`rounds:0` 或 `continuous:true` 一直跑到取消；
+`rounds>0` 跑这么多轮后结束；任务名再投一次从 cursor 续跑。`llm_model` / `llm_effort`
+选已装 endpoint 上的模型与 effort（`board.store.rsi_model_options()` 列可选项）。
+`proposer` 只能省略或写 `llm`。
 
-**采样与策略更新。** `plugins/rsi/learner.py` 管理当前策略及临时工作分支。每个策略 ID 由冻结评测身份和完整程序 overlay 计算。`trial` 在模型选择的已声明开发种子上从 reset 运行一次，返回固定评测向量、相对当前策略的增益/回退、节点行为变化和证据引用。探针完成后，下一次决策立即看到该候选的新世界观测；省略父策略时仍从当前正式策略开始。一次 probe 不晋级；零收益的候选仍可成为下一次修改的父策略，让多项修改组合后再观察反馈。模型 `choose(policy_id)` 后，完整组合策略从 reset 跑同一批开发种子，与当前策略配对比较。该结果直接用于接受判定，不重复跑一遍。只有通过判定的完整 overlay 才成为后续轮次的当前策略。同一次运行、同一 incumbent、评测身份和开发种子范围内，工作分支跨周期保留；周期边界保留最近的完整祖先路径，最多12个未接受策略和48条成功测量回执。周期预算和当前回执重新计数，历史实测不会冒充本周期新增采样；相同策略与种子的重复请求复用测量，换种子会更新最新观测并保留原有祖先关系。选择或组合分支前重新验证祖先代码身份。接受新 incumbent 或改变评测身份、种子范围会重新建立工作区；进程重启后只保留精简实验记忆，历史策略 ID 不成为可执行父级。记忆按评测、策略与种子去重，最多24条，保留具体参数路径、改前/改后值、父策略、测量引用与重复次数，程序改动以内容哈希引用。模型据此总结已测事实、尚未排除的组合与下一项实验；中性单项不自动否定多项组合。不保存模拟器 checkpoint，也不训练模型权重。
+**一轮做什么。**
 
-**取证成本。** 默认预算为 8 次模型调用、累计 96,000 输入字节、3 次单种子 probe；每次模型输出最多 4,096 tokens。有限模式将这些额度作为整个 brief 的总上限；持续模式将它们作为每个学习周期的上限，因此持续运行的总消耗没有预设上限，由用户停止。零预算或小到无法发起一次有效模型请求的预算直接终止，不能靠反复开周期空转。对应 brief 字段是 `max_model_calls`、`max_input_bytes`、`max_probe_episodes`、`max_output_tokens`。每次请求另有 24,000 字节上限，每页证据最多 8,000 字节。输入字节按 canonical UTF-8 JSON messages 计算，不是模型 tokenizer 数量或含 HTTP 选项的 wire 大小；真实 tokens 由 API usage 单独记录，缺测为 null。`cycle_budget` 记录当前周期的额度与消耗；`run_budget` 始终累计本次提交的总消耗，持续模式的总调用、输入和 probe 上限写为 null，不能把周期刷新显示成累计清零。`cycle_outcome` 区分本周期更新、无更新、放弃、额度用完和错误；`stop_reason` 只记录整个运行为何结束。失败请求也计入消耗。probe 预算不包含 baseline、被选策略的完整配对复测及开发确认，这些环境成本单独记录。
+1. **基线**：incumbent（上一次被接受的副本，或原卡）跑全部开发种子，得到每个种子的
+   里程碑轨迹（节点 ok/steps/failure_mode、首死节点、它前面那段把底盘停在哪、eef/base 到
+   目标的距离、目标几何、失败关键帧、验证行日志）。
+2. **工作副本**：把 incumbent 的卡包目录整个复制到
+   `campaigns/evolve-<task>/work/r<n>/`。副本里的 `predicates.py` 和 `manifest.toml` 冻结
+   （编辑被拒，跑前再校验哈希）；任务的 mission 卡（规划器、验证谓词绑定）根本不在副本里。
+3. **agent 会话**：系统提示给出方法（一次一个假设；先在能解释现象的最高层定位——恢复/
+   接近策略先于数值旋钮；最小改动；跑失败种子验证；笔记本里记过的实验不重复）。用户消息给
+   基线证据、副本文件表、当前 tunables、上一轮为止的**笔记本**、待处理的 operator proposal
+   和失败关键帧（视觉模型时）。每回合模型回一个 JSON 动作：
+   `read / grep / edit(old→new，必须唯一命中，写前编译) / write / tunable / trace(某节点的
+   逐步运动序列) / run(seed) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
+   消息返回，对话在一轮内累积（超过 400 KB 时最早的工具结果被折叠成一行）。`run` 在副本上跑
+   一个开发种子，返回同种子相对 incumbent 的里程碑增减和关键帧。预算是 `max_steps`
+   （动作数，默认 40）和 `max_probes`（单种子试跑，默认 6）——不再按字节或调用数限流。
+   动作用完而副本已有改动时，按 finish 处理。
+4. **验收**：`finish` 让副本跑全部开发种子，和基线**同种子配对**比较里程碑向量（每个种子的
+   verify 节点是否通过 + 任务是否成功；没有 verify 类节点的计划用全部节点的 oracle 结果）。verify 是 mission
+   卡的谓词（世界状态，部分还合取了段落自报），任务成功是本体的 `terminal_success`；两者都在副本之外。
+   接受当且仅当至少一个里程碑新通过且任何种子上没有已通过的里程碑退化。整任务成功数增加时再
+   用 `confirm_seeds`（默认 2）个新开发种子复核一次，退化则拒绝。接受后该副本成为 incumbent
+   （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
+5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
+   每次 probe 的结果一行、相对父副本的 unified diff、每个种子的前后一行。下一轮的提示把它整个
+   带上（超过 60 KB 时旧轮次折叠成标题行）。这是跨轮记忆的唯一载体，原始轨迹不进提示。
 
-每次决策直接接收已执行节点、有效参数和执行器目录、冻结奖励摘要，以及各节点采样运动的数值和覆盖率；不把诊断标签当作干预规则。未观测项保持 unknown，全部未执行的节点仅报告省略计数。请求中的节点目录保留当前技能、执行器及可直接使用的参数、执行器和可编辑模块名，相同能力只发送一次并由节点引用。模块、类、方法与 AST 位置从实际绑定导出，通过带内容哈希的 catalog 引用按需读取；`inspect {view:catalog,node}` 仅返回所选节点绑定的类和准确方法 ID，可直接用于 source.symbol。冻结评测保留身份、结果和条件数量，完整目标定义通过 evaluation 引用读取。每个采样决策最多使用两次成功的批量只读调用；参数错误且未返回任何证据时不扣读取额度，但模型调用与输入消耗照常计数。随后模型选择试验、提交已测策略或停止。只有新的实测 probe 才恢复只读预算，缓存和错误不恢复；后端不指定干预方向。 请求超过单次或剩余累计字节预算时，先把已保留源码正文替换为可重读引用，再按需把运动详情替换为 trace 引用；奖励反馈、策略身份和预算不删减，完整缓存与审计不变。精简后仍超限则明确停止，不增大预算或自动选择候选。模型可直接提出已声明参数或执行器试验，代码修改仍需读取同一父策略的源码或执行器契约。参数试验提交 `{node,parameter,to}`，后端从当前 binding 导出 provider 和路径，再走原有权限校验。
+**为什么是子进程 + 模块覆盖。** 每次 suite 都在 `python scripts/evolve.py --suite <spec>`
+子进程里跑，子进程启动时（任何 import 之前）用 `PH_MODULE_OVERLAY={"<卡包>": "<副本目录>"}`
+装一个 meta path finder，把卡包名映射到副本目录：副本里改什么就跑什么，没有类替换、没有
+陈旧模块；候选把 MuJoCo 搞崩也只是这一次 suite 的错误，会作为证据回给模型。tunables 走
+`PH_MOUNT_PARAMS_OVERRIDE`，键可以是卡包名（对该卡承载的所有 provider 生效）。子进程用
+`@@{json}` 行流回进度，父进程写进 `campaign.json.live`（phase 基线评测/LLM 分析/单种子试跑/
+同种子复测/新种子确认/完成；种子 i/n；当前节点；节点轨迹；最近 20 条消息）。
 
-`inspect` 支持一次提交最多四个相关只读请求：`args={requests:[{view,...},...]}`。所有页面共用工具字节限额，各自保留来源、哈希和续页位置。源码方法页携带原文，续页使用 `cursor=next`；同时提供 symbol 与绝对行号 start/end 会明确报错，不静默重读第一页。参数查询合并重叠代码片段，并按实际绑定类定位消费位置，静态表达式不冒充运行值。完整轨迹、计划和历史仍按需读取。证据只有结构化投影与分页读取一条路径，不再生成旧版全文 prompt 或重复的中文试验叙述；evaluation 页面可按 seed 读取独立评分、验证观测和终态观测，缺失读数保持缺失。本周期已有新的 probe 尝试且存在实测工作策略时，如果只剩一次模型调用、常规请求超过单次上限，或继续常规请求会侵占选择所需的累计输入预算，则同一工具循环发送精简的 selection 请求，只允许模型 choose/stop。该请求保留所有工作策略的条件比较、身份、预算和最近的选择错误，不加载源码或轨迹，不额外增加调用，也不自动选择候选。历史候选和缓存命中不触发这一限制；新周期仍可取证和试验。工作策略的长比较和改动详情在超限时转为带 policy_id 的 history 引用，保留可比较性和增益、回退数量；已有工作策略不再重复出现在历史回放中。若精简请求仍超限，仍按预算停止。每次请求重建，不累加完整聊天；最新工具页不再同时出现在保留页面中，最新工具页与保留页面合计不超过 8 KB，最近试验反馈优先保留。超出工作集上限的页面在修改缓存前拒绝，保留之前的证据和奖励反馈。模型的短 memo 用于保留观测和后续假设。同一工作区跨周期保留最多 8 KB 的有效源码页；策略被清理、绑定或源码变化时丢弃。只有实际发送的原文页可以恢复代码修改的取证资格，引用本身不授权。动态观测和工具错误不跨周期缓存为新事实。
+**每轮封存什么。** `campaign.json.rounds[]` 一行：`round, tried{kind: edit|none, node, detail{summary,
+files, tunables, diff, reason, error}}, before/after（成功数）, before_score/after_score
+（[成功数, 里程碑通过率]）, outcome improved|same|worse|none|error, accepted, accepted_reason,
+parent（父 incumbent 的轮次）, confirm, probes[], per_seed/after_seeds（节点轨迹）, media/
+media_dropped, workspace, usage{llm_tokens, model_calls, episode_attempts, sim_s, wall_s},
+llm{model, status finished|gave_up|exhausted|error|cancelled, calls, actions{read:n,...}, errors[],
+summary}`。运行时把它封成 `rsi_step`。超过 20 轮的旧行分片到 `rounds/<n>.json`，
+`campaign.json` 里只留索引行（含预算好的 `node_rate`/`by_task`）。完整对话（文本，图片以
+`[image]` 占位）在 `llm/round-<n>.json`。`board.store.rsi_command_summary(task, round)` 只返回
+动作计数和最近的错误。媒体按 `media/rsi/<task>/round-<r>/<phase>/` 分开存，段级录制器不变
+（`harness/media.py`：验证通过的段落成 mp4/gif，失败段留 3 张关键帧）。被拒的副本保留最近
+10 轮，incumbent 的副本一直保留。
 
-最近六条 probe 观测跨源码 epoch 保留，但携带原始评测身份；不同或未知身份明确标记 `transfer_only`，只供重新检验假设，不能直接成为父策略、接受证据或新评分。当前 `working_policies` 才是可执行策略目录，其中包含 incumbent。目录保留每个候选逐 seed 相对 incumbent 的实测比较：`comparable`、带 obligation ID 和原始前后值的 gains/regressions、比较理由；不可比较的结果不伪装成零收益。同一策略和 seed 去重，源码与轨迹不随目录重复发送，probe 明确标记为未验收。选择 incumbent ID 等同本周期不更新并保留当前策略，不重复评测或晋级，也不终止整个持续运行。只读额度与 `probe_budget` 独立：只读耗尽仍可采样，仿真报错也会消耗探针并在下一请求反映已用预算。probe 与完整评测都核对实际返回的种子集合；空批次、错种子、多余或重复种子记为采样错误，仍计入已用预算，不建立可选策略。采样决策默认使用 off effort；RSI 的“模型设置”页可选择同一已配置 endpoint 的模型 ID 和声明的 effort，通过 brief 的 `llm_model`、`llm_effort` 传递，仅在下一次开始或继续时生效。可选模型来自 endpoint 的 `/models`，允许填写未列出的实验模型 ID；effort 的请求参数由 model_endpoint 卡的 `reasoning_efforts` 声明，未支持的值明确拒绝，不静默降级。每次输出仍受原有 token 上限约束；辅助审计记录最终操作、请求、工具结果与用量，不保存或重放内部推理文本。每轮另封存 `llm.decision_flow`，统计请求、执行、selection 调用及最多八类拒绝原因；`board.store.rsi_command_summary` 返回这一精简摘要，旧轮次仅在 prompt/raw 身份匹配时从审计投影，不返回提示、源码或轨迹。该摘要用于诊断接口，不作为奖励证据。 `rsi_model_options` 只返回模型名、默认配置与 effort 列表，不返回地址或凭据；目录读取失败时保留已配置模型并报告错误。campaign 的 `llm_config` 记录本次提交配置，单轮审计记录 `requested_model`、实际 model 身份、effort 和每次请求 options，选择变化不改写历史。
-
-**固定评测目标。** `plugins/rsi/evaluation.py` 在首次无候选 baseline 后，从服务器原始计划和谓词绑定编译 `EvaluationContract`，连同绑定、SkillRecord、证据策略与源码摘要写入实验身份。每个具备服务器谓词绑定的 verify 定义一项待测条件；相同技能、参数与谓词来源只占一个维度。最终完成另由原始 embodiment 的 `terminal_success` 在世界关闭前判定。控制器的 `done()`、可调停止距离、diagnostics、图节点数量、report 的“读取成功”以及候选自己的目标坐标，都不进入奖励。
-
-执行层只产出 `verification_observations` 和 `terminal_observation`，不回调 RSI。RSI 按冻结来源和语义匹配读数，缺测为 unknown。开发接受要求同一批种子中至少一个条件从未通过变为通过，且没有任何已通过条件回退。界面中的 `evaluation.before/after.progress` 是后端计算的固定条件通过比例；完整布尔向量保存在每种子 evidence 中。旧 `node_rate` 仅是执行诊断，不能用于接受候选。此版本没有从布尔谓词虚构连续奖励，也没有宣称已自动拆出 benchmark 的全部物理合取项。
-
-源码固定并不足以保证读数独立：已安装谓词也可能间接读取执行器自报的 success。`fixed-verification-v2` 要求执行层在谓词的同一次调用中审计上下文读取，记录 `world-dependencies-v1` 和 `blocked_reads`。读取执行结果或控制器内部状态的值不作为评测真值；这种依赖经中间 facts 传递仍保留来源。原有执行判断保持不变，评测读数则成为 unknown，并列明依赖路径。没有审计标签的旧观测不能补成新证据。审计可能保守地丢弃实际为真的条件，当前不能据此声称谓词已经完成全部语义审计。
-
-**诊断与干预。** `plugins/rsi/diagnosis.py` 读取 embodiment 声明的动作组、状态坐标、带符号命令和采样轨迹，在目标及阶段一致的窗口内比较命令与响应。它区分样本未激励、发出命令但未观测到运动、远离目标、残差不在已观测响应空间内、进展和未知；这些是可检验的假设，不是物理不可达证明。采样间隔、目标漂移和缺少命令都会限制结论。通用 RSI 不包含特定墙面的臂展、dock 坐标或指定旋钮豁免。
-
-模型选择干预位置与方案；harness 不轮流指定目标，也不给“先调哪个参数、先向上还是向下”的菜单。可选节点来自本次实际执行过、具有安装绑定的动作节点，包含已通过的上游动作；首死位置和历史试验次数仅作为观测。动作类候选必须显式给出 `payload.node`，源码与参数跟随实际执行器解析；`plan` 和 `none` 不需要节点。模型的可改范围来自已安装能力。`tunables` 只能修改所选驱动实际声明的有限数值参数；`executor` 只能选该技能已绑定的执行器；`card`/`patch` 通过 doctor、实例化检查后进入 probe，选择后才做完整配对评估；doctor 对每张卡（模型写的候选一视同仁）查导入边界（`scripts/plugin_doctor.py` 的 `_CARD_IMPORTS`）：只许 stdlib、`harness`、`governor`、`numpy` 和卡自己声明的 `third_party`，`import` 兄弟卡直接 FAIL——卡之间只能按 ref 相认；patch 卡额外获准 import 它 `patched_from` 的那个包。源码编辑只覆盖真实 stage 所属模块，不能借 driver patch 修改规划器或评测器。在同一基线实验上已试过的精确重复候选会被拒绝；基线改变后不能用旧拒绝记录封死新的试验。连续参数空间不被离散方向枚举代替。没有合理试验时可以返回 `none` 并说明缺少的证据。
-
-`plan` 提案携带 `{"graph": <完整计划>}`。`plugins/rsi/interventions.py` 让提示与校验共享服务器计划、catalogue 和 oracle 词汇。当前只允许在原调用之间插入已安装动作技能，保持原节点相对顺序、技能参数、goal、tasks 和验证条目；新增动作仍需类型、依赖、验证覆盖及运行时 grounding 检查。该限制保护原验证检查点的含义；任意改图和任意重排需要更独立的世界状态观察器，当前不开放。新增节点不能增加评测维度。
-
-**跨任务复用。** `plugins/rsi/experience.py` 保存有 before/after 证据引用的诊断结构、干预策略与正负结果，最多保留 512 条。参数干预记相对变化，计划干预记新增动作的类型与数量；每条策略都有原始轮次引用。检索排除当前任务及不兼容评测协议或证据策略的记录，固定当前 campaign 启动时可见的记忆序号；不搬运候选源码或参数绝对值作为新任务设置。检索结果只是新试验的假设。更换评测 epoch 后，旧轮次仍可读，但旧拒绝记录不再限制新协议下的搜索。`transfer_report` 支持 cold/warm 的配对首次接受轮数、固定训练任务数和未出现改进的右删失记录。实际证明可扩展性还需要冻结未见任务、相同种子与预算，比较不同记忆规模下 cold/warm 的首次改进成本；单个 campaign 的曲线不能证明 scale。
-
-**改进成本。** 每轮 `usage` 记录本轮模型调用、输入字节、API tokens、仿真 episode 尝试次数、仿真调用耗时和整轮耗时；这些是增量，不累加 brief 的累计用量。基线复用不重复计数，已经开始但失败的 probe 仍计尝试与耗时。`transfer.cost` 从同一开发 epoch 的已封存轮次汇总总投入、截至首次被接受的改进所需投入，以及当前轮之前最近一次接受之后的投入（包括当前轮）。没有接受时首次成本为 null；历史缺项或 token 用量不完整按对应字段保留未知，不补零。分片与续跑保留这些读数，换 epoch 重新统计。模型的精简状态包含已测候选成本、当前采样投入、历史成本和完整候选验收的 episode 数；它自行决定继续采样、组合候选、验收或停止。成本不替代固定任务奖励，也不产生自动选优规则。控制台展示后端累计与首次改进成本，最近一个改进周期的详情可展开；不推算美元价格或宣称 benchmark 成功率已提升。
-
-**完整证据与控制台。** ph-station 的 RSI 页面宽屏按等宽两列展示媒体和分析，任务卡片均分可用宽度；媒体区使用一个主播放器及片段列表，实时画面限高并保持比例；右侧显示紧凑趋势和本轮评估，轮次历史、子任务热图、节点矩阵及完整版本标识可展开。历史与矩阵在各自面板内滚动，任务名保持横排。内容区窄于 860px 时改为上下排列，日志独占整行。 模型审计明确区分 `proposed`、`abstained`、`rejected`、`error`。没有完成候选复测的轮次，其 after、after_score、evaluation.after、experiments.after 为 null，after_seeds 为空，不把 baseline 复制为复测结果。每轮的 `evaluation`（固定目标、配对读数、接受理由、安装状态）、`diagnosis`、`experience`、`transfer`、真正的 before/after 节点轨迹、异常、耗时，以及模型审计摘要由 runtime 封入 `rsi_step`。控制台展示该摘要中的模型身份、状态、调用数、理由和 prompt/raw 哈希；完整请求与原始答复保存在独立开发审计文件中，不等于控制台已展示这些全文。视频、关键帧及其路径保留在 campaign 媒体记录中，不进入 session-log 链。候选目录不可覆盖，源码和数据共同进入内容摘要，挂载前重新核验。完整配对选择结果直接复用；probe 及其错误、父策略和测量结果保留在 `learning.probes`，完整选择与当前策略保留在 `policy`。两者在控制台分别显示，probe 不冒充 after 或开发接受。`confirm_seeds` 只增加开发种子，并保存两侧完整读数和实验身份，绝不是一次性 held-out 或安装依据。恢复封存会读取完整历史分片，并匹配那一轮原始评测合同。
-
-媒体按 `media/rsi/<task>/epoch-<n>/round-<r>/<phase>/` 分开存放，其中 probe 使用 `probe-<n>`，避免 baseline、多次 probe、完整候选和后续轮次覆盖旧片段。段级录制器是 `harness/media.py`：每 `EVERY`=4 个 driver step 抓一帧 128px 存在内存里，verify 过了才落盘成 `<node>.mp4`（imageio+ffmpeg 不可导入时退成 `.gif`），丢掉的段把原因写进该种子 `index.json["dropped"]`（`no_frame_source` / `no_frames` / `verify_failed` / `encode_failed`），并留最多 3 张失败关键帧 `<node>.fail-{0,1,2}.jpg`（首帧、停滞帧——驱动暴露 `last_progress_step` 时用它、否则取中间——和末帧）。成功段视频、失败关键帧、节点轨迹及实时日志继续由 board 的只读面提供；媒体自身仍是可视化材料，帧不进入证据链。`rsi_run(round=n)` 读取单轮完整结果，`rsi_series` 仅返回紧凑数值与 evaluation 摘要，历史轮次仍按 `rounds/<n>.json` 分片，`rsi_frames(task, round)` 给那一轮的媒体路径与 `dropped`；`rsi_campaigns(session)` 列出磁盘上的全部 evolve campaign（`{task,status,cursor,rounds,best,seeds,arm,node_rate_best,published_rounds,accepted_rounds,usage:{llm_tokens,sim_s},updated,live,open_brief}`，`status` ∈ `running|stopped|cancelled|paused_disk|done`——`stopped` 是读侧派生的：campaign.json 还写着 running，但 inbox/processing 里已经没有 brief 在驱动它），控制台重启后靠它而不是每次启动截断的 `runtime_events` 找回进行中的 rsi。ph-station 用独立区域显示“开发接受”和“安装未评测”，旧 published 仅显示为历史发布。
-
-提案收件箱 `submit_proposal` 接受 `{task,kind,payload,note}`，其中 kind 为 `tunables|executor|card|plan`；LLM 的 `patch` 在投递前生成候选卡。收件箱用于显式提交候选，动作类 payload 必须声明 node；与循环内模型提案经过相同的实际权限校验，它不是自动 fallback。唯一执行入口仍是 `submit_brief`，控制台通过 `brief_status`/`cancel_brief` 管理运行。
-
-**当前边界。** 默认布尔验证信号仍可能稀疏；当前目标编译适用于基线计划的固定 grounded 检查点，动态任务若改变物体或参数会保留 unknown，不能冒充同一目标。候选 Python 执行器仍在仿真进程内，doctor 和来源绑定不是恶意代码的隔离沙箱。已有能力只支持提出并评测策略或执行器改动，并不等于已经完成跨 RoboCasa363 的策略训练或证明跨 benchmark 的性能增长。
+**边界。** 开发接受不写技能库，安装仍需 §4.2 的完整链。模型改不了奖励：谓词绑定在 mission
+卡，副本里的 `predicates.py` 冻结。执行器仍在仿真进程内跑，doctor 不是恶意代码沙箱。
+布尔里程碑仍可能稀疏——这正是把首死节点的几何、上游段落和逐步 trace 交给模型的原因。
 
 ### 4.1 brief 形状
 
@@ -895,7 +918,7 @@ provider/model route 对齐；`model_endpoint` 先读
 `DEEPSEEK_API_KEY` 环境变量，缺失时只按同名 ref 从 `$DSH_HOME/.credentials.yaml` 读取，
 key 不进入 manifest、brief、prompt、日志或 endpoint identity。
 改 `plugins/model_endpoint/manifest.toml` 的 params **不会**给 planner 改道——今天读这张卡
-manifest params 的包括 evolve 的 LLM proposer 与恢复链的 reasoner（`scripts/evolve_llm.py:endpoint()`：
+manifest params 的包括 evolve 的 agent 与恢复链的 reasoner（`scripts/evolve.py:endpoint()`：
 `load_provider(ENDPOINT_REF, mount_params(ENDPOINT_REF) or {"preset": "deepseek"})`），
 planner 完全不看它。要给 planner 换托管 API 或别的端口，改 planner 的 `endpoint_params`
 默认值（一行；支持逐字段覆盖，如
@@ -1299,7 +1322,7 @@ plan node {kind: "segment", skill: "place"}
 | **segment → 动作** | **脚本驱动 *或* 学习策略** | **就是这一层** |
 | 有没有做到 | 卡片声明的谓词读活状态 | 不变 |
 | 失败怎么修 | 本体卡折出来的 `[recoveries.*]` | 不变 |
-| 补丁/候选怎么提 | evolve 的 LLM proposer（`scripts/evolve_llm.py`，§4.0） | 它和恢复链的 reasoner 都读取 `model_endpoint` 的 manifest params |
+| 补丁/候选怎么提 | evolve 的 LLM agent 在卡副本上改（`scripts/evolve.py`，§4.0） | 它和恢复链的 reasoner 都读取 `model_endpoint` 的 manifest params |
 
 慢脑与快脑之间的契约**就是那条 segment spec**——一个子目标加预算。它不发自由文本，
 也永远不发动作。这条边界是两个脑打不起来的原因：一个决定**做哪一段、什么顺序**，另一个

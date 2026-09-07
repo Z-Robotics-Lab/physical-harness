@@ -262,8 +262,8 @@ def check(plugin_dir: str | Path) -> Report:
     # checked here for every card, because a model-written candidate is not in
     # that suite's scan: a card may import harness/, its own package and its
     # declared third_party, never a sibling card.
-    # A patch card is a COPY of one module of ``patched_from``: it may import that
-    # package and inherits its third_party (evolve_llm.write_patch writes both).
+    # A card declaring ``patched_from`` is a copy of that package's module (the
+    # pre-2026-09 evolve wrote these): it may import the origin and inherits its third_party.
     kin = {plugin_dir.name, data.get("patched_from", "")}
     for path in sorted(plugin_dir.rglob("*.py")):
         for lineno, mod in _module_imports(path):
