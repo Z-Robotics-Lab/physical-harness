@@ -574,7 +574,7 @@ class Notebook:
         with self.path.open("a") as f:
             f.write(text.rstrip("\n") + "\n\n")
 
-    def text(self, limit: int = 12_000, diffs: int = 2) -> str:
+    def text(self, limit: int = 16_000, diffs: int = 2) -> str:
         """The brief's view of the notebook: full entries for the last ``diffs`` rounds, older
         entries without their diff block (accepted diffs live on in the incumbent's code),
         the oldest collapsed to their header line once ``limit`` is reached. Resent on every
@@ -590,7 +590,10 @@ class Notebook:
         kept, size = [], 0
         for e in reversed(entries):
             if size + len(e) > limit:
-                kept.append(e.split("\n", 1)[0] + "  (details elided)\n")
+                # collapsed rounds keep their verdict AND what was tried: the summary line is
+                # what stops the same hypothesis from being re-run ten rounds later
+                head = e.split("\n")
+                kept.append(head[0] + "\n" + "\n".join(l[:300] for l in head[1:3] if l.startswith("- ")) + "\n")
             else:
                 kept.append(e)
                 size += len(e)
