@@ -95,6 +95,7 @@ MIN_FREE_BYTES = 5 * 1024 ** 3
 #: ``[tunables]`` the stock card (not the copy) is read from anyway.
 PROTECTED = ("predicates.py", "manifest.toml")
 MAX_LOG_LINES = 60
+READ_MAX_LINES = 200
 MAX_CONTEXT_CHARS = 250_000   # ~70k tokens: the model has a 128k window and each read is long
 MAX_IMAGES = 6
 
@@ -448,7 +449,8 @@ class Workspace:
 
     def read(self, rel: str, start: int = 1, end: int | None = None) -> str:
         lines = self._resolve(rel).read_text().split("\n")
-        a, b = max(1, int(start or 1)), min(len(lines), int(end) if end else len(lines))
+        a = max(1, int(start or 1))
+        b = min(len(lines), int(end) if end else len(lines), a + READ_MAX_LINES - 1)   # bounded: read again for more
         if a > len(lines):
             raise ValueError(f"{rel} has {len(lines)} lines")
         body = "\n".join(f"{i:4d}| {lines[i - 1]}" for i in range(a, b + 1))
@@ -473,13 +475,29 @@ class Workspace:
         if p.suffix != ".py":
             raise ValueError("only .py files take effect in the copy")
         text = p.read_text()
-        n = text.count(old)
-        if not old or n != 1:
-            raise ValueError(f"`old` must occur exactly once in {rel}; it occurs {n} times. "
-                             "Copy it verbatim out of a read result (without the `NNNN| ` prefixes).")
         if old == new:
             raise ValueError("old == new changes nothing")
-        return self._write(p, text.replace(old, new, 1), rel)
+        n = text.count(old) if old else 0
+        if n == 1:
+            return self._write(p, text.replace(old, new, 1), rel)
+        # retyped snippet: the same lines ignoring indentation and trailing whitespace,
+        # matching exactly once, with ``new`` re-indented to the file
+        lines, want = text.split("\n"), [l.strip() for l in old.split("\n")]
+        strip = [l.strip() for l in lines]
+        hits = [i for i in range(len(lines) - len(want) + 1) if strip[i:i + len(want)] == want] if old.strip() else []
+        if len(hits) == 1:
+            i = hits[0]
+            j = next((k for k in range(len(want)) if want[k]), 0)
+            delta = (len(lines[i + j]) - len(lines[i + j].lstrip())) - (len(old.split("\n")[j]) - len(old.split("\n")[j].lstrip()))
+            shifted = [(" " * delta + l if delta > 0 else l[min(-delta, len(l) - len(l.lstrip())):]) if l.strip() else l
+                       for l in new.split("\n")]
+            return self._write(p, "\n".join(lines[:i] + shifted + lines[i + len(want):]), rel)
+        first = next((l for l in want if l), "")
+        near = next((k for k, l in enumerate(strip) if l == first), None) if first else None
+        hint = ("" if near is None else f" Its first line occurs at line {near + 1}; the file there reads:\n"
+                + "\n".join(f"{k + 1:4d}| {lines[k]}" for k in range(max(0, near - 3), min(len(lines), near + len(want) + 3))))
+        raise ValueError(f"`old` must occur exactly once in {rel}; it occurs {n} times (also ignoring indentation). "
+                         f"Copy it verbatim out of a read result, without the `NNNN| ` prefixes.{hint}")
 
     def write(self, rel: str, content: str) -> str:
         p = self._resolve(rel)
@@ -662,10 +680,14 @@ class Agent:
         self._bound()
 
     def _bound(self) -> None:
-        """Keep the conversation under MAX_CONTEXT_CHARS: elide the oldest tool results."""
+        """Keep the conversation under MAX_CONTEXT_CHARS. Elision rewrites history, which
+        invalidates the server's cached prefix for the next call, so when the cap is hit the
+        oldest tool results are collapsed down to HALF the cap at once, not one at a time."""
         size = lambda: sum(len(json.dumps(m.get("content"), default=str)) for m in self.messages)
+        if size() <= MAX_CONTEXT_CHARS:
+            return
         i = 2
-        while size() > MAX_CONTEXT_CHARS and i < len(self.messages) - 8:
+        while size() > MAX_CONTEXT_CHARS // 2 and i < len(self.messages) - 8:
             m = self.messages[i]
             if m["role"] == "user" and not (isinstance(m["content"], str) and m["content"].startswith("[elided")):
                 m["content"] = f"[elided earlier result, {len(json.dumps(m['content'], default=str))} chars]"
