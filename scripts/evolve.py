@@ -420,8 +420,9 @@ class Workspace:
     (the protected files must stay byte-identical to it)."""
 
     def __init__(self, path: Path, stock: Path, parent: Path | None = None) -> None:
-        self.path, self.stock = Path(path), Path(stock)
-        self.parent = Path(parent) if parent else self.stock   # what ``diff``/``changed`` compare against
+        # absolute throughout: the tools accept relative OR absolute paths inside the copy
+        self.path, self.stock = Path(path).resolve(), Path(stock).resolve()
+        self.parent = Path(parent).resolve() if parent else self.stock   # what ``diff``/``changed`` compare against
 
     @classmethod
     def create(cls, path: Path, source: Path, stock: Path) -> Workspace:
@@ -432,8 +433,9 @@ class Workspace:
 
     def _resolve(self, rel: str) -> Path:
         p = (self.path / rel).resolve()
-        if not p.is_relative_to(self.path.resolve()) or p == self.path.resolve():
-            raise ValueError(f"path must name a file inside the card copy, got {rel!r}")
+        if not p.is_relative_to(self.path) or p == self.path:
+            raise ValueError(f"path must name a file inside the card copy (e.g. {self.path.name}/drivers.py or just "
+                             f"drivers.py), got {rel!r}")
         return p
 
     def files(self) -> list[str]:
@@ -452,11 +454,12 @@ class Workspace:
         body = "\n".join(f"{i:4d}| {lines[i - 1]}" for i in range(a, b + 1))
         return body + ("" if b >= len(lines) else f"\n... ({len(lines) - b} more lines; read with start={b + 1})")
 
-    def grep(self, pattern: str) -> str:
+    def grep(self, pattern: str, path: str | None = None) -> str:
         rx = re.compile(pattern)
         hits = []
-        for p in sorted(self.path.rglob("*.py")):
-            if "__pycache__" in p.parts:
+        files = [self._resolve(path)] if path else sorted(self.path.rglob("*.py"))
+        for p in files:
+            if "__pycache__" in p.parts or not p.is_file():
                 continue
             for i, line in enumerate(p.read_text().split("\n"), 1):
                 if rx.search(line):
@@ -567,9 +570,10 @@ Method (one hypothesis at a time):
    runs EVERY development seed paired against the incumbent; the edit is accepted only
    if some milestone or task success is newly gained and none regresses on any seed.
 
-Reply with exactly ONE JSON object per turn, no prose outside it:
+Reply with exactly ONE JSON object per turn, no prose outside it. Inside JSON strings
+escape double quotes (or quote code with single quotes); an unparsable reply wastes an action.
   {{"thought": "...", "action": "read", "path": "drivers.py", "start": 1, "end": 120}}
-  {{"action": "grep", "pattern": "<regex over the copy's .py files>"}}
+  {{"action": "grep", "pattern": "<regex over the copy's .py files>", "path": "<optional one file>"}}
   {{"action": "edit", "path": "<file>", "old": "<snippet occurring exactly once>", "new": "<replacement>"}}
   {{"action": "write", "path": "<new_or_whole_file>.py", "content": "..."}}
   {{"action": "tunable", "name": "<declared knob>", "value": <number>}}
@@ -622,6 +626,7 @@ class Agent:
         self.usage = {"prompt": 0, "completion": 0}
         self.calls = 0
         self.actions: dict[str, int] = {}
+        self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
         self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
@@ -663,6 +668,7 @@ class Agent:
     def _persist(self, status: str, extra: dict | None = None) -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         doc = {"status": status, "calls": self.calls, "usage": dict(self.usage), "actions": self.actions,
+               "finish_reasons": self.finishes,
                "errors": self.errors[-20:], "probes": self.probes,
                "messages": [{"role": m["role"], "content": _text(m["content"])} for m in self.messages],
                **(extra or {})}
@@ -673,7 +679,7 @@ class Agent:
     # -- the loop ---------------------------------------------------------------------
     def loop(self) -> dict:
         """Returns ``{status: finished|gave_up|exhausted|error|cancelled, summary, reason, error}``."""
-        steps, result = 0, None
+        steps, result, empties = 0, None, 0
         while result is None:
             if self.cancelled():
                 result = {"status": "cancelled", "reason": "cancelled at an agent step"}
@@ -694,6 +700,21 @@ class Agent:
             u = getattr(self.ep, "last_usage", None) or {}
             for k in self.usage:
                 self.usage[k] += int(u.get(k) or 0)
+            finish = getattr(self.ep, "last_finish", None)
+            self.finishes[str(finish)] = self.finishes.get(str(finish), 0) + 1
+            if not (raw or "").strip():
+                # thinking mode sometimes returns an empty content (or the reasoning ate
+                # max_tokens): ask again, do not spend an action, give up after 3 in a row
+                empties += 1
+                self.errors.append(f"empty reply (finish_reason={finish})")
+                if empties >= 3:
+                    result = {"status": "error", "error": f"3 consecutive empty replies (finish_reason={finish})",
+                              "reason": "model_error"}
+                    break
+                self._user(f"error: your reply was empty (finish_reason={finish}). Answer with the JSON object only.")
+                self._persist("running")
+                continue
+            empties = 0
             self.raw.append(raw)
             self.messages.append({"role": "assistant", "content": raw})
             steps += 1
@@ -721,7 +742,7 @@ class Agent:
         if name == "read":
             return self.ws.read(str(a.get("path", "")), a.get("start", 1), a.get("end")), []
         if name == "grep":
-            return self.ws.grep(str(a.get("pattern", ""))), []
+            return self.ws.grep(str(a.get("pattern", "")), a.get("path") or None), []
         if name == "edit":
             return self.ws.edit(str(a.get("path", "")), str(a.get("old", "")), str(a.get("new", ""))), []
         if name == "write":
@@ -910,7 +931,8 @@ def main(argv=None) -> int:
     ap.add_argument("--llm-effort", default="off")
     ap.add_argument("--max-steps", type=int, default=40, help="agent actions per round")
     ap.add_argument("--max-probes", type=int, default=6, help="single-seed runs per round")
-    ap.add_argument("--max-output-tokens", type=int, default=4096)
+    ap.add_argument("--max-output-tokens", type=int, default=8192,
+                    help="per reply; with a thinking effort the reasoning shares this budget")
     args = ap.parse_args(argv)
     if args.suite:
         return _child_main(args.suite)
@@ -1141,7 +1163,7 @@ def main(argv=None) -> int:
                          "wall_s": round(time.time() - started, 3)},
                "llm": {"model": getattr(ep, "identity", type(ep).__name__), "requested_model": args.llm_model,
                        "effort": args.llm_effort, "status": outcome["status"], "calls": agent.calls,
-                       "actions": agent.actions, "errors": agent.errors[-8:], "summary": outcome.get("summary"),
+                       "actions": agent.actions, "finish_reasons": agent.finishes, "errors": agent.errors[-8:], "summary": outcome.get("summary"),
                        "reason": outcome.get("reason"), "error": outcome.get("error"), "stop_reason": outcome.get("reason")}}
         doc["rounds"].append(row)
         doc.update(cursor=rnd, best=row["best"])
