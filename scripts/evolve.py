@@ -648,7 +648,8 @@ class Agent:
     def __init__(self, ep, ws: Workspace, *, pkg: str, tunables: dict, knobs: dict, run_seed,
                  dev_seeds: list[int], baseline: dict, session: Path, notebook: str, proposal: dict | None,
                  max_steps: int, max_probes: int, max_tokens: int, options: dict, cancelled, audit_path: Path,
-                 tick) -> None:
+                 tick, frontier: str | None = None) -> None:
+        self.frontier = frontier
         # ``tunables`` = the OVERRIDE_ENV document, keyed by the card PACKAGE so it reaches
         # every provider the card hosts (harness.manifest.mount_params); ``knobs`` = the
         # effective numeric values the agent sees and may change.
@@ -674,11 +675,13 @@ class Agent:
 
     # -- prompt -------------------------------------------------------------------
     def _brief(self, notebook: str, proposal: dict | None):
+        frontier = self.frontier or ""
         text = [f"# Task: {self.baseline['task']}  (development seeds {self.dev_seeds}; arm {self.baseline.get('arm')})",
                 "Card copy files:\n  " + "\n  ".join(self.ws.files()),
                 "Declared tunables (current effective values; change with the tunable action): "
                 + json.dumps(self.knobs, sort_keys=True),
                 "## Incumbent on the development seeds (what you must beat)\n" + describe_suite(self.baseline),
+                *([frontier] if frontier else []),
                 "## Notebook of previous rounds\n" + notebook]
         if proposal:
             text.append("## Operator proposal pending -- evaluate it first\n" + json.dumps(proposal, ensure_ascii=False)[:2000])
@@ -1188,7 +1191,8 @@ def main(argv=None) -> int:
                       dev_seeds=list(range(seeds[0], seeds[1] + 1)), baseline=before, session=args.session,
                       notebook=notebook.text(), proposal=prop, max_steps=args.max_steps, max_probes=args.max_probes,
                       max_tokens=args.max_output_tokens, options=thinking, cancelled=cancelled,
-                      audit_path=store.dir / "llm" / f"round-{rnd}.json", tick=tick)
+                      audit_path=store.dir / "llm" / f"round-{rnd}.json", tick=tick,
+                      frontier=failure_frontier(doc["rounds"], before, list(range(seeds[0], seeds[1] + 1))))
         outcome = agent.loop()
         if outcome["status"] == "cancelled" or cancelled():
             doc.update(status="cancelled", stop_reason="cancelled")
@@ -1315,6 +1319,25 @@ def main(argv=None) -> int:
     tick(phase="done")
     print(json.dumps({"task": args.task, "cursor": doc["cursor"], "best": doc["best"], "status": "done"}))
     return 0
+
+
+def failure_frontier(rounds: list[dict], baseline: dict, seeds: list[int], window: int = 5) -> str:
+    """Per development seed: where the incumbent dies, how many single-seed runs the last
+    ``window`` rounds spent on it, and the last round that gained a milestone there. A
+    fact table (Zetta's failure clusters), not a target list."""
+    recent = [r for r in rounds if r.get("round")][-window:]
+    if not recent:
+        return ""
+    lines = [f"## Failure frontier (last {len(recent)} rounds: {recent[0]['round']}–{recent[-1]['round']})",
+             "seed | incumbent dies at | runs spent on it | last round with a gain on it"]
+    for seed in seeds:
+        row = baseline["seeds"].get(str(seed)) or {}
+        death = "SUCCESS" if row.get("success") else f"{row.get('first_death')} {row.get('failure_mode') or ''}".strip()
+        probes = sum(1 for r in recent for p in r.get("probes") or [] if p.get("seed") == seed)
+        gained = [r["round"] for r in rounds if any(g.startswith(f"{seed}:") for p in r.get("probes") or []
+                                                    for g in (p.get("compare") or {}).get("gains") or [])]
+        lines.append(f"{seed} | {death} | {probes} | {gained[-1] if gained else 'never'}")
+    return "\n".join(lines)
 
 
 def _trim_episodes(session: Path, task: str, keep_round: int, last: int) -> None:
