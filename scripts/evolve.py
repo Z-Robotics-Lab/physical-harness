@@ -23,6 +23,7 @@ crashing candidate cannot take the loop down.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import copy
 import difflib
@@ -547,6 +548,20 @@ class Workspace:
 
     def changed(self) -> bool:
         return bool(self.diff(limit=10 ** 9))
+
+    def changed_code(self) -> bool:
+        """True when some .py differs from the parent in its AST, not merely in comments or
+        whitespace -- a "revert" that leaves a stray comment is not a candidate."""
+        for rel in {q.relative_to(r) for r in (self.path, self.parent) for q in r.rglob("*.py") if "__pycache__" not in q.parts}:
+            a, b = self.parent / rel, self.path / rel
+            if a.exists() != b.exists():
+                return True
+            try:
+                if ast.dump(ast.parse(a.read_text())) != ast.dump(ast.parse(b.read_text())):
+                    return True
+            except SyntaxError:
+                return True
+        return False
 
 
 # ── the notebook: what crosses rounds ─────────────────────────────────────────────
@@ -1208,6 +1223,8 @@ def main(argv=None) -> int:
         if outcome["status"] == "finished" or (outcome["status"] in ("error", "exhausted") and (diff or tun_changes)):
             if not diff and not tun_changes:
                 why = "finish without any edit: nothing to evaluate"
+            elif not tun_changes and not ws.changed_code():
+                why = "finish with only comment/whitespace changes: nothing to evaluate"
             elif ws.protected_ok():
                 why = ws.protected_ok()
             elif (agent.probes and agent.ran.get(agent.probes[-1]["seed"]) == (ws.digest(), json.dumps(tunables, sort_keys=True))
