@@ -120,6 +120,7 @@ def endpoint(model=None):
     if os.environ.get("PH_MODEL_ENDPOINT_FAKE"):
         return load_provider(FAKE_REF, {})
     params, _ = model_request_config(model)
+    params.setdefault("timeout", 300.0)   # a thinking reply can take minutes; the card's default is 60 s
     return load_provider(ENDPOINT_REF, params)
 
 
@@ -722,11 +723,21 @@ class Agent:
             # after a reply the reasoning ate whole (finish_reason=length, empty content) the
             # retry runs WITHOUT thinking: the answer is one JSON object, reasoning is optional
             options = {"thinking": {"type": "disabled"}} if plain_retry else self.options
-            try:
-                raw = self.ep.chat(self.messages, max_tokens=self.max_tokens,
-                                   response_format={"type": "json_object"}, **options)
-            except Exception as exc:  # noqa: BLE001 -- the endpoint is infrastructure; seal and stop
-                result = {"status": "error", "error": f"{type(exc).__name__}: {str(exc)[:1000]}", "reason": "model_error"}
+            raw, failure = None, None
+            for attempt, pause in enumerate((0, 10, 30, 60)):   # transient network/API errors: retry, then seal
+                if pause:
+                    time.sleep(pause)
+                try:
+                    raw = self.ep.chat(self.messages, max_tokens=self.max_tokens,
+                                       response_format={"type": "json_object"}, **options)
+                    failure = None
+                    break
+                except Exception as exc:  # noqa: BLE001 -- the endpoint is infrastructure
+                    failure = f"{type(exc).__name__}: {str(exc)[:600]}"
+                    self.errors.append(f"model call failed (attempt {attempt + 1}): {failure}"[:300])
+                    self._persist("running")
+            if failure is not None:
+                result = {"status": "error", "error": failure, "reason": "model_error"}
                 break
             self.calls += 1
             u = getattr(self.ep, "last_usage", None) or {}
@@ -1145,7 +1156,9 @@ def main(argv=None) -> int:
         tun_changes = {k: v for k, v in agent.knobs.items() if knobs_from.get(k) != v}
         parent_round = int(incumbent.get("round") or 0)
         tried_kind = "none"
-        if outcome["status"] == "finished":
+        # the model finished, OR it became unusable (error / silence) with edits pending: the
+        # simulator does not need the model, so pending edits are still measured, never lost
+        if outcome["status"] == "finished" or (outcome["status"] in ("error", "exhausted") and (diff or tun_changes)):
             if not diff and not tun_changes:
                 why = "finish without any edit: nothing to evaluate"
             elif ws.protected_ok():
