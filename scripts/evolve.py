@@ -1210,6 +1210,13 @@ def main(argv=None) -> int:
                 why = "finish without any edit: nothing to evaluate"
             elif ws.protected_ok():
                 why = ws.protected_ok()
+            elif (agent.probes and agent.ran.get(agent.probes[-1]["seed"]) == (ws.digest(), json.dumps(tunables, sort_keys=True))
+                  and (agent.probes[-1].get("compare") or {}).get("regressions")):
+                # deterministic simulator: the state being submitted already regressed on its own
+                # last probe, so the paired suite cannot accept it -- the verdict needs no retest
+                tried_kind, compared = "edit", {"gains": [], "regressions": agent.probes[-1]["compare"]["regressions"], "accepted": False}
+                why = (f"rejected without a retest: the last run of this exact state (seed {agent.probes[-1]['seed']}) "
+                       f"already regressed {compared['regressions']}")
             else:
                 tried_kind = "edit"
                 tick(phase="retest", tried={"kind": "edit", "node": before["seeds"][str(seeds[0])].get("first_death")})
