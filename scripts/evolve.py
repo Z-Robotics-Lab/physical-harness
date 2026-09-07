@@ -558,7 +558,7 @@ class Notebook:
         with self.path.open("a") as f:
             f.write(text.rstrip("\n") + "\n\n")
 
-    def text(self, limit: int = 60_000) -> str:
+    def text(self, limit: int = 30_000) -> str:
         if not self.path.exists():
             return "(no previous rounds)"
         body = self.path.read_text()
@@ -676,6 +676,12 @@ class Agent:
 
     def _user(self, text: str, images: list | None = None) -> None:
         if images and self.images:
+            # keyframes ride only the NEWEST message: every earlier image becomes a one-line
+            # placeholder, or each call would resend every frame the round has ever shown
+            for m in self.messages[1:]:
+                if isinstance(m.get("content"), list):
+                    m["content"] = [{"type": "text", "text": "[keyframe shown earlier]"} if p.get("type") == "image_url" else p
+                                    for p in m["content"]]
             self.messages.append({"role": "user", "content": [{"type": "text", "text": text}, *images]})
         else:
             self.messages.append({"role": "user", "content": text})
