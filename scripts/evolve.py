@@ -1012,7 +1012,11 @@ def main(argv=None) -> int:
     doc = store.load() or {"task": args.task, "session": args.session.name, "seeds": list(args.seeds or [0, 1]),
                            "arm": args.arm, "rounds": [], "best": 0, "cursor": 0,
                            "incumbent": {"workspace": None, "tunables": {}, "round": 0}}
-    doc.pop("applied", None)
+    for legacy in ("applied", "accepted_stack", "learning_replay", "cycle_budget", "run_budget", "cycle_context",
+                   "transfer", "evaluation", "evaluation_contract", "evaluation_contracts", "reference", "reference_plan",
+                   "plan_space", "diagnosis", "experience", "memory_prefix", "last_outcome", "prior_protocols",
+                   "protocol_id", "working_candidates", "epoch_start", "confirm_base", "continuous"):
+        doc.pop(legacy, None)   # the previous loop's state; the console would keep rendering it
     doc.update(status="running", stop_reason=None, card=pkg, llm_config={"model": llm_params.get("model"), "effort": args.llm_effort},
                score_definition="Frozen verify milestones per seed (plus task success), paired on the same development "
                                 "seeds: accepted iff some milestone is newly gained and none regresses.")

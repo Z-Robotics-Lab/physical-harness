@@ -1507,7 +1507,8 @@ def rsi_campaigns(session_dir: str | Path) -> list[dict]:
             # (a partial win accepts without publishing whole-task evidence)
             "accepted_rounds": [r["round"] for r in rounds if r.get("accepted")],
             "usage": {"llm_tokens": {"prompt": sum(t.get("prompt") or 0 for t in tok),
-                                     "completion": sum(t.get("completion") or 0 for t in tok)} if tok else None,
+                                     "completion": sum(t.get("completion") or 0 for t in tok),
+                                     "cache_hit": sum(t.get("cache_hit") or 0 for t in tok)} if tok else None,
                       "sim_s": round(sum((r.get("usage") or {}).get("sim_s") or 0 for r in rounds), 3)},
             "node_rate_best": (_series(doc) or [{}])[-1].get("node_rate", {}).get("best"),
             "updated": (d / "campaign.json").stat().st_mtime,
