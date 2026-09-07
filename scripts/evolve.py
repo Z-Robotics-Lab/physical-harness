@@ -708,7 +708,7 @@ class Agent:
     # -- the loop ---------------------------------------------------------------------
     def loop(self) -> dict:
         """Returns ``{status: finished|gave_up|exhausted|error|cancelled, summary, reason, error}``."""
-        steps, result, empties = 0, None, 0
+        steps, result, empties, plain_retry = 0, None, 0, False
         while result is None:
             if self.cancelled():
                 result = {"status": "cancelled", "reason": "cancelled at an agent step"}
@@ -719,9 +719,12 @@ class Agent:
                           else {"status": "exhausted", "reason": "action budget exhausted without an edit"})
                 break
             self.tick(phase="propose", llm_calls=self.calls + 1)
+            # after a reply the reasoning ate whole (finish_reason=length, empty content) the
+            # retry runs WITHOUT thinking: the answer is one JSON object, reasoning is optional
+            options = {"thinking": {"type": "disabled"}} if plain_retry else self.options
             try:
                 raw = self.ep.chat(self.messages, max_tokens=self.max_tokens,
-                                   response_format={"type": "json_object"}, **self.options)
+                                   response_format={"type": "json_object"}, **options)
             except Exception as exc:  # noqa: BLE001 -- the endpoint is infrastructure; seal and stop
                 result = {"status": "error", "error": f"{type(exc).__name__}: {str(exc)[:1000]}", "reason": "model_error"}
                 break
@@ -733,17 +736,18 @@ class Agent:
             self.finishes[str(finish)] = self.finishes.get(str(finish), 0) + 1
             if not (raw or "").strip():
                 # thinking mode sometimes returns an empty content (or the reasoning ate
-                # max_tokens): ask again, do not spend an action, give up after 3 in a row
+                # max_tokens): ask again without spending an action; the retry drops thinking.
+                # Three in a row end the ROUND as unproductive, never the campaign.
                 empties += 1
+                plain_retry = True
                 self.errors.append(f"empty reply (finish_reason={finish})")
                 if empties >= 3:
-                    result = {"status": "error", "error": f"3 consecutive empty replies (finish_reason={finish})",
-                              "reason": "model_error"}
+                    result = {"status": "exhausted", "reason": f"3 consecutive empty replies (finish_reason={finish})"}
                     break
                 self._user(f"error: your reply was empty (finish_reason={finish}). Answer with the JSON object only.")
                 self._persist("running")
                 continue
-            empties = 0
+            empties, plain_retry = 0, False
             self.raw.append(raw)
             self.messages.append({"role": "assistant", "content": raw})
             steps += 1
