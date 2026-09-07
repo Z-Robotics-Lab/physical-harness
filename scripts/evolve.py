@@ -186,7 +186,7 @@ def _get(budgets, binding: dict, key: str, default):
 
 def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root: Path,
               tunables: dict, media_dir: Path | None = None, budgets: dict | None = None,
-              progress=None, media_prefix: str = "media", cancelled=None) -> dict:
+              progress=None, media_prefix: str = "media", cancelled=None, episode: bool = False) -> dict:
     """{count, seeds: {seed: {success, first_death, failure_mode, trail, ...}}, sha,
     elapsed_s, logs}. ``tunables`` = ``{provider ref: {param: value}}`` (OVERRIDE_ENV)."""
     os.environ[OVERRIDE_ENV] = json.dumps(tunables or {})
@@ -194,6 +194,7 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
     brief = {**hr.task_brief(task, binding), "arm": arm}
     if media_dir is not None:
         brief["media_dir"] = str(media_dir)
+        brief["media_episode"] = bool(episode)   # whole-episode video (the retest: the round's rollout)
     tick = progress or (lambda **kw: None)
     t_suite = time.time()
     for i, seed in enumerate(seeds):
@@ -271,7 +272,7 @@ def _child_main(spec_path: Path) -> int:
                     Path(spec["skills_root"]), spec["tunables"],
                     media_dir=Path(spec["media_dir"]) if spec.get("media_dir") else None,
                     budgets=spec.get("budgets"), progress=progress, media_prefix=spec.get("media_prefix", "media"),
-                    cancelled=(lambda: marker.exists()) if marker else None)
+                    cancelled=(lambda: marker.exists()) if marker else None, episode=bool(spec.get("episode")))
     Path(spec["out"]).write_text(json.dumps(out, default=str))
     return 0
 
@@ -1089,7 +1090,8 @@ def main(argv=None) -> int:
     round_cost = {"episode_attempts": 0, "sim_s": 0.0}
 
     def suite(seed_list: list[int], workspace: Path | None, tunables: dict, label: str, media_on: bool = True) -> dict:
-        """One suite in a CHILD process mapped onto ``workspace`` (None = the stock card)."""
+        """One suite in a CHILD process mapped onto ``workspace`` (None = the stock card).
+        The retest also records each seed's whole-episode video (the round's rollout)."""
         prefix = f"media/rsi/{args.task}/round-{live['round']}/{label}"
         work = store.dir / "work"
         work.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1100,7 @@ def main(argv=None) -> int:
             "task": args.task, "seeds": seed_list, "arm": arm, "skills_root": str(args.skills_root),
             "tunables": tunables,
             "media_dir": str(args.session / prefix) if media_on else None, "media_prefix": prefix,
+            "episode": label == "retest",
             "budgets": budgets, "out": str(out_path), "cancel_marker": str(args.cancel_marker) if args.cancel_marker else None}))
         env = {**os.environ}
         env.pop(OVERLAY_ENV, None)
@@ -1298,6 +1301,7 @@ def main(argv=None) -> int:
         notebook.append("\n".join(entry))
         _trim_workspaces(store.dir / "work", keep={Path(incumbent["workspace"]).name} if incumbent.get("workspace") else set(),
                          last=rnd)
+        _trim_episodes(args.session, args.task, int(incumbent.get("round") or 0), rnd)
         completed += 1
         if outcome["status"] == "error":
             doc.update(status="failed", stop_reason="model_error")
@@ -1311,6 +1315,23 @@ def main(argv=None) -> int:
     tick(phase="done")
     print(json.dumps({"task": args.task, "cursor": doc["cursor"], "best": doc["best"], "status": "done"}))
     return 0
+
+
+def _trim_episodes(session: Path, task: str, keep_round: int, last: int) -> None:
+    """Whole-episode videos are the largest thing a round leaves: keep the incumbent's
+    and the last WORKSPACES_KEPT rounds', drop the rest (index entries included)."""
+    for d in (session / "media" / "rsi" / task).glob("round-*"):
+        m = re.fullmatch(r"round-(\d+)", d.name)
+        if not m or int(m.group(1)) == keep_round or int(m.group(1)) > last - WORKSPACES_KEPT:
+            continue
+        for idx in d.glob(f"retest/{task}/*/index.json"):
+            try:
+                data = json.loads(idx.read_text())
+                if data.get("files", {}).pop("episode", None) is not None:
+                    (idx.parent / "episode.mp4").unlink(missing_ok=True)
+                    idx.write_text(json.dumps(data, sort_keys=True, indent=1))
+            except (OSError, ValueError):
+                continue
 
 
 def _trim_workspaces(work: Path, keep: set[str], last: int) -> None:

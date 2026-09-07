@@ -31,15 +31,22 @@ FPS = 10
 EVERY = 4
 MAX_BYTES = 1_000_000
 KEYFRAME_QUALITY = 60   # 128px JPEG at q60: a few KB, well under the ~25 KB budget
+#: The whole-episode video (``episode=True``): every captured frame of every segment,
+#: passed or failed, streamed to ``<seed>/episode.mp4`` at this size -- the operator's
+#: "watch the best round's rollout" view, never evidence. mp4 only (imageio+ffmpeg).
+EPISODE_SIZE = 256
 
 
 class SegmentRecorder:
     def __init__(self, root: str | os.PathLike, task: str, seed: int, *,
-                 every: int = EVERY) -> None:
+                 every: int = EVERY, episode: bool = False) -> None:
         self.root = Path(root)
         self.task = str(task)
         self.seed = int(seed)
         self.every = max(1, int(every))
+        self.episode = bool(episode)
+        self._ep = None            # the streaming episode writer, opened on the first frame
+        self._ep_frames = 0
         self.frames: list[Any] = []   # PIL RGB images, SIZE x SIZE
         self._src = None
         self._driver = None
@@ -71,11 +78,47 @@ class SegmentRecorder:
         if self._n % self.every or self._src is None:
             return
         try:
-            img = _to_image(self._src(obs))
+            raw = self._src(obs)
+            img = _to_image(raw)
             if img is not None:
                 self.frames.append(img)
+                if self.episode:
+                    self._episode_frame(_to_image(raw, EPISODE_SIZE))
         except Exception as exc:  # noqa: BLE001 -- a lost frame never touches the task
             self.error = repr(exc)
+
+    def _episode_frame(self, img) -> None:
+        import numpy as np
+        if self._ep is None:
+            try:
+                import imageio.v2 as imageio
+                import imageio_ffmpeg  # noqa: F401
+            except ImportError:      # gif would be huge: no episode video without ffmpeg
+                self.episode = False
+                return
+            self.seed_dir.mkdir(parents=True, exist_ok=True)
+            self._ep = imageio.get_writer(str(self.seed_dir / "episode.tmp.mp4"), fps=FPS, format="FFMPEG",
+                                          codec="libx264", macro_block_size=None)
+        self._ep.append_data(np.asarray(img))
+        self._ep_frames += 1
+
+    def close_episode(self) -> dict | None:
+        """End of the episode: finalise ``episode.mp4`` and index it as the pseudo-node
+        ``episode`` (so the board's media list carries it). None when nothing streamed."""
+        if self._ep is None:
+            return None
+        writer, self._ep = self._ep, None
+        try:
+            writer.close()
+            path = self.seed_dir / "episode.mp4"
+            os.replace(self.seed_dir / "episode.tmp.mp4", path)
+            entry = {"file": path.name, "bytes": path.stat().st_size, "frames": self._ep_frames,
+                     "fps": FPS, "ts": time.time()}
+            _index(self.seed_dir, "episode", entry)
+            return entry
+        except Exception as exc:  # noqa: BLE001 -- a lost video never touches the task
+            self.error = repr(exc)
+            return None
 
     def stop(self) -> None:
         if self._untap is not None:
@@ -152,15 +195,17 @@ class SegmentRecorder:
 
 def recorder_for(brief: Any, seed: int) -> SegmentRecorder | None:
     """A recorder when the brief names a ``media_dir`` (the runtime sets it for
-    evolve/suite briefs and for a task brief with ``media: true``); else None."""
+    evolve/suite briefs and for a task brief with ``media: true``); else None.
+    ``media_episode: true`` adds the whole-episode video."""
     root = brief.get("media_dir")
-    return SegmentRecorder(root, brief.get("task", "task"), seed) if root else None
+    return SegmentRecorder(root, brief.get("task", "task"), seed,
+                           episode=bool(brief.get("media_episode"))) if root else None
 
 
 # -- helpers -------------------------------------------------------------------
 
-def _to_image(raw: Any):
-    """A frame from any source shape -> SIZE x SIZE PIL RGB image. ``bytes`` is
+def _to_image(raw: Any, size: int = SIZE):
+    """A frame from any source shape -> size x size PIL RGB image. ``bytes`` is
     a packed SIZE*SIZE*3 RGB buffer (the stdlib-only fake); anything else is an
     HxWx3 uint8 array."""
     if raw is None:
@@ -175,8 +220,8 @@ def _to_image(raw: Any):
         img = Image.fromarray(np.ascontiguousarray(np.asarray(raw, dtype=np.uint8)))
     if img.mode != "RGB":
         img = img.convert("RGB")
-    if img.size != (SIZE, SIZE):
-        img = img.resize((SIZE, SIZE))
+    if img.size != (size, size):
+        img = img.resize((size, size))
     return img
 
 

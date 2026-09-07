@@ -203,7 +203,7 @@ class EpisodeContext:
     def __exit__(self, _exc_type, exc, _traceback):
         try:
             self.close()
-        except BaseException as cleanup_error:  # noqa: BLE001 -- retain the original execution failure
+        except BaseException as cleanup_error:
             if exc is None:
                 raise
             exc.add_note(f"Episode cleanup also failed: {cleanup_error!r}")
@@ -1175,6 +1175,8 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
                           node=fault.get("node"), msg=fault.get("msg"))
             brief = {**brief, "fault": fault}
 
+        if ctx.media is not None:   # the whole-episode video, when the brief asked for one
+            ctx.media.close_episode()
         terminal_observation = {"authority": "embodiment.terminal_success", "source": embodiment,
                                 "mounted_ref": env_ref, "success": None}
         if episode is not None:
