@@ -95,7 +95,7 @@ MIN_FREE_BYTES = 5 * 1024 ** 3
 #: ``[tunables]`` the stock card (not the copy) is read from anyway.
 PROTECTED = ("predicates.py", "manifest.toml")
 MAX_LOG_LINES = 60
-MAX_CONTEXT_CHARS = 400_000
+MAX_CONTEXT_CHARS = 250_000   # ~70k tokens: the model has a 128k window and each read is long
 MAX_IMAGES = 6
 
 
@@ -496,6 +496,11 @@ class Workspace:
         p.write_text(text)
         return f"{rel} written ({len(text.split(chr(10)))} lines)"
 
+    def digest(self) -> str:
+        """Content identity of the copy's .py files (what a run would execute)."""
+        return sha_json({str(q.relative_to(self.path)): _sha(q) for q in sorted(self.path.rglob("*.py"))
+                         if "__pycache__" not in q.parts})
+
     def protected_ok(self) -> str | None:
         for name in PROTECTED:
             a, b = self.path / name, self.stock / name
@@ -623,6 +628,7 @@ class Agent:
         for seed in baseline["seeds"]:
             self.last_runs[seed] = baseline
         self.probes: list[dict] = []
+        self.ran: dict[int, tuple] = {}   # seed -> (copy digest, knobs) of its last run
         self.usage = {"prompt": 0, "completion": 0}
         self.calls = 0
         self.actions: dict[str, int] = {}
@@ -774,6 +780,13 @@ class Agent:
                 raise ValueError("single-seed run budget exhausted: finish or give_up")
             if why := self.ws.protected_ok():
                 raise ValueError(why)
+            # the simulator is deterministic per seed: the same code and knobs give the same
+            # episode, so a repeat run buys nothing and is refused without spending a probe
+            identity = (self.ws.digest(), json.dumps(self.tunables, sort_keys=True))
+            if self.ran.get(seed) == identity:
+                raise ValueError(f"seed {seed} already ran with exactly this code and these knobs (see its result above); "
+                                 "edit something or run another seed")
+            self.ran[seed] = identity
             label = f"probe-{len(self.probes)}"
             self.probes.append({"seed": seed, "label": label})
             self.tick(phase="probe", probe_index=len(self.probes) - 1)
