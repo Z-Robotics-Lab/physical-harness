@@ -97,7 +97,7 @@ MIN_FREE_BYTES = 5 * 1024 ** 3
 PROTECTED = ("predicates.py", "manifest.toml")
 MAX_LOG_LINES = 60
 READ_MAX_LINES = 200
-MAX_CONTEXT_CHARS = 250_000   # ~70k tokens: the model has a 128k window and each read is long
+MAX_CONTEXT_CHARS = 120_000   # ~35k tokens per call; the round's conversation is resent on every call
 MAX_IMAGES = 6
 
 
@@ -368,7 +368,7 @@ def describe_suite(suite: dict, baseline: dict | None = None, logs: bool = True)
         out.append("failure clusters (first death, mode → seeds): "
                    + "; ".join(f"{k[0]} {k[1] or ''} → {v}" for k, v in fails.items()))
     if logs and suite.get("logs"):
-        out.append("log excerpt (fault / verify rows of the dying node):\n  " + "\n  ".join(suite["logs"][:20]))
+        out.append("log excerpt (fault / verify rows of the dying node):\n  " + "\n  ".join(suite["logs"][-8:]))
     return "\n".join(out)
 
 
@@ -558,13 +558,19 @@ class Notebook:
         with self.path.open("a") as f:
             f.write(text.rstrip("\n") + "\n\n")
 
-    def text(self, limit: int = 30_000) -> str:
+    def text(self, limit: int = 12_000, diffs: int = 2) -> str:
+        """The brief's view of the notebook: full entries for the last ``diffs`` rounds, older
+        entries without their diff block (accepted diffs live on in the incumbent's code),
+        the oldest collapsed to their header line once ``limit`` is reached. Resent on every
+        model call, so it is the one piece of context worth keeping small."""
         if not self.path.exists():
             return "(no previous rounds)"
-        body = self.path.read_text()
+        entries = re.split(r"(?m)^(?=## Round )", self.path.read_text())
+        entries = [re.sub(r"```diff\n.*?\n```\n?", "- diff: (see the incumbent's code)\n", e, flags=re.DOTALL)
+                   if i < len(entries) - diffs else e for i, e in enumerate(entries)]
+        body = "".join(entries)
         if len(body) <= limit:
             return body
-        entries = re.split(r"(?m)^(?=## Round )", body)
         kept, size = [], 0
         for e in reversed(entries):
             if size + len(e) > limit:
@@ -595,8 +601,11 @@ Method (one hypothesis at a time):
    runs EVERY development seed paired against the incumbent; the edit is accepted only
    if some milestone or task success is newly gained and none regresses on any seed.
 
-Reply with exactly ONE JSON object per turn, no prose outside it. Inside JSON strings
-escape double quotes (or quote code with single quotes); an unparsable reply wastes an action.
+Reply with ONE JSON object per turn, no prose outside it. Inside JSON strings escape
+double quotes (or quote code with single quotes); an unparsable reply wastes an action.
+To save round trips send several actions at once as {{"actions": [{{...}}, {{...}}]}}: reads,
+greps and edits run in order and return together; the batch stops at its first error or
+at a run. Keep "thought" to two sentences; the notebook, not the chat, is your memory.
   {{"thought": "...", "action": "read", "path": "drivers.py", "start": 1, "end": 120}}
   {{"action": "grep", "pattern": "<regex over the copy's .py files>", "path": "<optional one file>"}}
   {{"action": "edit", "path": "<file>", "old": "<snippet occurring exactly once>", "new": "<replacement>"}}
@@ -615,17 +624,21 @@ def _text(content) -> str:
         p.get("text", "[image]") for p in content if isinstance(p, dict) and p.get("type") != "image_url") or "[image]"
 
 
-def _parse_action(raw: str) -> dict:
+def _parse_actions(raw: str) -> list[dict]:
+    """One action ``{"action": ...}`` or a batch ``{"actions": [...]}`` / ``[...]``."""
     try:
         v = json.loads(raw)
     except ValueError:
-        i = raw.find("{")
+        i = min((k for k in (raw.find("{"), raw.find("[")) if k >= 0), default=-1)
         if i < 0:
             raise ValueError("reply contains no JSON object")
         v, _ = json.JSONDecoder().raw_decode(raw[i:])
-    if not isinstance(v, dict) or not isinstance(v.get("action"), str):
-        raise TypeError('reply must be a JSON object with an "action" string')
-    return v
+    if isinstance(v, dict) and isinstance(v.get("actions"), list):
+        v = v["actions"]
+    batch = v if isinstance(v, list) else [v]
+    if not batch or any(not isinstance(a, dict) or not isinstance(a.get("action"), str) for a in batch):
+        raise TypeError('reply must be a JSON object with an "action" string, or {"actions": [...]} of them')
+    return batch
 
 
 class Agent:
@@ -768,22 +781,39 @@ class Agent:
             self.raw.append(raw)
             self.messages.append({"role": "assistant", "content": raw})
             steps += 1
+            # a batch runs to its end, its first error, or its first run/finish/give_up; every
+            # executed action counts against the budget, the results come back as ONE message
+            outputs, images = [], []
             try:
-                act = _parse_action(raw)
+                batch = _parse_actions(raw)
+            except Exception as exc:  # noqa: BLE001 -- an unparsable reply is feedback, not a crash
+                batch, outputs = [], [f"error: {exc}"]
+                self.errors.append(outputs[0][:300])
+            for k, act in enumerate(batch):
                 name = act["action"]
                 self.actions[name] = self.actions.get(name, 0) + 1
+                steps += 1 if k else 0
                 if name == "finish":
                     result = {"status": "finished", "summary": str(act.get("summary") or act.get("thought") or "")[:600],
                               "reason": "finish"}
-                elif name == "give_up":
+                    break
+                if name == "give_up":
                     result = {"status": "gave_up", "reason": str(act.get("reason") or act.get("thought") or "give_up")[:600]}
-                else:
+                    break
+                head = f"[{k + 1}/{len(batch)} {name}] " if len(batch) > 1 else ""
+                try:
                     text, images = self._tool(name, act)
-                    self._user(text, images)
-            except Exception as exc:  # noqa: BLE001 -- a wrong action is feedback, not a crash
-                msg = f"error: {exc}"
-                self.errors.append(msg[:300])
-                self._user(msg + f"\n({self.max_steps - steps} actions left)")
+                    outputs.append(head + text)
+                except Exception as exc:  # noqa: BLE001 -- a wrong action is feedback, not a crash
+                    msg = f"{head}error: {exc}"
+                    self.errors.append(msg[:300])
+                    outputs.append(msg + (" (rest of the batch skipped)" if k + 1 < len(batch) else ""))
+                    break
+                if name == "run" and k + 1 < len(batch):
+                    outputs.append("(read this result before the rest of the batch; it was skipped)")
+                    break
+            if result is None:
+                self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} actions left)", images)
             self._persist("running")
         self._persist(result["status"], result)
         return result
