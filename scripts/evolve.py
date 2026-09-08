@@ -706,6 +706,8 @@ class Agent:
                  tick, frontier: str | None = None, evaluate=None, max_evals: int = 3) -> None:
         self.frontier = frontier
         self.evaluate_cb, self.max_evals, self.evals = evaluate, max_evals, 0
+        # reads are free of the change budget but not of tokens: the call cap bounds a round
+        self.max_calls = max_steps + 20
         self.last_eval_identity = None   # (copy digest, knobs) of the last evaluated state
         # ``tunables`` = the OVERRIDE_ENV document, keyed by the card PACKAGE so it reaches
         # every provider the card hosts (harness.manifest.mount_params); ``knobs`` = the
@@ -727,7 +729,7 @@ class Agent:
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
         self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes,
-                                                                     max_calls=2 * max_steps, max_evals=max_evals)},
+                                                                     max_calls=max_steps + 20, max_evals=max_evals)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
         self.raw: list[str] = []
 
@@ -795,7 +797,7 @@ class Agent:
             if self.cancelled():
                 result = {"status": "cancelled", "reason": "cancelled at an agent step"}
                 break
-            if steps >= self.max_steps or self.calls >= 2 * self.max_steps:
+            if steps >= self.max_steps or self.calls >= self.max_calls:
                 result = ({"status": "finished", "summary": "(action budget exhausted; evaluating the edits as they stand)",
                            "reason": "steps_exhausted"} if self.ws.changed() or self.knobs != self.knobs_from
                           else {"status": "exhausted", "reason": "action budget exhausted without an edit"})
@@ -887,7 +889,7 @@ class Agent:
                     break
             if result is None:
                 self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} changes left, "
-                           f"{max(0, 2 * self.max_steps - self.calls)} calls left)", images)
+                           f"{max(0, self.max_calls - self.calls)} calls left)", images)
             self._persist("running")
         self._persist(result["status"], result)
         return result
