@@ -642,6 +642,32 @@ class Workspace:
                         for q in sorted(root.rglob("*.py")) if "__pycache__" not in q.parts]
         return out
 
+    def outline(self, limit: int = 6_000) -> str:
+        """Every file's classes (with their methods), top-level functions and CONSTANTS with
+        line numbers -- the map a round otherwise spends 40 reads and greps rebuilding.
+        The mission card's files follow under ``mission/``."""
+        roots = [(self.path, "")] + ([(self.mission, "mission/")] if self.mission else [])
+        out = []
+        for root, prefix in roots:
+            for q in sorted(root.glob("*.py")):
+                try:
+                    src = q.read_text()
+                    tree = ast.parse(src)
+                except (OSError, SyntaxError):
+                    continue
+                items = []
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef):
+                        meths = [f"{m.name} {m.lineno}" for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                        items.append(f"class {node.name} {node.lineno} [{', '.join(meths)}]")
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        items.append(f"def {node.name} {node.lineno}")
+                    elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) and t.id.isupper() for t in node.targets):
+                        items.append(f"{node.targets[0].id} {node.lineno}")
+                out.append(f"{prefix}{q.name} ({src.count(chr(10)) + 1} lines): " + "; ".join(items))
+        text = "\n".join(out)
+        return text if len(text) <= limit else text[:limit] + "\n... (outline truncated)"
+
     def _readable(self, rel: str) -> Path:
         """``mission/<file>`` and ``stock/<file>`` read the frozen cards; anything else is the copy."""
         for prefix, root in (("mission/", self.mission), ("stock/", self.stock)):
@@ -976,7 +1002,8 @@ class Agent:
     def _brief(self, notebook: str, proposal: dict | None):
         frontier = self.frontier or ""
         text = [f"# Task: {self.baseline['task']}  (development seeds {self.dev_seeds}; arm {self.baseline.get('arm')})",
-                "Card copy files:\n  " + "\n  ".join(self.ws.files()),
+                "## Card copy outline (file (lines): classes [methods line], defs, CONSTANTS -- read by line range)\n"
+                + self.ws.outline(),
                 "Declared tunables (current effective values; change with the tunable action): "
                 + json.dumps(self.knobs, sort_keys=True),
                 "## Incumbent on the development seeds (what you must beat)\n" + describe_suite(self.baseline),
