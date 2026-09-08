@@ -462,7 +462,7 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict 
         lines.append(f"  upstream segment {u['node']} ended at base {(u.get('trace_end') or {}).get('base')} "
                      f"({u.get('steps')} steps)")
     if dead and dead.get("geometry"):
-        lines.append(f"  target geometry: {json.dumps(dead['geometry'], default=str)[:400]}")
+        lines.append(f"  target geometry: {json.dumps(dead['geometry'], default=str)[:900]}")
     if dead and dead.get("scene"):
         base = (dead.get("trace_end") or {}).get("base") or (dead.get("motion_end") or {}).get("base")
         if base:
@@ -809,6 +809,11 @@ Method (one hypothesis at a time):
    hypothesis).
 2. Localise the cause at the highest layer that explains it (a recovery or approach
    decision before a numeric knob). Read the code that produced the observed numbers.
+   Instrument when the evidence does not say WHICH condition failed: whatever a stage
+   puts in its provenance() dict shows up in the dying node's "target geometry" line,
+   and its failure_mode string in the trail -- add the sub-conditions of done(), the
+   object pose at release, anything you would print in a debugger, then run from the
+   dying node and read them. Predicates are frozen; watching them is not editing them.
 3. Make the smallest edit that tests the hypothesis; run the failing seed (from its death
    node when nothing before it changed) AND a passing seed before evaluating; read the
    result; iterate.
@@ -851,7 +856,8 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "finish", "summary": "<what changed and why, <=600 chars>"}}
   {{"action": "give_up", "reason": "..."}}
 Budget this round: {max_steps} changes (edit/write/tunable/run count; read/grep/trace are free,
-model calls are capped at {max_calls}), {max_probes} single-seed runs. finish is free.
+model calls are capped at {max_calls}), {max_probes} full single-seed runs plus {max_replays} replays
+(run with "from"). finish is free.
 """
 
 
@@ -926,6 +932,7 @@ class Agent:
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
         self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes,
+                                                                     max_replays=2 * max_probes,
                                                                      max_calls=max_steps + 20, max_evals=max_evals)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
         self.raw: list[str] = []
@@ -1240,11 +1247,15 @@ class Agent:
             for seed in seeds:
                 if isinstance(seed, bool) or not isinstance(seed, int) or seed not in self.dev_seeds:
                     raise ValueError(f"run.seed must be one of the development seeds {self.dev_seeds}")
-            if len(self.probes) + len(seeds) > self.max_probes:
-                raise ValueError(f"single-seed run budget exhausted ({self.max_probes - len(self.probes)} left): finish or give_up")
+            node = a.get("from")
+            # replays are cheap: they have their own budget (twice the full-run one)
+            used = sum(1 for p in self.probes if bool(p.get("from")) == bool(node))
+            cap = 2 * self.max_probes if node else self.max_probes
+            if used + len(seeds) > cap:
+                raise ValueError(f"{'replay' if node else 'full single-seed run'} budget exhausted ({cap - used} left): "
+                                 + ("try a full run, " if node else "try a replay (run with from), ") + "finish or give_up")
             if why := self.ws.protected_ok():
                 raise ValueError(why)
-            node = a.get("from")
             replay: dict[str, str] = {}
             if node:
                 for seed in seeds:
