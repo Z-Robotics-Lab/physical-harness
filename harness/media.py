@@ -57,6 +57,7 @@ class SegmentRecorder:
         self.big: list[Any] = []      # the same frames at KEYFRAME_SIZE, for the failure keyframes
         self.motion: list[dict] = []  # [{step, base:[x,y,yaw], eef:[x,y,z]}] of the running segment
         self.scene: dict | None = None
+        self.contacts_start: dict | None = None
         self._env = None
         self._src = None
         self._driver = None
@@ -70,6 +71,7 @@ class SegmentRecorder:
         self.frames, self.big, self.motion, self._n, self.error = [], [], [], 0, None
         self._driver, self._env = driver, env
         self.scene = read_scene(env)   # the layout at segment start (objects move; fixtures do not)
+        self.contacts_start = read_contacts(env)   # what is in the hand / on the floor as the segment begins
         emb = getattr(embodiment, "frame", None)
         src = getattr(driver, "frame", None) or getattr(env, "frame", None)
         # one callable(obs): the embodiment reads the obs, the legacy sources ignore it
@@ -199,8 +201,11 @@ class SegmentRecorder:
         # where the task objects ended up (a released object may have rolled or fallen)
         objects = {k: v["pos"] for k, v in (read_scene(self._env) or {}).items() if k.startswith("obj:")} \
             if self._env is not None else {}
+        contacts_end = read_contacts(self._env) if self._env is not None else None
+        contacts, self.contacts_start = ({"start": self.contacts_start, "end": contacts_end}
+                                         if contacts_end or self.contacts_start else None), None
         extra = {**({"motion": motion} if motion else {}), **({"scene": scene} if scene else {}),
-                 **({"objects_end": objects} if objects else {})}
+                 **({"objects_end": objects} if objects else {}), **({"contacts": contacts} if contacts else {})}
         path = self.keep(node) if ok else None
         if path is not None:
             return {"kept": True, "file": str(path.relative_to(self.root)), **extra}
@@ -253,6 +258,44 @@ def read_scene(env: Any) -> dict | None:
             with contextlib.suppress(Exception):
                 out[f"obj:{name}"] = {"pos": [round(float(v), 3) for v in sim.data.body_xpos[bid][:3]]}
     return out or None
+
+
+def read_contacts(env: Any) -> dict | None:
+    """Who touches whom, off the MuJoCo contact list: task objects in the gripper
+    (``hand``), on the floor (``floor``), fixtures the mobile base is pressed against
+    (``base``), and every task object's contact partners (``objects``). Duck-typed off
+    ``env.sim`` / ``env.obj_body_id`` (robocasa); None elsewhere. Bodies are named by
+    their MuJoCo body name minus the ``_main`` suffix."""
+    import contextlib
+    sim, objs = getattr(env, "sim", None), getattr(env, "obj_body_id", None)
+    if sim is None or not isinstance(objs, dict):
+        return None
+    out: dict = {"hand": [], "floor": [], "base": [], "objects": {}}
+    with contextlib.suppress(Exception):
+        m, d = sim.model, sim.data
+        by_body = {int(bid): name for name, bid in objs.items()}
+        short = lambda n: (n or "?").removesuffix("_main")
+        for i in range(int(d.ncon)):
+            c = d.contact[i]
+            b1, b2 = int(m.geom_bodyid[c.geom1]), int(m.geom_bodyid[c.geom2])
+            n1, n2 = m.body_id2name(b1) or "", m.body_id2name(b2) or ""
+            for obj_bid, other_bid, other in ((b1, b2, n2), (b2, b1, n1)):
+                if obj_bid in by_body:
+                    name = by_body[obj_bid]
+                    partner = by_body.get(other_bid, short(other))
+                    out["objects"].setdefault(name, [])
+                    if partner not in out["objects"][name]:
+                        out["objects"][name].append(partner)
+                    if other.startswith("gripper0") and name not in out["hand"]:
+                        out["hand"].append(name)
+                    if "floor" in other and name not in out["floor"]:
+                        out["floor"].append(name)
+            for base_name, other in ((n1, n2), (n2, n1)):
+                if base_name.startswith("mobilebase0") and not other.startswith(("robot0", "mobilebase0", "gripper0")):
+                    fx = by_body.get(int(m.geom_bodyid[c.geom2 if base_name == n1 else c.geom1]), short(other))
+                    if fx not in out["base"] and "floor" not in fx:
+                        out["base"].append(fx)
+    return out
 
 
 def read_pose(env: Any) -> dict | None:

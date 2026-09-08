@@ -263,6 +263,8 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
                 n["motion_end"] = motion[-1]
             if (diag.get("media") or {}).get("objects_end"):
                 n["objects_end"] = diag["media"]["objects_end"]
+            if (diag.get("media") or {}).get("contacts"):
+                n["contacts"] = diag["media"]["contacts"]   # harness.media.read_contacts at segment start / end
         _link_upstream(row["trail"], dead, skills)
         if dead:   # the layout around the death, once per seed (fixtures + objects, harness.media.read_scene)
             scene = ((nodes.get(dead) or {}).get("diagnostics") or {}).get("media", {}).get("scene")
@@ -444,6 +446,18 @@ def _node_line(n: dict, faults: int = 0) -> str:
     return s
 
 
+def _touch(c: dict | None) -> str:
+    """One phrase off a read_contacts dict: what is in the hand, on the floor, against the base."""
+    if not c:
+        return "?"
+    parts = [f"hand {c.get('hand') or '-'}"]
+    if c.get("floor"):
+        parts.append(f"floor {c['floor']}")
+    if c.get("base"):
+        parts.append(f"base↔{c['base']}")
+    return " ".join(parts)
+
+
 def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict | None = None) -> str:
     trail = s.get("trail") or []
     ran = [n for n in trail if n.get("ok") is not None]
@@ -457,6 +471,14 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict 
     lines = [head, "  " + " · ".join(_node_line(n, faults.get((str(seed), n["id"]), 0)) for n in ran)
              + (f" · ({left} nodes not reached)" if left else "")]
     dead = next((n for n in trail if n.get("id") == s.get("first_death")), None)
+    custody = [n for n in ran if n.get("contacts")]
+    if custody:   # what each segment left in the hand / on the floor: a carry that lost its object shows here
+        lines.append("  after each segment (contacts): " + " · ".join(
+            f"{n['id']}: {_touch((n['contacts'] or {}).get('end'))}" for n in custody))
+    if dead and dead.get("contacts"):
+        c = dead["contacts"]
+        lines.append(f"  contacts as {dead['id']} began: {_touch(c.get('start'))}; objects {json.dumps((c.get('start') or {}).get('objects'))}"
+                     f" | as it ended: {_touch(c.get('end'))}; objects {json.dumps((c.get('end') or {}).get('objects'))}")
     if dead and dead.get("upstream"):
         u = dead["upstream"]
         lines.append(f"  upstream segment {u['node']} ended at base {(u.get('trace_end') or {}).get('base')} "
@@ -1939,8 +1961,8 @@ def cluster_geometry(baseline: dict) -> str:
         return ""
     node = max(set(deaths), key=deaths.count)
     lines = [f"## {node} across seeds (the most common first death; passing seeds included)",
-             ("seed | outcome | steps | end: eef→target, base→target, target bearing from base yaw, arm extended | "
-              "base [x,y,yaw] | target | motion | stage geometry")]
+             ("seed | outcome | steps | in hand / on floor as the node began | end: eef→target, base→target, "
+              "target bearing from base yaw, arm extended | base [x,y,yaw] | target | motion | stage geometry")]
     for seed, s in baseline["seeds"].items():
         n = next((n for n in s.get("trail") or [] if n.get("id") == node), None)
         if not n:
@@ -1951,6 +1973,7 @@ def cluster_geometry(baseline: dict) -> str:
         base = end.get("base") or me.get("base")
         eef = end.get("eef") or me.get("eef")
         lines.append(f"{seed} | {'ok' if n.get('ok') else 'FAIL ' + str(n.get('failure_mode') or '')} | {n.get('steps')} | "
+                     f"{_touch((n.get('contacts') or {}).get('start'))} | "
                      f"{_f(end.get('d_eef_target'))}, {_f(end.get('d_base_target'))}, "
                      f"{_deg(_bearing(base, end.get('target')))}, {_f(_reach(base, eef))} | {base} | {end.get('target')} | "
                      f"{_phases(n) or '-'} | "
