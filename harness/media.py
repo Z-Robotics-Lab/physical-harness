@@ -92,7 +92,8 @@ class SegmentRecorder:
         if self._n % MOTION_EVERY == 0 and self._env is not None:
             pose = read_pose(self._env)
             if pose:
-                self.motion.append({"step": self._n, **pose})
+                hand = (read_contacts(self._env) or {}).get("hand")   # what the gripper holds, per sample
+                self.motion.append({"step": self._n, **pose, **({"hand": hand} if hand is not None else {})})
         if self._n % self.every or self._src is None:
             return
         try:

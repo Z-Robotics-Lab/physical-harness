@@ -263,6 +263,9 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
             if motion:
                 n["motion"] = motion[::max(1, len(motion) // 80)]
                 n["motion_end"] = motion[-1]
+                start_hand = (((diag.get("media") or {}).get("contacts") or {}).get("start") or {}).get("hand")
+                if lost := _hand_lost(motion, start_hand):   # an object the segment began holding left the gripper
+                    n["hand_lost"] = lost
             if (diag.get("media") or {}).get("objects_end"):
                 n["objects_end"] = diag["media"]["objects_end"]
             if (diag.get("media") or {}).get("contacts"):
@@ -423,6 +426,30 @@ def _phases(n: dict) -> str:
     return "; ".join(out)
 
 
+def _hand_lost(motion: list, held_at_start=None) -> dict | None:
+    """The first sample at which an object the segment began holding (its start contacts,
+    else its first sample) is no longer in the gripper, with how the base was moving just
+    before: ``{object, step, base, moved, turned}``."""
+    held = set(held_at_start if held_at_start is not None else ((motion[0].get("hand") if motion else None) or []))
+    if not held or not motion:
+        return None
+    if gone := held - set(motion[0].get("hand") or []):
+        return {"object": min(gone), "step": motion[0].get("step"), "base": motion[0].get("base"),
+                "eef": motion[0].get("eef"), "moved": None, "turned": None, "steps": motion[0].get("step", 0),
+                "note": "gone by the first sample: released at the very start of the segment"}
+    for i in range(1, len(motion)):
+        gone = held - set(motion[i].get("hand") or [])
+        if gone:
+            a, b = motion[i - 1], motion[i]
+            moved = turned = None
+            if isinstance(a.get("base"), list) and isinstance(b.get("base"), list):
+                moved = round(math.dist(a["base"][:2], b["base"][:2]), 3)
+                turned = round(abs((b["base"][2] - a["base"][2] + math.pi) % (2 * math.pi) - math.pi), 3)
+            return {"object": min(gone), "step": b.get("step"), "base": b.get("base"), "eef": b.get("eef"),
+                    "moved": moved, "turned": turned, "steps": b.get("step", 0) - a.get("step", 0)}
+    return None
+
+
 def _node_line(n: dict, faults: int = 0) -> str:
     mark = {True: "ok", False: "FAIL", None: "-"}[n.get("ok")]
     s = f"{'⟲' if n.get('replayed') else ''}{n['id']} {mark}"
@@ -445,6 +472,10 @@ def _node_line(n: dict, faults: int = 0) -> str:
         s += f" [d_eef {_f(end.get('d_eef_target'))} d_base {_f(end.get('d_base_target'))}]"
     if n.get("ok") is not True and (ph := _phases(n)):
         s += f" [{ph}]"
+    if lost := n.get("hand_lost"):
+        s += f" ✗ {lost['object']} LEFT THE HAND at step {lost['step']} (base {lost.get('base')}, eef {lost.get('eef')}; "
+        s += (lost["note"] if lost.get("note") else
+              f"over the previous {lost.get('steps')} steps the base moved {_f(lost.get('moved'))} m and turned {_f(lost.get('turned'))} rad") + ")"
     return s
 
 
