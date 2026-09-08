@@ -131,7 +131,8 @@ def test_round_one_edits_the_copy_and_is_accepted_round_two_gives_up(runtime, tw
     assert r1["probes"][0]["compare"]["gains"] == ["1:grab-0", "1:task"]
     assert r1["usage"]["model_calls"] == 5 and r1["usage"]["episode_attempts"] == 2 + 1 + 2 + 2 + 2
     # the incumbent IS the edited copy; the next round starts from it
-    assert doc["incumbent"] == {"workspace": f"campaigns/evolve-{TASK}/work/r1", "round": 1, "tunables": {}}
+    assert doc["incumbent"] == {"workspace": f"campaigns/evolve-{TASK}/work/r1e1", "round": 1, "tunables": {}}
+    assert [e["accepted"] for e in r1["evaluations"]] == [True] and r1["evaluations"][0]["gains"] == ["1:grab-0", "1:task", "2:grab-0", "2:task"]
     ws = runtime.session / doc["incumbent"]["workspace"]
     assert "STOP = 0.3" in (ws / "stage.py").read_text() and (ws / "predicates.py").read_text().count("FROZEN = True")
     assert "STOP = 0.3" in (runtime.session / f"campaigns/evolve-{TASK}/work/r2" / "stage.py").read_text()
@@ -237,17 +238,24 @@ def _row(ok: list, success: bool, kinds=None) -> dict:
     return {"success": success, "trail": [{"id": f"n{i}", "kind": k, "ok": o} for i, (k, o) in enumerate(zip(kinds, ok))]}
 
 
-def test_compare_accepts_only_a_gain_without_any_regression():
+def test_compare_accepts_a_net_milestone_gain_but_never_a_lost_success():
     # verify nodes (n1, n3) are the milestones; segment nodes' self-reports are not
     before = {"seeds": {"1": _row([True, True, True, False], False), "2": _row([True, True, None, None], False)}}
     assert evolve.milestones(before["seeds"]["1"]) == {"n1": True, "n3": False, "task": False}
     gain = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, True, None, None], False)}}
-    assert evolve.compare(before, gain) == {"gains": ["1:n3", "1:task"], "regressions": [], "accepted": True}
-    trade = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, True, True, False], False)}}
-    assert evolve.compare(before, trade)["accepted"] is True     # seed 2 unchanged on its milestones
+    assert evolve.compare(before, gain) == {"gains": ["1:n3", "1:task"], "regressions": [], "lost_success": [], "accepted": True}
+    # a trade that gains more than it loses is progress
     swap = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, False, None, None], False)}}
-    assert evolve.compare(before, swap) == {"gains": ["1:n3", "1:task"], "regressions": ["2:n1"], "accepted": False}
-    assert evolve.compare(before, before) == {"gains": [], "regressions": [], "accepted": False}
+    assert evolve.compare(before, swap) == {"gains": ["1:n3", "1:task"], "regressions": ["2:n1"], "lost_success": [], "accepted": True}
+    # an even trade is not
+    even = {"seeds": {"1": _row([True, True, True, True], False), "2": _row([True, False, None, None], False)}}
+    assert evolve.compare(before, even)["accepted"] is False
+    # a seed that had completed the whole task must keep completing it, whatever else is gained
+    done = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, True, None, None], False)}}
+    breaks = {"seeds": {"1": _row([True, True, True, False], False), "2": _row([True, True, True, True], True)}}
+    c = evolve.compare(done, breaks)
+    assert c["lost_success"] == ["1"] and c["accepted"] is False and c["gains"] == ["2:n3", "2:task"]
+    assert evolve.compare(before, before)["accepted"] is False
     assert evolve.compare(before, {"seeds": {}})["regressions"] == ["1:n1", "2:n1"]   # unmeasured = lost
     # no verify kind: every node's ok is the oracle's verify row
     seg = {"seeds": {"1": _row([True, False], False, ["segment", "segment"])}}

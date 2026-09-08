@@ -67,16 +67,19 @@ returns the available model IDs and configured efforts without credentials.
 
 `kind:"evolve"` is the LLM repair loop (evolution mode only). One round = one
 agent session over a WORKING COPY of the card package that drives the task: the
-model reads the card's source, edits it, runs single development seeds (`run`),
-reads the milestone trail / stall geometry / failure keyframes, and calls
-`finish`. `finish` runs the full paired development suite against the incumbent;
-the copy is accepted iff some frozen verify milestone (or task success) is newly
-gained on a seed and none regresses on any seed; a whole-task gain is re-checked
-on fresh development seeds. Accepted copies are the next round's starting point;
+model reads the card's source (and, read-only, the mission card), edits it, runs
+development seeds (`run`), reads the milestone trail / pose trace / failure
+keyframes, and calls `evaluate` (up to `max_evals` per round; `finish` ends the
+round). An evaluation runs the full paired development suite against the
+incumbent; accepted iff more frozen milestones are gained than lost across the
+seeds and no seed that completed the task before fails it now; a whole-task gain
+is re-checked on fresh development seeds. An accepted state becomes the incumbent
+at once (snapshot under `work/`) and the session continues on top of it;
 `campaigns/evolve-<task>/notebook.md` (hypothesis, diff, measured outcome per
 round) is the memory the next round reads. `predicates.py` and the mission
 planner are frozen; the harness never trains weights or installs skills. Budgets
-are `max_steps` (agent actions) and `max_probes` (single-seed runs) per round;
+are `max_steps` (edits/knobs/runs; reads are free), `max_probes` (single-seed
+runs) and `max_evals` per round;
 `rounds:0` or `continuous:true` runs until cancelled. Suites run in a child
 process whose imports map the card package onto the copy (`PH_MODULE_OVERLAY`).
 Outside proposals (`submit_proposal`) are handed to the agent as an instruction

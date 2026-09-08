@@ -296,16 +296,23 @@ def milestones(row: dict) -> dict[str, bool]:
 
 def compare(before: dict, after: dict) -> dict:
     """Paired, per seed: gains = milestones newly passed, regressions = milestones lost.
-    Accepted iff any gain and no regression on ANY seed. Missing after-rows regress."""
-    gains, losses = [], []
+    Accepted iff the net milestone count rises (more gained than lost) AND no seed that
+    completed the whole task before fails it now (``lost_success``). Trading a partial
+    milestone on one seed for two on another is progress; losing a finished seed is not.
+    Missing after-rows regress."""
+    gains, losses, lost_success = [], [], []
     for seed, b in before["seeds"].items():
-        mb, ma = milestones(b), milestones((after.get("seeds") or {}).get(seed) or {})
+        a = (after.get("seeds") or {}).get(seed) or {}
+        mb, ma = milestones(b), milestones(a)
         for k in sorted(set(mb) | set(ma)):
             if ma.get(k) and not mb.get(k):
                 gains.append(f"{seed}:{k}")
             elif mb.get(k) and not ma.get(k):
                 losses.append(f"{seed}:{k}")
-    return {"gains": gains, "regressions": losses, "accepted": bool(gains) and not losses}
+        if b.get("success") and not a.get("success"):
+            lost_success.append(str(seed))
+    return {"gains": gains, "regressions": losses, "lost_success": lost_success,
+            "accepted": len(gains) > len(losses) and not lost_success}
 
 
 def score(suite: dict) -> list:
@@ -431,10 +438,11 @@ class Workspace:
     """A copy of the card package the agent edits. ``stock`` is the installed card
     (the protected files must stay byte-identical to it)."""
 
-    def __init__(self, path: Path, stock: Path, parent: Path | None = None) -> None:
+    def __init__(self, path: Path, stock: Path, parent: Path | None = None, mission: Path | None = None) -> None:
         # absolute throughout: the tools accept relative OR absolute paths inside the copy
         self.path, self.stock = Path(path).resolve(), Path(stock).resolve()
         self.parent = Path(parent).resolve() if parent else self.stock   # what ``diff``/``changed`` compare against
+        self.mission = Path(mission).resolve() if mission else None      # the task's mission card: readable, never editable
 
     @classmethod
     def create(cls, path: Path, source: Path, stock: Path) -> Workspace:
@@ -456,10 +464,24 @@ class Workspace:
             if p.is_file() and "__pycache__" not in p.parts:
                 rel = str(p.relative_to(self.path))
                 out.append(f"{rel} ({p.stat().st_size} B{', protected' if p.name in PROTECTED else ''})")
+        for prefix, root in (("mission", self.mission), ("stock", self.stock)):
+            if root and root != self.path:
+                out += [f"{prefix}/{q.relative_to(root)} ({q.stat().st_size} B, read-only)"
+                        for q in sorted(root.rglob("*.py")) if "__pycache__" not in q.parts]
         return out
 
+    def _readable(self, rel: str) -> Path:
+        """``mission/<file>`` and ``stock/<file>`` read the frozen cards; anything else is the copy."""
+        for prefix, root in (("mission/", self.mission), ("stock/", self.stock)):
+            if rel.startswith(prefix) and root:
+                q = (root / rel[len(prefix):]).resolve()
+                if not q.is_relative_to(root) or not q.is_file():
+                    raise ValueError(f"{rel!r} is not a file of the {prefix[:-1]} card")
+                return q
+        return self._resolve(rel)
+
     def read(self, rel: str, start: int = 1, end: int | None = None) -> str:
-        lines = self._resolve(rel).read_text().split("\n")
+        lines = self._readable(rel).read_text().split("\n")
         a = max(1, int(start or 1))
         b = min(len(lines), int(end) if end else len(lines), a + READ_MAX_LINES - 1)   # bounded: read again for more
         if a > len(lines):
@@ -623,9 +645,14 @@ Method (one hypothesis at a time):
    decision before a numeric knob). Read the code that produced the observed numbers.
 3. Make the smallest edit that tests the hypothesis; run the failing seed; read the
    result; iterate. Do not repeat an experiment the notebook already records.
-4. When the failing seed gains its milestone without losing any, call finish. finish
-   runs EVERY development seed paired against the incumbent; the edit is accepted only
-   if some milestone or task success is newly gained and none regresses on any seed.
+4. When a state looks better, call evaluate: it runs EVERY development seed paired against
+   the incumbent. Accepted iff more milestones are gained than lost across all seeds AND no
+   seed that completed the whole task before fails it now. An accepted state becomes the
+   incumbent immediately and you keep working on top of it (up to {max_evals} evaluations
+   per round). finish ends the round (evaluating the current state if it changed since the
+   last evaluate); give_up ends it without evaluating.
+The mission card (planner, verify predicates, recovery table) is readable as mission/<file>
+and the stock card as stock/<file>; neither is editable.
 
 Reply with ONE JSON object per turn, no prose outside it. Inside JSON strings escape
 double quotes (or quote code with single quotes); an unparsable reply wastes an action.
@@ -639,6 +666,8 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "tunable", "name": "<declared knob>", "value": <number>}}
   {{"action": "trace", "seed": <seed>, "node": "<node id>"}}   per-step motion series of that node in its last run
   {{"action": "run", "seed": <development seed>}}                one episode of the copy on that seed
+  {{"action": "run", "seeds": [<seed>, <seed>]}}                  several seeds at once (one probe each)
+  {{"action": "evaluate", "summary": "<what changed and why, <=600 chars>"}}   the paired suite; accepted = incumbent
   {{"action": "finish", "summary": "<what changed and why, <=600 chars>"}}
   {{"action": "give_up", "reason": "..."}}
 Budget this round: {max_steps} changes (edit/write/tunable/run count; read/grep/trace are free,
@@ -674,8 +703,10 @@ class Agent:
     def __init__(self, ep, ws: Workspace, *, pkg: str, tunables: dict, knobs: dict, run_seed,
                  dev_seeds: list[int], baseline: dict, session: Path, notebook: str, proposal: dict | None,
                  max_steps: int, max_probes: int, max_tokens: int, options: dict, cancelled, audit_path: Path,
-                 tick, frontier: str | None = None) -> None:
+                 tick, frontier: str | None = None, evaluate=None, max_evals: int = 3) -> None:
         self.frontier = frontier
+        self.evaluate_cb, self.max_evals, self.evals = evaluate, max_evals, 0
+        self.last_eval_identity = None   # (copy digest, knobs) of the last evaluated state
         # ``tunables`` = the OVERRIDE_ENV document, keyed by the card PACKAGE so it reaches
         # every provider the card hosts (harness.manifest.mount_params); ``knobs`` = the
         # effective numeric values the agent sees and may change.
@@ -696,7 +727,7 @@ class Agent:
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
         self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes,
-                                                                     max_calls=2 * max_steps)},
+                                                                     max_calls=2 * max_steps, max_evals=max_evals)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
         self.raw: list[str] = []
 
@@ -829,6 +860,16 @@ class Agent:
                     result = {"status": "finished", "summary": str(act.get("summary") or act.get("thought") or "")[:600],
                               "reason": "finish"}
                     break
+                if name == "evaluate" and self.evaluate_cb is not None:
+                    head = f"[{k + 1}/{len(batch)} evaluate] " if len(batch) > 1 else ""
+                    try:
+                        outputs.append(head + self._evaluate(act))
+                    except Exception as exc:  # noqa: BLE001 -- feedback, not a crash
+                        outputs.append(f"{head}error: {exc}")
+                        self.errors.append(f"evaluate: {exc}"[:300])
+                    if k + 1 < len(batch):
+                        outputs.append("(read this verdict before the rest of the batch; it was skipped)")
+                    break
                 if name == "give_up":
                     result = {"status": "gave_up", "reason": str(act.get("reason") or act.get("thought") or "give_up")[:600]}
                     break
@@ -850,6 +891,44 @@ class Agent:
             self._persist("running")
         self._persist(result["status"], result)
         return result
+
+    def state_identity(self) -> tuple:
+        return (self.ws.digest(), json.dumps(self.tunables, sort_keys=True))
+
+    def _evaluate(self, a: dict) -> str:
+        """The paired suite on every development seed; an accepted state becomes the
+        incumbent at once and the session continues on top of it."""
+        if self.evals >= self.max_evals:
+            raise ValueError(f"evaluation budget exhausted ({self.max_evals} per round): finish or give_up")
+        if self.state_identity() == self.last_eval_identity:
+            raise ValueError("this exact state was already evaluated (see its verdict above)")
+        if not self.ws.changed_code() and self.knobs == self.knobs_from:
+            raise ValueError("nothing changed since the incumbent (comments/whitespace do not count)")
+        if why := self.ws.protected_ok():
+            raise ValueError(why)
+        self.evals += 1
+        self.last_eval_identity = self.state_identity()
+        self.tick(phase="retest", tried={"kind": "edit", "node": None})
+        try:
+            receipt = self.evaluate_cb(self.evals, str(a.get("summary") or a.get("thought") or "")[:600])
+        finally:
+            self.tick(phase="propose", llm_calls=self.calls)
+        if receipt.get("error"):
+            return f"evaluation {self.evals} failed to run: {receipt['error'][-1500:]}"
+        after = receipt["after"]
+        text = describe_suite(after, self.baseline, logs=False)
+        c = receipt["compare"]
+        verdict = (f"ACCEPTED: it is the incumbent now (gained {c['gains']}, lost {c['regressions']})" if receipt["accepted"]
+                   else f"REJECTED: {receipt['why']}")
+        if receipt["accepted"]:
+            self.baseline = after
+            self.knobs_from = dict(self.knobs)
+            for seed in after["seeds"]:
+                self.last_runs[seed] = after
+            self.ran = {}
+        conf = receipt.get("confirm")
+        return (f"evaluation {self.evals}/{self.max_evals} on all development seeds -- {verdict}"
+                + (f"\nfresh-seed check {conf}" if conf else "") + "\n" + text)
 
     def _tool(self, name: str, a: dict) -> tuple[str, list]:
         if name == "read":
@@ -887,6 +966,17 @@ class Agent:
             return (f"{node} on seed {seed}: {len(rows)} sampled steps (every {step}th shown)\n"
                     + "\n".join(json.dumps(r, default=str) for r in rows[::step])), []
         if name == "run":
+            if isinstance(a.get("seeds"), list):   # several seeds: each one is a probe, results together
+                texts, images = [], []
+                for seed in a["seeds"]:
+                    try:
+                        t, im = self._tool("run", {"seed": seed})
+                    except ValueError as exc:
+                        texts.append(f"seed {seed}: error: {exc}")
+                        break
+                    texts.append(t)
+                    images = im
+                return "\n\n".join(texts), images
             seed = a.get("seed")
             if isinstance(seed, bool) or not isinstance(seed, int) or seed not in self.dev_seeds:
                 raise ValueError(f"run.seed must be one of the development seeds {self.dev_seeds}")
@@ -918,7 +1008,7 @@ class Agent:
                                    compare=compare({"seeds": {str(seed): self.baseline["seeds"][str(seed)]}}, suite))
             text = describe_suite(suite, self.baseline)
             return text, keyframe_parts(self.session, suite, 3)
-        raise ValueError(f"unknown action {name!r}; use read/grep/edit/write/tunable/trace/run/finish/give_up")
+        raise ValueError(f"unknown action {name!r}; use read/grep/edit/write/tunable/trace/run/evaluate/finish/give_up")
 
 
 # ── campaign store ──────────────────────────────────────────────────────────────────
@@ -1057,13 +1147,14 @@ def main(argv=None) -> int:
     ap.add_argument("--llm-model")
     ap.add_argument("--llm-effort", default="off")
     ap.add_argument("--max-steps", type=int, default=40, help="agent actions per round")
-    ap.add_argument("--max-probes", type=int, default=6, help="single-seed runs per round")
+    ap.add_argument("--max-probes", type=int, default=8, help="single-seed runs per round")
+    ap.add_argument("--max-evals", type=int, default=3, help="paired evaluations per round (an accepted one moves the incumbent)")
     ap.add_argument("--max-output-tokens", type=int, default=8192,
                     help="per reply; with a thinking effort the reasoning shares this budget")
     args = ap.parse_args(argv)
     if args.suite:
         return _child_main(args.suite)
-    if args.rounds < 0 or args.max_steps < 1 or args.max_probes < 0:
+    if args.rounds < 0 or args.max_steps < 1 or args.max_probes < 0 or args.max_evals < 1:
         ap.error("rounds/probes must be nonnegative and steps positive")
     try:
         llm_params, thinking = model_request_config(args.llm_model, args.llm_effort)
@@ -1078,6 +1169,12 @@ def main(argv=None) -> int:
     if binding is None:
         raise SystemExit(f"no task binding for {args.task!r}")
     pkg, stock = card_package(binding)
+    mission_dir = None
+    try:   # the mission card (planner, verify predicates, recovery table): readable, never in the copy
+        mission_dir = Path(importlib.import_module(binding["planner"].partition(":")[0].rpartition(".")[0] or
+                                                   binding["planner"].partition(":")[0]).__file__).resolve().parent
+    except Exception:  # noqa: BLE001 -- a planner outside a package: nothing extra to read
+        mission_dir = None
     store = EvolveStore(args.session, args.task)
     doc = store.load() or {"task": args.task, "session": args.session.name, "seeds": list(args.seeds or [0, 1]),
                            "arm": args.arm, "rounds": [], "best": 0, "cursor": 0,
@@ -1139,7 +1236,7 @@ def main(argv=None) -> int:
             "task": args.task, "seeds": seed_list, "arm": arm, "skills_root": str(args.skills_root),
             "tunables": tunables,
             "media_dir": str(args.session / prefix) if media_on else None, "media_prefix": prefix,
-            "episode": label == "retest",
+            "episode": label.startswith("retest"),
             "budgets": budgets, "out": str(out_path), "cancel_marker": str(args.cancel_marker) if args.cancel_marker else None}))
         env = {**os.environ}
         env.pop(OVERLAY_ENV, None)
@@ -1209,6 +1306,7 @@ def main(argv=None) -> int:
         # the working copy: from the incumbent's copy, else the stock card
         ws_rel = f"campaigns/evolve-{args.task}/work/r{rnd}"
         ws = Workspace.create(args.session / ws_rel, inc_dir or stock, stock)
+        ws.mission = mission_dir
         tunables = copy.deepcopy(incumbent["tunables"])
         os.environ[OVERRIDE_ENV] = json.dumps(tunables)   # so mount_params reads the incumbent's knobs
         params = mount_params(binding["policy"])
@@ -1222,104 +1320,161 @@ def main(argv=None) -> int:
             doc.update(status="failed", stop_reason="model_error")
             tick(phase="failed", error=f"model endpoint: {exc}")
             return 5
+        before0, parent0 = before, ws.parent          # the round's starting point, for the row and the diff
+        evals: list[dict] = []
+        dev = list(range(seeds[0], seeds[1] + 1))
+
+        def evaluate_state(k: int, summary: str = "", *, ws=ws, tunables=tunables, dev=dev, evals=evals,
+                           before0=before0, rnd=rnd) -> dict:   # bound per round: the closure outlives no iteration
+            """The paired suite of the current copy on every development seed; an accepted
+            state is snapshotted and becomes the incumbent at once."""
+            nonlocal incumbent, before, inc_dir, base
+            receipt: dict = {"k": k, "summary": summary, "accepted": False, "confirm": None}
+            tick(phase="retest", tried={"kind": "edit", "node": before0["seeds"][str(seeds[0])].get("first_death")})
+            try:
+                after = suite(dev, ws.path, tunables, f"retest-{k}" if k > 1 else "retest")
+            except Exception as exc:
+                if cancelled():
+                    raise
+                receipt.update(error=str(exc)[-2000:], why=f"candidate suite failed: {str(exc)[-300:]}",
+                               compare={"gains": [], "regressions": [], "lost_success": [], "accepted": False})
+                evals.append(receipt)
+                return receipt
+            cmp = compare(before, after)
+            accepted = cmp["accepted"]
+            why = (f"gained {cmp['gains']}, lost {cmp['regressions']}" if accepted else
+                   f"a finished seed failed: {cmp['lost_success']}" if cmp["lost_success"] else
+                   f"lost {cmp['regressions']} for {cmp['gains']}: no net gain" if cmp["regressions"] or cmp["gains"] else
+                   "no milestone gained")
+            confirm = None
+            if accepted and after["count"] > before["count"] and args.confirm_seeds > 0:
+                cs = list(range(seeds[1] + 1, seeds[1] + 1 + args.confirm_seeds))
+                tick(phase="confirm")
+                try:
+                    cb = suite(cs, inc_dir, incumbent["tunables"], f"confirm-before-{k}", media_on=False)
+                    ca = suite(cs, ws.path, tunables, f"confirm-after-{k}", media_on=False)
+                    check = compare(cb, ca)
+                    confirm = {"seeds": cs, "before": cb["count"], "after": ca["count"], "regressions": check["regressions"]}
+                    if check["lost_success"] or len(check["regressions"]) > len(check["gains"]):
+                        accepted, why = False, f"fresh seeds {cs} regressed {check['regressions']}"
+                except Exception as exc:
+                    if cancelled():
+                        raise
+                    accepted, why = False, f"confirmation suite failed: {str(exc)[-300:]}"
+                    confirm = {"seeds": cs, "before": None, "after": None, "error": str(exc)[-500:]}
+                seeds[1] = cs[-1]
+                dev[:] = list(range(seeds[0], seeds[1] + 1))
+                tick(seeds_total=seeds[1] - seeds[0] + 1)
+            receipt.update(after=after, compare=cmp, accepted=accepted, why=why, confirm=confirm,
+                           before_count=before["count"], after_count=after["count"])
+            if accepted:
+                snap_rel = f"campaigns/evolve-{args.task}/work/r{rnd}e{k}"
+                snap = args.session / snap_rel
+                if snap.exists():
+                    shutil.rmtree(snap)
+                shutil.copytree(ws.path, snap, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                incumbent = doc["incumbent"] = {"workspace": snap_rel, "round": rnd, "tunables": copy.deepcopy(tunables)}
+                doc["best"] = max(int(doc["best"]), after["count"])
+                store.save(doc)
+                ws.parent = snap.resolve()
+                inc_dir = ws.parent
+                # the next comparison (and the next round's baseline) starts from the accepted state;
+                # a confirm that widened the seed range must be re-measured on the full range
+                before = after
+                base = None if confirm else after
+                receipt["snapshot"] = snap_rel
+            evals.append(receipt)
+            return receipt
+
         agent = Agent(ep, ws, pkg=pkg, tunables=tunables, knobs=dict(knobs_from),
                       run_seed=lambda sl, label, ws=ws, tunables=tunables: suite(sl, ws.path, tunables, label),
-                      dev_seeds=list(range(seeds[0], seeds[1] + 1)), baseline=before, session=args.session,
+                      dev_seeds=dev, baseline=before, session=args.session,
                       notebook=notebook.text(), proposal=prop, max_steps=args.max_steps, max_probes=args.max_probes,
                       max_tokens=args.max_output_tokens, options=thinking, cancelled=cancelled,
                       audit_path=store.dir / "llm" / f"round-{rnd}.json", tick=tick,
-                      frontier=failure_frontier(doc["rounds"], before, list(range(seeds[0], seeds[1] + 1))))
-        outcome = agent.loop()
+                      frontier=failure_frontier(doc["rounds"], before, dev),
+                      evaluate=evaluate_state, max_evals=args.max_evals)
+        try:
+            outcome = agent.loop()
+        except RuntimeError:   # a cancelled suite inside evaluate
+            outcome = {"status": "cancelled", "reason": "cancelled"}
         if outcome["status"] == "cancelled" or cancelled():
             doc.update(status="cancelled", stop_reason="cancelled")
             tick(phase="cancelled")
             return 3
-        after, compared, accepted, why, confirm, exc_text = None, None, False, outcome.get("reason") or "", None, None
-        diff = ws.diff()
         tun_changes = {k: v for k, v in agent.knobs.items() if knobs_from.get(k) != v}
-        parent_round = int(incumbent.get("round") or 0)
-        tried_kind = "none"
-        # the model finished, OR it became unusable (error / silence) with edits pending: the
-        # simulator does not need the model, so pending edits are still measured, never lost
-        if outcome["status"] == "finished" or (outcome["status"] in ("error", "exhausted") and (diff or tun_changes)):
-            if not diff and not tun_changes:
-                why = "finish without any edit: nothing to evaluate"
-            elif not tun_changes and not ws.changed_code():
-                why = "finish with only comment/whitespace changes: nothing to evaluate"
-            elif ws.protected_ok():
-                why = ws.protected_ok()
-            elif (agent.probes and agent.ran.get(agent.probes[-1]["seed"]) == (ws.digest(), json.dumps(tunables, sort_keys=True))
-                  and (agent.probes[-1].get("compare") or {}).get("regressions")):
-                # deterministic simulator: the state being submitted already regressed on its own
-                # last probe, so the paired suite cannot accept it -- the verdict needs no retest
-                tried_kind, compared = "edit", {"gains": [], "regressions": agent.probes[-1]["compare"]["regressions"], "accepted": False}
-                why = (f"rejected without a retest: the last run of this exact state (seed {agent.probes[-1]['seed']}) "
-                       f"already regressed {compared['regressions']}")
+        parent_round = int(incumbent.get("round") or 0) if not evals or not any(e["accepted"] for e in evals) else \
+            max((r["round"] for r in doc["rounds"] if r.get("accepted")), default=0)
+        pending = agent.state_identity() != agent.last_eval_identity and (ws.changed_code() or agent.knobs != agent.knobs_from)
+        # the model finished with a changed state, OR it became unusable (error / silence) with
+        # edits pending: the simulator does not need the model, pending edits are still measured
+        if pending and outcome["status"] in ("finished", "error", "exhausted") and not ws.protected_ok():
+            last = agent.probes[-1] if agent.probes else None
+            if (last and agent.ran.get(last["seed"]) == agent.state_identity()
+                    and ((last.get("compare") or {}).get("lost_success") or
+                         len((last.get("compare") or {}).get("regressions") or []) > len((last.get("compare") or {}).get("gains") or []))):
+                # deterministic simulator: this exact state already lost on its own last probe
+                evals.append({"k": len(evals) + 1, "summary": outcome.get("summary") or "", "accepted": False,
+                              "compare": last["compare"], "confirm": None,
+                              "why": f"rejected without a retest: the last run of this exact state (seed {last['seed']}) "
+                                     f"already lost {last['compare'].get('regressions')}"})
             else:
-                tried_kind = "edit"
-                tick(phase="retest", tried={"kind": "edit", "node": before["seeds"][str(seeds[0])].get("first_death")})
                 try:
-                    after = suite(list(range(seeds[0], seeds[1] + 1)), ws.path, tunables, "retest")
-                    compared = compare(before, after)
-                    accepted, why = compared["accepted"], (
-                        f"gained {compared['gains']}" if compared["accepted"] else
-                        f"regressed {compared['regressions']}" if compared["regressions"] else "no milestone gained")
-                except Exception as exc:  # noqa: BLE001 -- the candidate's own failure is the round's verdict
-                    if cancelled():
-                        doc.update(status="cancelled", stop_reason="cancelled")
-                        tick(phase="cancelled")
-                        return 3
-                    exc_text = str(exc)[-2000:]
-                    why = f"candidate suite failed: {exc_text[:300]}"
-        if accepted and after["count"] > before["count"] and args.confirm_seeds > 0:
-            cs = list(range(seeds[1] + 1, seeds[1] + 1 + args.confirm_seeds))
-            tick(phase="confirm")
-            try:
-                cb = suite(cs, inc_dir, incumbent["tunables"], "confirm-before", media_on=False)
-                ca = suite(cs, ws.path, tunables, "confirm-after", media_on=False)
-                check = compare(cb, ca)
-                confirm = {"seeds": cs, "before": cb["count"], "after": ca["count"], "regressions": check["regressions"]}
-                if check["regressions"]:
-                    accepted, why = False, f"fresh seeds regressed {check['regressions']}"
-            except Exception as exc:  # noqa: BLE001
-                if cancelled():
+                    evaluate_state(len(evals) + 1, outcome.get("summary") or "")
+                except RuntimeError:
                     doc.update(status="cancelled", stop_reason="cancelled")
                     tick(phase="cancelled")
                     return 3
-                accepted, why = False, f"confirmation suite failed: {str(exc)[-300:]}"
-                confirm = {"seeds": cs, "before": None, "after": None, "error": str(exc)[-500:]}
-            seeds[1] = cs[-1]
-            tick(seeds_total=seeds[1] - seeds[0] + 1)
-        if accepted:
-            incumbent = doc["incumbent"] = {"workspace": ws_rel, "round": rnd, "tunables": tunables}
-        kept = after if accepted else before
+        elif pending and outcome["status"] == "finished" and ws.protected_ok():
+            evals.append({"k": len(evals) + 1, "accepted": False, "why": ws.protected_ok(), "confirm": None,
+                          "compare": {"gains": [], "regressions": [], "lost_success": [], "accepted": False}})
+        accepted_any = any(e["accepted"] for e in evals)
+        last_eval = evals[-1] if evals else None
+        after = (before if accepted_any else (last_eval or {}).get("after"))
+        why = (last_eval or {}).get("why") or outcome.get("reason") or ""
+        if not evals and outcome["status"] in ("finished", "exhausted"):
+            why = ("finish without any edit: nothing to evaluate" if not (ws.changed() or tun_changes)
+                   else "finish with only comment/whitespace changes: nothing to evaluate")
+        tried_kind = "edit" if evals else "none"
+        confirm = next((e["confirm"] for e in reversed(evals) if e.get("confirm")), None)
+        exc_text = next((e["error"] for e in reversed(evals) if e.get("error")), None)
+        diff = ws.diff(parent0)
+        kept = before
         outcome_word = ("error" if outcome["status"] == "error" else "none" if tried_kind == "none" else
-                        "improved" if accepted else "worse" if compared and compared["regressions"] else
-                        "same" if compared else "error")
+                        "improved" if accepted_any else
+                        "worse" if last_eval and (last_eval["compare"].get("regressions") or last_eval["compare"].get("lost_success")) else
+                        "same" if last_eval and not last_eval.get("error") else "error")
         files = sorted({l[6:] for l in diff.split("\n") if l.startswith("+++ b/")})
         # the console's learning chart reads evaluation.{before,after}.{progress,successes,episodes}
         # and segments epochs by (protocol_id, objective_id)
         sample = lambda suite: {"successes": score(suite)[0], "episodes": len(suite["seeds"]), "progress": score(suite)[1]}
-        eval_row = {"protocol_id": "milestones-v1",
+        eval_row = {"protocol_id": "milestones-v2",
                     "objective_id": sha_json({"task": args.task, "card": pkg, "milestones": "verify nodes + terminal success"}),
-                    "before": sample(before), "after": sample(after) if after else None,
-                    "acceptance": {"accepted": accepted, "reason": why}}
+                    "before": sample(before0), "after": sample(after) if after else None,
+                    "acceptance": {"accepted": accepted_any, "reason": why}}
+        eval_summaries = [{k: e.get(k) for k in ("k", "accepted", "why", "summary", "confirm", "snapshot", "error",
+                                                  "before_count", "after_count")}
+                          | {"gains": e["compare"].get("gains"), "regressions": e["compare"].get("regressions"),
+                             "lost_success": e["compare"].get("lost_success")} for e in evals]
         row = {"round": rnd, "ts": time.time(), "proposer": "llm",
-               "tried": {"kind": tried_kind, "node": before["seeds"][str(seeds[0])].get("first_death"),
+               "tried": {"kind": tried_kind, "node": before0["seeds"][str(seeds[0])].get("first_death"),
                          "detail": {"summary": outcome.get("summary") or outcome.get("reason"), "files": files,
                                     "tunables": tun_changes, "diff": diff[:20_000], "reason": why, "error": exc_text}},
-               "before": before["count"], "after": after["count"] if after else None,
+               "before": before0["count"], "after": after["count"] if after else None,
                "best": max(int(doc["best"]), kept["count"]), "suite_sha": after["sha"] if after else None,
-               "before_score": score(before), "after_score": score(after) if after else None,
-               "outcome": outcome_word, "accepted": accepted, "accepted_reason": why, "published": False,
-               "evaluation": eval_row,
+               "before_score": score(before0), "after_score": score(after) if after else None,
+               "outcome": outcome_word, "accepted": accepted_any, "accepted_reason": why, "published": False,
+               "evaluation": eval_row, "evaluations": eval_summaries,
                "parent": parent_round,
-               "regression": {"lost": compared["regressions"] if compared else []}, "confirm": confirm,
-               "workspace": ws_rel, "needs": [] if tried_kind != "none" else ["edit"],
-               "per_seed": per_seed(before), "after_seeds": per_seed(after) if after else [],
-               "media": list(dict.fromkeys([*before.get("media", []), *(after.get("media", []) if after else [])])),
-               "media_dropped": {**{f"before/{k}": v for k, v in before.get("media_dropped", {}).items()},
-                                 **({f"after/{k}": v for k, v in after.get("media_dropped", {}).items()} if after else {})},
+               "regression": {"lost": (last_eval or {}).get("compare", {}).get("regressions", []) if last_eval else []},
+               "confirm": confirm,
+               "workspace": incumbent["workspace"] if accepted_any else ws_rel, "needs": [] if tried_kind != "none" else ["edit"],
+               "per_seed": per_seed(before0), "after_seeds": per_seed(after) if after else [],
+               "media": list(dict.fromkeys([*before0.get("media", []),
+                                            *[m for e in evals if e.get("after") for m in e["after"].get("media", [])]])),
+               "media_dropped": {**{f"before/{k}": v for k, v in before0.get("media_dropped", {}).items()},
+                                 **{f"eval{e['k']}/{k}": v for e in evals if e.get("after")
+                                    for k, v in e["after"].get("media_dropped", {}).items()}},
                "probes": agent.probes, "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
                "usage": {"llm_tokens": dict(agent.usage), "model_calls": agent.calls,
                          "episode_attempts": round_cost["episode_attempts"], "sim_s": round(round_cost["sim_s"], 3),
@@ -1330,10 +1485,10 @@ def main(argv=None) -> int:
                        "reason": outcome.get("reason"), "error": outcome.get("error"), "stop_reason": outcome.get("reason")}}
         doc["rounds"].append(row)
         doc.update(cursor=rnd, best=row["best"])
-        verdict = ("ACCEPTED" if accepted else "REJECTED" if tried_kind == "edit" else
-                   "NO EDIT" if outcome["status"] in ("gave_up", "exhausted") else outcome["status"].upper())
-        entry = [(f"## Round {rnd} — {verdict}  (successes {before['count']} → {after['count'] if after else '-'} "
-                  f"of {len(before['seeds'])}; {why})"),
+        verdict = ("ACCEPTED" if accepted_any else "REJECTED" if tried_kind == "edit" else
+                   "NO EDIT" if outcome["status"] in ("gave_up", "exhausted", "finished") else outcome["status"].upper())
+        entry = [(f"## Round {rnd} — {verdict}  (successes {before0['count']} → {after['count'] if after else '-'} "
+                  f"of {len(before0['seeds'])}; {why})"),
                  f"- hypothesis / summary: {outcome.get('summary') or outcome.get('reason') or '-'}"]
         if tun_changes:
             entry.append(f"- tunables: {json.dumps(tun_changes)}")
@@ -1342,11 +1497,14 @@ def main(argv=None) -> int:
             entry.append(f"- probe seed {p['seed']}: " + (f"error {p['error'][:200]}" if p.get("error") else
                          f"{'success' if p.get('success') else 'fail at ' + str(p.get('first_death'))} "
                          f"{p.get('failure_mode') or ''} gains {c.get('gains')} lost {c.get('regressions')}"))
+        for e in evals:
+            entry.append(f"- evaluation {e['k']}: {'ACCEPTED' if e['accepted'] else 'REJECTED'} -- {e.get('why')}"
+                         + (f" ({e.get('summary')[:200]})" if e.get("summary") else ""))
         if diff:
             entry.append("```diff\n" + diff[:6000] + "\n```")
         if after:
             entry.append("- result per seed:\n  " + "\n  ".join(
-                describe_seed(s, after["seeds"][s], before["seeds"][s]).split("\n")[0] for s in after["seeds"]))
+                describe_seed(sd, after["seeds"][sd], before0["seeds"].get(sd)).split("\n")[0] for sd in after["seeds"]))
         notebook.append("\n".join(entry))
         _trim_workspaces(store.dir / "work", keep={Path(incumbent["workspace"]).name} if incumbent.get("workspace") else set(),
                          last=rnd)
@@ -1359,7 +1517,8 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 5
         tick(phase="idle", last_round_s=round(time.time() - started, 1))
-        base = None if confirm else kept
+        if base is not None and base is not before:
+            base = before
     doc.update(status="done", stop_reason="round_limit")
     tick(phase="done")
     print(json.dumps({"task": args.task, "cursor": doc["cursor"], "best": doc["best"], "status": "done"}))
@@ -1405,7 +1564,7 @@ def _trim_episodes(session: Path, task: str, keep_round: int, last: int) -> None
 def _trim_workspaces(work: Path, keep: set[str], last: int) -> None:
     """Rejected copies older than WORKSPACES_KEPT rounds go; the incumbent's stays."""
     for d in work.glob("r*"):
-        m = re.fullmatch(r"r(\d+)", d.name)
+        m = re.fullmatch(r"r(\d+)(?:e\d+)?", d.name)
         if d.is_dir() and m and d.name not in keep and int(m.group(1)) <= last - WORKSPACES_KEPT:
             shutil.rmtree(d, ignore_errors=True)
 

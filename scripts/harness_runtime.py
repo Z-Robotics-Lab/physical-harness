@@ -1104,7 +1104,7 @@ def _run_evolve(brief: dict, rt: Runtime, brief_id: str) -> None:
             cmd += [f"--{key.replace('_', '-')}", brief[key]]
     if brief.get("seeds"):
         cmd += ["--seeds", str(int(brief["seeds"][0])), str(int(brief["seeds"][1]))]
-    for k in ("max_replans", "max_actuations", "confirm_seeds", "max_steps", "max_probes", "max_output_tokens"):
+    for k in ("max_replans", "max_actuations", "confirm_seeds", "max_steps", "max_probes", "max_evals", "max_output_tokens"):
         if brief.get(k) is not None:
             value = brief[k]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1228,7 +1228,7 @@ _BRIEF_KEYS = {
     "rsi": {"kind", "task", "node", "cal", "dev", "heldout", "workers", "floor"},
     "mission": {"kind", "mission", "seed", "arm", "max_replans", "max_actuations"},
     "evolve": {"kind", "task", "seeds", "rounds", "continuous", "arm", "max_replans", "max_actuations", "proposer",
-               "confirm_seeds", "max_steps", "max_probes", "max_output_tokens", "llm_model", "llm_effort"},
+               "confirm_seeds", "max_steps", "max_probes", "max_evals", "max_output_tokens", "llm_model", "llm_effort"},
 }
 _MAX_INSTRUCTION_CHARS = 4000
 

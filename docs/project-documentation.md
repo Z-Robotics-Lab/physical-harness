@@ -539,12 +539,16 @@ clone 合法地显示**更多跳过，绝不是失败**：
    逐步运动序列) / run(seed) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
    消息返回，对话在一轮内累积（超过 12 万字符时最早的工具结果一次折叠到 6 万，关键帧图片只保留最新一条消息里的）。`run` 在副本上跑
    一个开发种子，返回同种子相对 incumbent 的里程碑增减和关键帧。预算是 `max_steps`
-   （动作数，默认 40）和 `max_probes`（单种子试跑，默认 6）——不再按字节或调用数限流。
-   动作用完而副本已有改动时，按 finish 处理。
-4. **验收**：`finish` 让副本跑全部开发种子，和基线**同种子配对**比较里程碑向量（每个种子的
+   （只数 edit/write/tunable/run，默认 40；read/grep/trace 免费，模型调用上限为其两倍）、`max_probes`
+   （单种子试跑，默认 8，`run` 可一次给多个种子）和 `max_evals`——不再按字节限流。动作用完而副本已有
+   改动时，按 finish 处理。副本外的 mission 卡和原版卡可以 `read`（`mission/<file>`、`stock/<file>`），不能改。
+4. **验收**：`evaluate`（一轮最多 `max_evals`=3 次；`finish` 结束本轮，状态有变则先评一次）让副本跑全部
+   开发种子，和 incumbent **同种子配对**比较里程碑向量（每个种子的
    verify 节点是否通过 + 任务是否成功；没有 verify 类节点的计划用全部节点的 oracle 结果）。verify 是 mission
    卡的谓词（世界状态，部分还合取了段落自报），任务成功是本体的 `terminal_success`；两者都在副本之外。
-   接受当且仅当至少一个里程碑新通过且任何种子上没有已通过的里程碑退化。整任务成功数增加时再
+   接受当且仅当**净增**（新通过的里程碑数多于退化的）且任何已整任务成功的种子不能失败：用一个种子的
+   一个中间里程碑换另一个种子的两个是进步，丢掉一个已完成的种子不是。通过的评测**当场**成为 incumbent（副本快照到
+   `work/r<n>e<k>/`），模型在它上面继续改。整任务成功数增加时再
    用 `confirm_seeds`（默认 2）个新开发种子复核一次，退化则拒绝。接受后该副本成为 incumbent
    （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
 5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
