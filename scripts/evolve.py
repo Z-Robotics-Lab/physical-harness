@@ -102,6 +102,8 @@ MAX_LOG_LINES = 60
 READ_MAX_LINES = 200
 MAX_CONTEXT_CHARS = 120_000   # ~35k tokens per call; the round's conversation is resent on every call
 MAX_IMAGES = 6
+#: The model's own persistent notes (campaigns/evolve-<task>/notes.md), shown in every brief.
+NOTES_MAX = 6_000
 #: Seeds of one suite run as concurrent child processes, this many at a time.
 PARALLEL_SEEDS = 4   # ponytail: fixed; a knob if a smaller machine ever runs this
 
@@ -846,6 +848,8 @@ Method (one hypothesis at a time):
    incumbent immediately and you keep working on top of it (up to {max_evals} evaluations
    per round). finish ends the round (evaluating the current state if it changed since the
    last evaluate); give_up ends it without evaluating.
+Your notes and a parked copy are how work crosses rounds: a round that ends reading is not lost
+if its map went into the notes and its half-built change was kept.
 Every result ends with a harness-kept ledger of this round: what your copy currently changes
 against the incumbent (file +added/-removed, changed knobs) and every probe and evaluation so
 far with the state it ran on. Trust it over your memory: earlier results get elided from this
@@ -876,7 +880,11 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "evaluate", "summary": "<what changed and why, <=600 chars>"}}   the paired suite; accepted = incumbent
   {{"action": "branch", "from": "incumbent" | "stock" | <accepted round number>}}   restart the copy from that
       state (exact; your edits so far are discarded). Acceptance is always judged against the incumbent.
-  {{"action": "finish", "summary": "<what changed and why, <=600 chars>"}}
+  {{"action": "note", "text": "..."}}   append to YOUR notes (shown in every round's brief: a code map, what a
+      file does, dead ends); {{"action": "note", "text": "...", "replace": true}} rewrites them; {notes_max} chars
+  {{"action": "finish", "summary": "<what changed and why, <=600 chars>", "keep": true}}   keep=true parks the
+      current copy (unevaluated) as the starting point of the NEXT round instead of the incumbent -- for work
+      that needs more than one round; acceptance stays judged against the incumbent
   {{"action": "give_up", "reason": "..."}}
 Budget this round: {max_steps} changes (edit/write/tunable/run count; read/grep/trace are free,
 model calls are capped at {max_calls}), {max_probes} full single-seed runs plus {max_replays} replays
@@ -924,8 +932,9 @@ class Agent:
                  max_steps: int, max_probes: int, max_tokens: int, options: dict, cancelled, audit_path: Path,
                  tick, frontier: str | None = None, evaluate=None, max_evals: int = 3,
                  branch=None, branches: str | None = None, hypotheses: str | None = None,
-                 diag_options: dict | None = None) -> None:
+                 diag_options: dict | None = None, notes: str = "", note=None, wip: str | None = None) -> None:
         self.frontier, self.branch_cb, self.branches = frontier, branch, branches
+        self.notes, self.note_cb, self.wip = notes, note, wip
         self.hypotheses, self.diag_options = hypotheses, diag_options
         self.diagnoses: list[dict] = []
         self.evaluate_cb, self.max_evals, self.evals = evaluate, max_evals, 0
@@ -955,7 +964,7 @@ class Agent:
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
         self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes,
-                                                                     max_replays=2 * max_probes,
+                                                                     max_replays=2 * max_probes, notes_max=NOTES_MAX,
                                                                      max_calls=max_steps + 20, max_evals=max_evals)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
         self.raw: list[str] = []
@@ -972,6 +981,9 @@ class Agent:
                 *([cluster_geometry(self.baseline)] if cluster_geometry(self.baseline) else []),
                 *([self.hypotheses] if self.hypotheses else []),
                 *([self.branches] if self.branches else []),
+                *([self.wip] if self.wip else []),
+                "## Your notes (persist across rounds; note appends, note replace:true rewrites)\n"
+                + (self.notes or "(empty -- a code map of the card would save the next round its reading)"),
                 "## Notebook of previous rounds\n" + notebook]
         if proposal:
             text.append("## Operator proposal pending -- evaluate it first\n" + json.dumps(proposal, ensure_ascii=False)[:2000])
@@ -1149,7 +1161,7 @@ class Agent:
                 steps += 1 if name in ("edit", "write", "tunable", "run") else 0
                 if name == "finish":
                     result = {"status": "finished", "summary": str(act.get("summary") or act.get("thought") or "")[:600],
-                              "reason": "finish"}
+                              "reason": "finish", "keep": bool(act.get("keep"))}
                     break
                 if name == "evaluate" and self.evaluate_cb is not None:
                     try:
@@ -1253,6 +1265,14 @@ class Agent:
             self.knobs[k] = v
             self.tunables.setdefault(self.pkg, {}).setdefault("tunables", {})[k] = v
             return f"{k} = {v} for the next run (was {self.knobs_from.get(k)})", []
+        if name == "note":
+            if self.note_cb is None:
+                raise ValueError("notes are not available in this run")
+            text = str(a.get("text") or "").strip()
+            if not text:
+                raise ValueError("note needs text")
+            self.notes = self.note_cb(text, bool(a.get("replace")))
+            return f"noted ({len(self.notes)}/{NOTES_MAX} chars used)", []
         if name == "branch":
             if self.branch_cb is None:
                 raise ValueError("branching is not available in this run")
@@ -1690,11 +1710,25 @@ def main(argv=None) -> int:
             doc.update(status="failed", stop_reason="infrastructure_error")
             tick(phase="failed", error=f"{type(exc).__name__}: {exc}")
             raise
-        # the working copy: from the incumbent's copy, else the stock card
+        # the working copy: a parked copy from the last round (finish keep:true), else the
+        # incumbent's copy, else the stock card; acceptance is always judged against the incumbent
         ws_rel = f"campaigns/evolve-{args.task}/work/r{rnd}"
-        ws = Workspace.create(args.session / ws_rel, inc_dir or stock, stock)
+        parked = doc.get("parked") if (doc.get("parked") and (args.session / doc["parked"]["workspace"]).is_dir()) else None
+        ws = Workspace.create(args.session / ws_rel, (args.session / parked["workspace"]) if parked else (inc_dir or stock), stock)
+        ws.parent = (inc_dir or stock).resolve()
         ws.mission = mission_dir
-        tunables = copy.deepcopy(incumbent["tunables"])
+        tunables = copy.deepcopy(parked["tunables"] if parked else incumbent["tunables"])
+        wip_text = (f"## Work in progress (your copy continues from round {parked['round']}'s parked state; unevaluated; "
+                    f"acceptance is judged against the incumbent)\n```diff\n{ws.diff(limit=80)}\n```") if parked else None
+        notes_path = store.dir / "notes.md"
+
+        def note(text: str, replace: bool = False, *, path=notes_path) -> str:
+            current = "" if replace or not path.exists() else path.read_text()
+            new = (current.rstrip("\n") + "\n" + text).strip("\n") if current else text
+            if len(new) > NOTES_MAX:
+                raise ValueError(f"notes would be {len(new)} chars (cap {NOTES_MAX}): rewrite them shorter with replace: true")
+            path.write_text(new + "\n")
+            return new
         os.environ[OVERRIDE_ENV] = json.dumps(tunables)   # so mount_params reads the incumbent's knobs
         params = mount_params(binding["policy"])
         knobs_from = {k: v for k, v in (params.get("tunables") if isinstance(params.get("tunables"), dict) else params).items()
@@ -1804,7 +1838,8 @@ def main(argv=None) -> int:
                       frontier=failure_frontier(doc["rounds"], before, dev),
                       evaluate=evaluate_state, max_evals=args.max_evals,
                       branch=branch_from, branches=branches_text,
-                      hypotheses=hypotheses_table(doc["rounds"]), diag_options=diag_thinking)
+                      hypotheses=hypotheses_table(doc["rounds"]), diag_options=diag_thinking,
+                      notes=notes_path.read_text() if notes_path.exists() else "", note=note, wip=wip_text)
         try:
             outcome = agent.loop()
         except RuntimeError:   # a cancelled suite inside evaluate
@@ -1837,6 +1872,10 @@ def main(argv=None) -> int:
             evals.append({"k": len(evals) + 1, "accepted": False, "why": ws.protected_ok(), "confirm": None,
                           "compare": {"gains": [], "regressions": [], "lost_success": [], "accepted": False}})
         accepted_any = any(e["accepted"] for e in evals)
+        if outcome.get("keep") and not accepted_any and (ws.changed_code() or agent.knobs != knobs_from):
+            doc["parked"] = {"workspace": ws_rel, "round": rnd, "tunables": copy.deepcopy(tunables)}
+        else:
+            doc.pop("parked", None)
         last_eval = evals[-1] if evals else None
         after = (before if accepted_any else (last_eval or {}).get("after"))
         why = (last_eval or {}).get("why") or outcome.get("reason") or ""
@@ -1883,7 +1922,7 @@ def main(argv=None) -> int:
                "media_dropped": {**{f"before/{k}": v for k, v in before0.get("media_dropped", {}).items()},
                                  **{f"eval{e['k']}/{k}": v for e in evals if e.get("after")
                                     for k, v in e["after"].get("media_dropped", {}).items()}},
-               "probes": agent.probes, "diagnosis": agent.diagnoses,
+               "probes": agent.probes, "diagnosis": agent.diagnoses, "parked": bool(doc.get("parked")),
                "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
                "usage": {"llm_tokens": dict(agent.usage), "model_calls": agent.calls,
                          "episode_attempts": round_cost["episode_attempts"], "sim_s": round(round_cost["sim_s"], 3),
@@ -1901,6 +1940,8 @@ def main(argv=None) -> int:
                  f"- hypothesis / summary: {outcome.get('summary') or outcome.get('reason') or '-'}"]
         for d in agent.diagnoses:
             entry.append(f"- diagnosis: {d['contrast'][:300]} | hypothesis: {d['hypothesis'][:300]} | plan: {d['plan'][:200]}")
+        if doc.get("parked"):
+            entry.append("- parked: the next round continues from this copy (unevaluated)")
         if tun_changes:
             entry.append(f"- tunables: {json.dumps(tun_changes)}")
         for p in agent.probes:
@@ -1922,6 +1963,8 @@ def main(argv=None) -> int:
         keep = {Path(r["workspace"]).name for r in doc["rounds"] if r.get("accepted") and r.get("workspace")}
         if incumbent.get("workspace"):
             keep.add(Path(incumbent["workspace"]).name)
+        if doc.get("parked"):
+            keep.add(Path(doc["parked"]["workspace"]).name)
         _trim_workspaces(store.dir / "work", keep=keep, last=rnd)
         _trim_episodes(args.session, args.task, int(incumbent.get("round") or 0), rnd)
         completed += 1

@@ -577,6 +577,10 @@ clone 合法地显示**更多跳过，绝不是失败**：
    `work/r<n>e<k>/`），模型在它上面继续改。整任务成功数增加时再
    用 `confirm_seeds`（默认 2）个新开发种子复核一次，退化则拒绝。接受后该副本成为 incumbent
    （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
+4b. **跨轮的工作**：`note` 动作写模型自己的持久笔记（`campaigns/evolve-<task>/notes.md`，6 KB 上限，追加或
+   `replace` 重写），每轮简报原样带上——代码地图、死路，省掉每轮重读 3000 行代码（651 轮 60 次调用里 55 次是
+   read/grep）。`finish` 带 `keep: true` 把当前副本**停靠**为下一轮的起点（`campaign.json.parked`，未评测，
+   简报里给出它相对 incumbent 的 diff），验收仍然对 incumbent；被接受、或下一轮没有再 keep，停靠即清除。
 5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
    每次 diagnose 一行、每次 probe 的结果一行（含它运行时副本相对 incumbent 的改动统计）、相对父副本的
    unified diff、每个种子的前后一行。下一轮的提示带上它的精简视图（最近 1 轮带 diff，更早的只留标题和结论，
