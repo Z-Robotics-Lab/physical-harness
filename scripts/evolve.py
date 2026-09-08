@@ -270,6 +270,15 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
                 n["objects_end"] = diag["media"]["objects_end"]
             if (diag.get("media") or {}).get("contacts"):
                 n["contacts"] = diag["media"]["contacts"]   # harness.media.read_contacts at segment start / end
+        if row.get("replayed_from"):
+            # a restored world does not carry a grasp faithfully: if the first executed segment
+            # began holding an object and lost it by its first sample, the replay is suspect
+            first = next((n for n in row["trail"] if n.get("id") == row["replayed_from"]), None)
+            if first and (first.get("hand_lost") or {}).get("note"):
+                row["replay_suspect"] = (f"REPLAY ARTIFACT: {first['hand_lost']['object']} left the hand on the first "
+                                         f"sample after the world was restored at {row['replayed_from']}; a held object does "
+                                         "not survive a replay point -- do not read this run's failure as the policy's; use "
+                                         "a full run, or replay from a node that starts with an empty hand")
         _link_upstream(row["trail"], dead, skills)
         if dead:   # the layout around the death, once per seed (fixtures + objects, harness.media.read_scene)
             scene = ((nodes.get(dead) or {}).get("diagnostics") or {}).get("media", {}).get("scene")
@@ -503,6 +512,8 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict 
                if s.get("replayed_from") else ""))
     lines = [head, "  " + " · ".join(_node_line(n, faults.get((str(seed), n["id"]), 0)) for n in ran)
              + (f" · ({left} nodes not reached)" if left else "")]
+    if s.get("replay_suspect"):
+        lines.append("  !! " + s["replay_suspect"])
     dead = next((n for n in trail if n.get("id") == s.get("first_death")), None)
     custody = [n for n in ran if n.get("contacts")]
     if custody:   # what each segment left in the hand / on the floor: a carry that lost its object shows here
@@ -935,8 +946,9 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "run", "seeds": [<seed>, <seed>]}}                  several seeds at once, in parallel (one probe each)
   {{"action": "run", "seed": <seed>, "from": "<node id>"}}       start from the world that seed's LAST run had on
       reaching that node (earlier nodes are copied in, marked ⟲) at a fraction of the time. The world is the
-      same; controller memory is re-anchored, so step counts can differ from a full run -- evaluate always
-      runs full episodes. Use it when nothing before that node changed
+      same; controller memory is re-anchored, so step counts can differ from a full run, and a HELD object
+      does not survive the restore (the harness flags such a run as a REPLAY ARTIFACT) -- replay from nodes
+      that start empty-handed; evaluate always runs full episodes
   {{"action": "evaluate", "summary": "<what changed and why, <=600 chars>"}}   the paired suite; accepted = incumbent
   {{"action": "branch", "from": "incumbent" | "stock" | <accepted round number>}}   restart the copy from that
       state (exact; your edits so far are discarded). Acceptance is always judged against the incumbent.
@@ -1072,7 +1084,8 @@ class Agent:
                 what += (f", gained {[g.split(':', 1)[1] for g in c['gains']]}" if c.get("gains") else "") \
                     + (f", LOST {[g.split(':', 1)[1] for g in c['regressions']]}" if c.get("regressions") else "") \
                     + ("" if c.get("gains") or c.get("regressions") else ", no milestone change")
-            lines.append(f"{p['label']} seed {p['seed']}{' from ' + p['from'] if p.get('from') else ''} → {what}  @ {p.get('state', '?')}")
+            lines.append(f"{p['label']} seed {p['seed']}{' from ' + p['from'] if p.get('from') else ''} → {what}"
+                         f"{' (REPLAY ARTIFACT: held object lost on restore; not evidence)' if p.get('suspect') else ''}  @ {p.get('state', '?')}")
         lines += self.verdicts
         return "--- this round so far (harness-kept) ---\n" + "\n".join(lines)
 
@@ -1445,6 +1458,9 @@ class Agent:
                 self.last_runs[str(p["seed"])] = suite
                 p.update(success=row["success"], first_death=row.get("first_death"), failure_mode=row.get("failure_mode"),
                          compare=compare({"seeds": {str(p["seed"]): self.baseline["seeds"][str(p["seed"])]}}, suite))
+                if row.get("replay_suspect"):
+                    p["suspect"] = True
+                    p["compare"] = {**p["compare"], "regressions": [], "lost_success": [], "accepted": False}
             return describe_suite(suite, self.baseline), keyframe_parts(self.session, suite, 3)
         raise ValueError(f"unknown action {name!r}; use read/grep/edit/write/tunable/trace/run/evaluate/finish/give_up")
 

@@ -826,9 +826,15 @@ def save_replay_point(directory, node_id: str, ep: EpisodeContext, plan: Mapping
         return
     p.parent.mkdir(parents=True, exist_ok=True)
     slim = {k: {kk: vv for kk, vv in v.items() if kk != "diagnostics"} for k, v in nodes_out.items()}
+    # the flattened MjSimState is time/qpos/qvel only: the actuator controls (the gripper's
+    # closing command among them) and activations ride separately, or a restored grasp
+    # opens on the first frames and the object falls before the segment's first action
+    data = getattr(sim, "data", None)
+    ctrl = [float(v) for v in getattr(data, "ctrl", None)] if data is not None and getattr(data, "ctrl", None) is not None else []
+    act = [float(v) for v in getattr(data, "act", None)] if data is not None and getattr(data, "act", None) is not None else []
     p.write_text(json.dumps(_jsonable({
         "node": node_id, "graph_sha": protocol.graph_sha(plan), "plan": plan,
-        "state": sim.get_state().flatten(), "cursor": ep.cursor,
+        "state": sim.get_state().flatten(), "ctrl": ctrl, "act": act, "cursor": ep.cursor,
         "nodes_out": slim, "done_specs": done_specs, "actuations": actuations, "replans": replans})))
 
 
@@ -838,17 +844,24 @@ def _restore_replay_point(ep: EpisodeContext, bundle: Mapping) -> None:
     import numpy as np
     sim = ep.env.sim
     sim.set_state_from_flattened(np.asarray(bundle["state"], dtype=float))
+    data = getattr(sim, "data", None)
+    for key in ("ctrl", "act"):
+        vals = bundle.get(key) or []
+        target = getattr(data, key, None) if data is not None else None
+        if vals and target is not None and len(target) == len(vals):
+            target[:] = np.asarray(vals, dtype=float)
     sim.forward()
     for robot in getattr(ep.env, "robots", None) or []:
-        # the ARM controllers' goals re-anchor on the restored pose (an OSC goal is memory
-        # outside qpos); the base controller keeps its reset-time origin, which the same
+        # every part controller but the base re-anchors its goal on the restored pose (an OSC
+        # goal, a gripper's or the torso's target are memory outside qpos: a stale goal moves
+        # the arm and drops the grasp on the first frames); the base keeps its reset-time origin, which the same
         # seed's env.reset() already reproduced -- re-anchoring it would change how the
         # driver's velocity commands map onto motion
         cc = getattr(robot, "composite_controller", None)
         if cc is not None and hasattr(cc, "part_controllers"):
             cc.update_state()
-            for name, ctrl in cc.part_controllers.items():
-                if name in (getattr(cc, "arms", None) or ()) and hasattr(ctrl, "reset_goal"):
+            for name, ctrl in cc.part_controllers.items():   # everything but the base: arm, gripper, torso, head
+                if name != "base" and hasattr(ctrl, "reset_goal"):
                     ctrl.reset_goal()
     if hasattr(ep.env, "_get_observations"):
         ep.obs = ep.env._get_observations(force_update=True)
