@@ -535,10 +535,14 @@ clone 合法地显示**更多跳过，绝不是失败**：
    接近策略先于数值旋钮；最小改动；跑失败种子验证；笔记本里记过的实验不重复）。用户消息给
    基线证据（每个种子的里程碑轨迹，靠 recovery 重试才通过的节点标出 fault 次数；首死节点的停滞几何，
    含目标相对底盘 yaw 的方位角和手臂伸出距离、驱动无关的位姿轨迹、附近 fixtures 的位置尺寸）、
-   最常见首死节点在**所有种子**（含通过的）上的几何对照表（同样带方位角和伸出距离）、可分支的起点（原版卡、incumbent、被接受的快照）、
+   最常见首死节点在**所有种子**（含通过的）上的几何对照表（同样带方位角和伸出距离，外加该节点的
+   运动概要：相位区间、eef 离目标最近多少、夹爪何时松开）、**假设表**（最近 20 轮各自的 diagnose 假设，
+   老轮次用 finish 摘要；改了哪些文件/knob；配对评测说了什么——ENPIRE 的假设树摊平，被驳回的假设不该换个数值再试）、可分支的起点（原版卡、incumbent、被接受的快照）、
    副本文件表、当前 tunables、**失败前沿**表（每个种子：incumbent 死在哪、最近 5 轮花了几次试跑、
    最后一次有增益的轮次）、上一轮为止的**笔记本**、待处理的 operator proposal 和失败关键帧（视觉模型时）。每回合模型回一个 JSON 动作，或一组动作 `{"actions": [...]}`（依次执行，遇错或遇 run 停下，结果合成一条消息返回）：
-   `read / grep / edit(old→new，必须唯一命中，写前编译) / write / tunable / trace(某节点的
+   `diagnose(contrast, hypothesis, plan：本轮第一条回复必须是它，先从证据里用数字对比过关和失败的种子，
+   再给一个假设和最小改动；其它动作在它之前会被拒绝，finish/give_up 除外；这一次调用用端点声明的 high
+   effort，之后的工具循环用 brief 选的 effort) / read / grep / edit(old→new，必须唯一命中，写前编译) / write / tunable / trace(某节点的
    逐步运动序列) / run(seed 或 seeds) / evaluate(summary) / branch(from: stock | incumbent | 被接受的轮次，
    精确重置副本) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
    消息返回，对话在一轮内累积（超过 12 万字符时最早的大块工具结果一次折叠到 6 万，占位符写明它原来是
@@ -561,8 +565,9 @@ clone 合法地显示**更多跳过，绝不是失败**：
    用 `confirm_seeds`（默认 2）个新开发种子复核一次，退化则拒绝。接受后该副本成为 incumbent
    （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
 5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
-   每次 probe 的结果一行（含它运行时副本相对 incumbent 的改动统计）、相对父副本的 unified diff、每个种子的前后一行。下一轮的提示带上它的精简视图
-   （最近 2 轮带 diff，更早的只留标题和结论，上限 12 KB）。这是跨轮记忆的唯一载体，原始轨迹不进提示。
+   每次 diagnose 一行、每次 probe 的结果一行（含它运行时副本相对 incumbent 的改动统计）、相对父副本的
+   unified diff、每个种子的前后一行。下一轮的提示带上它的精简视图（最近 1 轮带 diff，更早的只留标题和结论，
+   上限 12 KB；跨轮的假设史由假设表承担）。这是跨轮记忆的唯一载体，原始轨迹不进提示。
 
 **为什么是子进程 + 模块覆盖。** 每次 suite 都在 `python scripts/evolve.py --suite <spec>`
 子进程里跑，子进程启动时（任何 import 之前）用 `PH_MODULE_OVERLAY={"<卡包>": "<副本目录>"}`

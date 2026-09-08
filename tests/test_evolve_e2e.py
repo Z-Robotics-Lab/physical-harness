@@ -42,6 +42,8 @@ segment_specs = "{CARD}.stage:SEGMENT_SPECS"
 max_replans = 1
 """
 
+DIAGNOSE = {"action": "diagnose", "contrast": "both seeds die at grab-0 with the base 0.65 m out",
+            "hypothesis": "the loaded standoff is too large", "plan": "lower STOP"}
 READ = {"thought": "grab dies; read the driver", "action": "read", "path": "stage.py", "start": 60, "end": 100}
 EDIT_FROZEN = {"action": "edit", "path": "predicates.py", "old": "FROZEN = True", "new": "FROZEN = False"}
 EDIT = {"thought": "the standoff is too large", "action": "edit", "path": "stage.py",
@@ -54,7 +56,7 @@ GIVE_UP = {"action": "give_up", "reason": "every seed already succeeds"}
 @pytest.fixture(scope="module")
 def runtime(tmp_path_factory):
     rt = _Runtime(tmp_path_factory.mktemp("runs"), card=_CARD,
-                  canned=[READ, EDIT_FROZEN, EDIT, RUN, FINISH, GIVE_UP], mode="evolution")
+                  canned=[READ, DIAGNOSE, EDIT_FROZEN, EDIT, RUN, FINISH, GIVE_UP], mode="evolution")
     rt.campaign = rt.session / "campaigns" / f"evolve-{TASK}" / "campaign.json"
     yield rt
     rt.stop()
@@ -125,11 +127,13 @@ def test_round_one_edits_the_copy_and_is_accepted_round_two_gives_up(runtime, tw
     assert r1["confirm"] == {"seeds": [3, 4], "before": 0, "after": 2, "regressions": []}
     assert r1["accepted_reason"].startswith("gained ") and "1:grab-0" in r1["accepted_reason"]
     assert r1["proposal"]["kind"] == "tunables" and r1["parent"] == 0
-    assert r1["llm"]["status"] == "finished" and r1["llm"]["actions"] == {"read": 1, "edit": 2, "run": 1, "finish": 1}
-    assert any("frozen" in e for e in r1["llm"]["errors"])
+    # the read before the diagnosis is refused (a call, not a step); the diagnosis is kept on the row
+    assert r1["llm"]["status"] == "finished" and r1["llm"]["actions"] == {"read": 1, "diagnose": 1, "edit": 2, "run": 1, "finish": 1}
+    assert any("frozen" in e for e in r1["llm"]["errors"]) and any("diagnose first" in e for e in r1["llm"]["errors"])
+    assert r1["diagnosis"] == [DIAGNOSE | {}] or r1["diagnosis"][0]["hypothesis"] == DIAGNOSE["hypothesis"]
     assert [p["seed"] for p in r1["probes"]] == [1] and r1["probes"][0]["success"] is True
     assert r1["probes"][0]["compare"]["gains"] == ["1:grab-0", "1:task"]
-    assert r1["usage"]["model_calls"] == 5 and r1["usage"]["episode_attempts"] == 2 + 1 + 2 + 2 + 2
+    assert r1["usage"]["model_calls"] == 6 and r1["usage"]["episode_attempts"] == 2 + 1 + 2 + 2 + 2
     # the incumbent IS the edited copy; the next round starts from it
     assert doc["incumbent"] == {"workspace": f"campaigns/evolve-{TASK}/work/r1e1", "round": 1, "tunables": {}}
     assert [e["accepted"] for e in r1["evaluations"]] == [True] and r1["evaluations"][0]["gains"] == ["1:grab-0", "1:task", "2:grab-0", "2:task"]
@@ -144,7 +148,7 @@ def test_round_one_edits_the_copy_and_is_accepted_round_two_gives_up(runtime, tw
     assert "## Round 1 — ACCEPTED" in nb and "+    STOP = 0.3" in nb and "probe seed 1: success" in nb
     assert "## Round 2 — NO EDIT" in nb
     audit = json.loads((runtime.session / f"campaigns/evolve-{TASK}/llm/round-1.json").read_text())
-    assert audit["status"] == "finished" and audit["calls"] == 5
+    assert audit["status"] == "finished" and audit["calls"] == 6 and audit["diagnoses"][0]["plan"] == "lower STOP"
     assert "Operator proposal pending" in audit["messages"][1]["content"]
     assert audit["messages"][2]["content"] == json.dumps(READ)
     # media: verified segments kept as clips per phase, never overwritten across phases

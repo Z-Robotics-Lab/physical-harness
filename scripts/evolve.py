@@ -368,6 +368,34 @@ def _faults(suite: dict) -> dict[tuple[str, str], int]:
     return counts
 
 
+def _phases(n: dict) -> str:
+    """How the node's motion went, off the stage's sampled series: the phase runs, the
+    closest the eef came to its target, when the gripper opened."""
+    tr = n.get("trace")
+    rows = (tr.get("series") or []) if isinstance(tr, dict) else []
+    if not rows:
+        return ""
+    runs: list = []
+    for r in rows:
+        ph = r.get("phase") or "?"
+        if runs and runs[-1][0] == ph:
+            runs[-1][2] = r.get("step")
+        else:
+            runs.append([ph, r.get("step"), r.get("step")])
+    out = ["phases " + " → ".join(f"{p} {a}-{b}" for p, a, b in runs)]
+    dist = [r for r in rows if isinstance(r.get("d_eef"), (int, float))]
+    if dist:
+        best = min(dist, key=lambda r: r["d_eef"])
+        out.append(f"closest eef→target {_f(best['d_eef'])} m at step {best.get('step')}")
+    grips = [r.get("grip") for r in rows]
+    opened = next((rows[i].get("step") for i in range(1, len(rows))
+                   if isinstance(grips[i], (int, float)) and isinstance(grips[i - 1], (int, float))
+                   and grips[i] < 0 < grips[i - 1]), None)
+    if opened is not None:
+        out.append(f"gripper opened at step {opened}")
+    return "; ".join(out)
+
+
 def _node_line(n: dict, faults: int = 0) -> str:
     mark = {True: "ok", False: "FAIL", None: "-"}[n.get("ok")]
     s = f"{n['id']} {mark}"
@@ -388,6 +416,8 @@ def _node_line(n: dict, faults: int = 0) -> str:
               f" eef {end.get('eef')} target {end.get('target')} base {end.get('base')}]")
     elif end:
         s += f" [d_eef {_f(end.get('d_eef_target'))} d_base {_f(end.get('d_base_target'))}]"
+    if n.get("ok") is not True and (ph := _phases(n)):
+        s += f" [{ph}]"
     return s
 
 
@@ -740,12 +770,17 @@ by anything you write. Do not read simulator internals the installed drivers do 
 already read.
 
 Method (one hypothesis at a time):
-1. Read the evidence: the milestone trail per seed, where the first death is, the stall
-   geometry (eef/base vs target), the upstream segment that parked the base, keyframes.
+1. Diagnose from the evidence BEFORE reading code (the diagnose action, your first reply):
+   what differs, in numbers, between the seeds that pass the dying node and the seeds that
+   fail it (the cross-seed table: bearing, extension, phases, closest approach, layout);
+   then ONE hypothesis and the smallest edit that would test it. The hypotheses table
+   lists what earlier rounds diagnosed and what the suite measured: a refuted hypothesis
+   is not retried in a new numeric guise (a threshold moved by centimetres is the same
+   hypothesis).
 2. Localise the cause at the highest layer that explains it (a recovery or approach
    decision before a numeric knob). Read the code that produced the observed numbers.
-3. Make the smallest edit that tests the hypothesis; run the failing seed; read the
-   result; iterate. Do not repeat an experiment the notebook already records.
+3. Make the smallest edit that tests the hypothesis; run the failing seed AND a passing
+   seed before evaluating; read the result; iterate.
 4. When a state looks better, call evaluate: it runs EVERY development seed paired against
    the incumbent. Accepted iff more milestones are gained than lost across all seeds AND the
    number of seeds that complete the whole task does not drop. An accepted state becomes the
@@ -765,6 +800,8 @@ double quotes (or quote code with single quotes); an unparsable reply wastes an 
 To save round trips send several actions at once as {{"actions": [{{...}}, {{...}}]}}: reads,
 greps and edits run in order and return together; the batch stops at its first error or
 at a run. Keep "thought" to two sentences; the notebook, not the chat, is your memory.
+  {{"action": "diagnose", "contrast": "<numbers that separate passing from failing seeds>",
+    "hypothesis": "<the one cause you will test>", "plan": "<the smallest edit>"}}   first; free; revise any time
   {{"thought": "...", "action": "read", "path": "drivers.py", "start": 1, "end": 120}}
   {{"action": "grep", "pattern": "<regex over the copy's .py files>", "path": "<optional one file>"}}
   {{"action": "edit", "path": "<file>", "old": "<snippet occurring exactly once>", "new": "<replacement>"}}
@@ -822,8 +859,11 @@ class Agent:
                  dev_seeds: list[int], baseline: dict, session: Path, notebook: str, proposal: dict | None,
                  max_steps: int, max_probes: int, max_tokens: int, options: dict, cancelled, audit_path: Path,
                  tick, frontier: str | None = None, evaluate=None, max_evals: int = 3,
-                 branch=None, branches: str | None = None) -> None:
+                 branch=None, branches: str | None = None, hypotheses: str | None = None,
+                 diag_options: dict | None = None) -> None:
         self.frontier, self.branch_cb, self.branches = frontier, branch, branches
+        self.hypotheses, self.diag_options = hypotheses, diag_options
+        self.diagnoses: list[dict] = []
         self.evaluate_cb, self.max_evals, self.evals = evaluate, max_evals, 0
         # reads are free of the change budget but not of tokens: the call cap bounds a round
         self.max_calls = max_steps + 20
@@ -865,11 +905,13 @@ class Agent:
                 "## Incumbent on the development seeds (what you must beat)\n" + describe_suite(self.baseline),
                 *([frontier] if frontier else []),
                 *([cluster_geometry(self.baseline)] if cluster_geometry(self.baseline) else []),
+                *([self.hypotheses] if self.hypotheses else []),
                 *([self.branches] if self.branches else []),
                 "## Notebook of previous rounds\n" + notebook]
         if proposal:
             text.append("## Operator proposal pending -- evaluate it first\n" + json.dumps(proposal, ensure_ascii=False)[:2000])
-        text.append("Start by reading the code behind the first death, then state your hypothesis in `thought`.")
+        text.append("Reply first with a diagnose action built from the evidence above (contrast the seeds that pass "
+                    "the dying node with the ones that fail it, in numbers); code reading comes after.")
         parts = [{"type": "text", "text": "\n\n".join(text)}]
         if self.images:
             parts += keyframe_parts(self.session, self.baseline)
@@ -944,7 +986,7 @@ class Agent:
     def _persist(self, status: str, extra: dict | None = None) -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         doc = {"status": status, "calls": self.calls, "usage": dict(self.usage), "actions": self.actions,
-               "finish_reasons": self.finishes,
+               "finish_reasons": self.finishes, "diagnoses": self.diagnoses,
                "errors": self.errors[-20:], "probes": self.probes,
                "messages": [{"role": m["role"], "content": _text(m["content"])} for m in self.messages],
                **(extra or {})}
@@ -968,7 +1010,10 @@ class Agent:
             self.tick(phase="propose", llm_calls=self.calls + 1)
             # after a reply the reasoning ate whole (finish_reason=length, empty content) the
             # retry runs WITHOUT thinking: the answer is one JSON object, reasoning is optional
-            options = {"thinking": {"type": "disabled"}} if plain_retry else self.options
+            # the diagnosis is the one call worth the most reasoning: it runs at the higher
+            # declared effort, the tool loop at the round's
+            options = ({"thinking": {"type": "disabled"}} if plain_retry else
+                       self.diag_options if self.diag_options and not self.diagnoses else self.options)
             raw, failure = None, None
             for attempt, pause in enumerate((0, 10, 30, 60)):   # transient network/API errors: retry, then seal
                 if pause:
@@ -1019,6 +1064,21 @@ class Agent:
                 name = act["action"]
                 self.actions[name] = self.actions.get(name, 0) + 1
                 done.append(_tag(name, act))
+                head = f"[{k + 1}/{len(batch)} {name}] " if len(batch) > 1 else ""
+                if name == "diagnose":
+                    d = {key: str(act.get(key) or "")[:800] for key in ("contrast", "hypothesis", "plan")}
+                    if not d["hypothesis"]:
+                        outputs.append(f"{head}error: diagnose needs a hypothesis (and a contrast in numbers)")
+                        break
+                    self.diagnoses.append(d)
+                    outputs.append(f"{head}diagnosis {len(self.diagnoses)} recorded (it goes to the notebook and the "
+                                   "hypotheses table); now read the code behind it")
+                    continue
+                if not self.diagnoses and name not in ("finish", "give_up"):
+                    msg = f"{head}error: diagnose first -- contrast passing and failing seeds from the evidence, then your hypothesis"
+                    self.errors.append(msg[:300])
+                    outputs.append(msg)
+                    break
                 # reading is free: the budget counts what changes or simulates something
                 # (edit/write/tunable/run); model calls are capped at twice that separately
                 steps += 1 if name in ("edit", "write", "tunable", "run") else 0
@@ -1027,7 +1087,6 @@ class Agent:
                               "reason": "finish"}
                     break
                 if name == "evaluate" and self.evaluate_cb is not None:
-                    head = f"[{k + 1}/{len(batch)} evaluate] " if len(batch) > 1 else ""
                     try:
                         outputs.append(head + self._evaluate(act))
                     except Exception as exc:  # noqa: BLE001 -- feedback, not a crash
@@ -1039,7 +1098,6 @@ class Agent:
                 if name == "give_up":
                     result = {"status": "gave_up", "reason": str(act.get("reason") or act.get("thought") or "give_up")[:600]}
                     break
-                head = f"[{k + 1}/{len(batch)} {name}] " if len(batch) > 1 else ""
                 try:
                     text, images = self._tool(name, act)
                     outputs.append(head + text)
@@ -1192,7 +1250,7 @@ class Agent:
 
 _INDEX_KEYS = ("round", "before", "after", "best", "parent", "outcome", "accepted", "accepted_reason",
                "published", "before_score", "after_score", "usage", "proposer", "needs", "confirm",
-               "suite_sha", "proposal", "ts", "workspace", "llm", "evaluation")
+               "suite_sha", "proposal", "ts", "workspace", "llm", "evaluation", "diagnosis")
 _SEED_KEYS = ("seed", "success", "first_death", "failure_mode")
 
 
@@ -1335,6 +1393,11 @@ def main(argv=None) -> int:
         ap.error("rounds/probes must be nonnegative and steps positive")
     try:
         llm_params, thinking = model_request_config(args.llm_model, args.llm_effort)
+        # the round's first call (the diagnosis) runs at the higher declared effort
+        from plugins.model_endpoint import reasoning_options
+        declared = llm_params.get("reasoning_efforts")
+        diag_thinking = (reasoning_options("high", declared) if isinstance(declared, dict) and "high" in declared
+                         and args.llm_effort not in ("high", "max") else thinking)
     except ValueError as exc:
         ap.error(str(exc))
     if missing := [f"--{k}" for k in ("task", "session", "skills_root") if getattr(args, k) is None]:
@@ -1587,12 +1650,14 @@ def main(argv=None) -> int:
         agent = Agent(ep, ws, pkg=pkg, tunables=tunables, knobs=dict(knobs_from),
                       run_seed=lambda sl, label, ws=ws, tunables=tunables: suite(sl, ws.path, tunables, label),
                       dev_seeds=dev, baseline=before, session=args.session,
-                      notebook=notebook.text(), proposal=prop, max_steps=args.max_steps, max_probes=args.max_probes,
+                      notebook=notebook.text(limit=12_000, diffs=1), proposal=prop,
+                      max_steps=args.max_steps, max_probes=args.max_probes,
                       max_tokens=args.max_output_tokens, options=thinking, cancelled=cancelled,
                       audit_path=store.dir / "llm" / f"round-{rnd}.json", tick=tick,
                       frontier=failure_frontier(doc["rounds"], before, dev),
                       evaluate=evaluate_state, max_evals=args.max_evals,
-                      branch=branch_from, branches=branches_text)
+                      branch=branch_from, branches=branches_text,
+                      hypotheses=hypotheses_table(doc["rounds"]), diag_options=diag_thinking)
         try:
             outcome = agent.loop()
         except RuntimeError:   # a cancelled suite inside evaluate
@@ -1673,7 +1738,8 @@ def main(argv=None) -> int:
                "media_dropped": {**{f"before/{k}": v for k, v in before0.get("media_dropped", {}).items()},
                                  **{f"eval{e['k']}/{k}": v for e in evals if e.get("after")
                                     for k, v in e["after"].get("media_dropped", {}).items()}},
-               "probes": agent.probes, "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
+               "probes": agent.probes, "diagnosis": agent.diagnoses,
+               "proposal": {k: prop[k] for k in ("id", "kind", "note")} if prop else None,
                "usage": {"llm_tokens": dict(agent.usage), "model_calls": agent.calls,
                          "episode_attempts": round_cost["episode_attempts"], "sim_s": round(round_cost["sim_s"], 3),
                          "wall_s": round(time.time() - started, 3)},
@@ -1688,6 +1754,8 @@ def main(argv=None) -> int:
         entry = [(f"## Round {rnd} — {verdict}  (successes {before0['count']} → {after['count'] if after else '-'} "
                   f"of {len(before0['seeds'])}; {why})"),
                  f"- hypothesis / summary: {outcome.get('summary') or outcome.get('reason') or '-'}"]
+        for d in agent.diagnoses:
+            entry.append(f"- diagnosis: {d['contrast'][:300]} | hypothesis: {d['hypothesis'][:300]} | plan: {d['plan'][:200]}")
         if tun_changes:
             entry.append(f"- tunables: {json.dumps(tun_changes)}")
         for p in agent.probes:
@@ -1748,7 +1816,7 @@ def cluster_geometry(baseline: dict) -> str:
     node = max(set(deaths), key=deaths.count)
     lines = [f"## {node} across seeds (the most common first death; passing seeds included)",
              ("seed | outcome | steps | end: eef→target, base→target, target bearing from base yaw, arm extended | "
-              "base [x,y,yaw] | target | stage geometry")]
+              "base [x,y,yaw] | target | motion | stage geometry")]
     for seed, s in baseline["seeds"].items():
         n = next((n for n in s.get("trail") or [] if n.get("id") == node), None)
         if not n:
@@ -1761,8 +1829,38 @@ def cluster_geometry(baseline: dict) -> str:
         lines.append(f"{seed} | {'ok' if n.get('ok') else 'FAIL ' + str(n.get('failure_mode') or '')} | {n.get('steps')} | "
                      f"{_f(end.get('d_eef_target'))}, {_f(end.get('d_base_target'))}, "
                      f"{_deg(_bearing(base, end.get('target')))}, {_f(_reach(base, eef))} | {base} | {end.get('target')} | "
+                     f"{_phases(n) or '-'} | "
                      f"{_flat({k: v for k, v in (n.get('geometry') or {}).items() if k not in ('base', 'point')})}")
     return "\n".join(lines)
+
+
+def hypotheses_table(rounds: list[dict], limit: int = 20) -> str:
+    """Every recent round's own diagnosis (older rounds: the finish summary) with what it
+    changed and what the paired suite said -- ENPIRE's hypothesis tree, flattened. This
+    is what stops a refuted hypothesis from coming back in a new numeric guise."""
+    out = []
+    for r in rounds[-limit:]:
+        d = (r.get("diagnosis") or [{}])[-1]
+        t = (r.get("tried") or {}).get("detail") or {}
+        claim = d.get("hypothesis") or (r.get("llm") or {}).get("summary") or t.get("summary") or ""
+        if not claim:
+            continue
+        changed = ", ".join(t.get("files") or []) + (f" knobs {json.dumps(t.get('tunables'))}" if t.get("tunables") else "")
+        probes = r.get("probes") or []
+        gained = sum(1 for p in probes if (p.get("compare") or {}).get("gains"))
+        if r.get("accepted"):
+            outcome = "ACCEPTED"
+        elif r.get("evaluations"):
+            outcome = f"REJECTED: {str(r.get('accepted_reason'))[:120]}"
+        elif probes:
+            outcome = f"{len(probes)} probes, {gained} with a milestone gain; not evaluated"
+        else:
+            outcome = str(r.get("accepted_reason") or r.get("outcome") or "")[:100]
+        out.append(f"{r['round']} | {str(claim)[:220]} | {changed.strip() or 'nothing'} | {outcome}")
+    if not out:
+        return ""
+    return ("## Hypotheses already tested (your own diagnoses; a refuted one is not retried in a new numeric guise)\n"
+            "round | hypothesis | changed | outcome\n" + "\n".join(out))
 
 
 def failure_frontier(rounds: list[dict], baseline: dict, seeds: list[int], window: int = 5) -> str:
