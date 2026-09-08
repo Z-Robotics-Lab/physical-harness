@@ -550,7 +550,14 @@ clone 合法地显示**更多跳过，绝不是失败**：
    **本轮账本**：副本此刻相对 incumbent 改了哪些文件（+增/-删行）和哪些 knob、本轮每次 probe 和 evaluate
    的结论及其运行时的状态——折叠不掉的轮内记忆（之前模型在折叠后分不清「原版卡」和 incumbent，手工回滚
    时把 incumbent 自己的补丁一起删掉）。`trace` 输出每个相位切换加均匀采样共约 40 行，命令只列非零分量。
-   `run` 在副本上跑一个开发种子，返回同种子相对 incumbent 的里程碑增减和关键帧。预算是 `max_steps`
+   `run` 在副本上跑一个或多个开发种子（多个种子各起一个子进程并行，`PARALLEL_SEEDS`=4，evaluate 的
+   全量套件同样并行），返回同种子相对 incumbent 的里程碑增减和关键帧。`run` 可带 `from: <节点>`：从该种子
+   **上一次运行**到达该节点时留下的**重放点**起跑——workload 在每个干净前缀上的 segment 节点派发前把
+   MuJoCo 状态向量、当时生效的计划、已完成节点的封存条目和预算写成 `work/replay/<label>/<seed>/<节点>.json`；
+   重放时先把这些节点原样计入（轨迹里标 ⟲），在该节点派发前恢复世界状态，本次尝试按存档里的计划执行，
+   之后的故障照常 replan。世界状态与整段运行相同，但手臂控制器的目标要重新锚定到恢复后的位姿，所以
+   stall 步数这类细节可能不同（真机校验：4244 全跑 69 s 死于 drop-can1 reach_stall，eef 差 0.245 m；
+   重放 14 s，同一结论，eef 差 0.243 m）。重放只用于 probe，evaluate 永远整段跑。预算是 `max_steps`
    （只数 edit/write/tunable/run，默认 40；read/grep/trace 免费，模型调用上限为其两倍）、`max_probes`
    （单种子试跑，默认 8，`run` 可一次给多个种子）和 `max_evals`——不再按字节限流。动作用完而副本已有
    改动时，按 finish 处理。副本外的 mission 卡和原版卡可以 `read`（`mission/<file>`、`stock/<file>`），不能改。

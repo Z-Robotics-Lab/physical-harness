@@ -34,6 +34,7 @@ import importlib.util
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import signal
@@ -101,6 +102,8 @@ MAX_LOG_LINES = 60
 READ_MAX_LINES = 200
 MAX_CONTEXT_CHARS = 120_000   # ~35k tokens per call; the round's conversation is resent on every call
 MAX_IMAGES = 6
+#: Seeds of one suite run as concurrent child processes, this many at a time.
+PARALLEL_SEEDS = 4   # ponytail: fixed; a knob if a smaller machine ever runs this
 
 
 # ── the model endpoint ────────────────────────────────────────────────────────────
@@ -188,9 +191,12 @@ def _get(budgets, binding: dict, key: str, default):
 
 def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root: Path,
               tunables: dict, media_dir: Path | None = None, budgets: dict | None = None,
-              progress=None, media_prefix: str = "media", cancelled=None, episode: bool = False) -> dict:
+              progress=None, media_prefix: str = "media", cancelled=None, episode: bool = False,
+              replay_dir: Path | None = None, replay: dict | None = None) -> dict:
     """{count, seeds: {seed: {success, first_death, failure_mode, trail, ...}}, sha,
-    elapsed_s, logs}. ``tunables`` = ``{provider ref: {param: value}}`` (OVERRIDE_ENV)."""
+    elapsed_s, logs}. ``tunables`` = ``{provider ref: {param: value}}`` (OVERRIDE_ENV).
+    ``replay_dir``: each seed drops its replay points under ``<replay_dir>/<seed>/``;
+    ``replay`` = {seed: replay point file} starts that seed from the saved world."""
     os.environ[OVERRIDE_ENV] = json.dumps(tunables or {})
     per, logs = {}, []
     brief = {**hr.task_brief(task, binding), "arm": arm}
@@ -205,7 +211,12 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
         log = _Tap(lambda nodes: tick(nodes=nodes, node=next((n["id"] for n in nodes if n["ok"] is not True), None)))
         kernel = Kernel(CAPABILITIES, log=log)
         kernel.mount(hr._mount_plan(binding, skills_root, frames=_maybe_arm_frames()))
-        out = workload.run(dict(brief), kernel, seed=seed,
+        seed_brief = dict(brief)
+        if replay_dir is not None:
+            seed_brief["replay_dir"] = str(Path(replay_dir) / str(seed))
+        if (replay or {}).get(str(seed)):
+            seed_brief["replay"] = str(replay[str(seed)])
+        out = workload.run(seed_brief, kernel, seed=seed,
                            max_replans=int(_get(budgets, binding, "max_replans", 3)),
                            max_actuations=int(_get(budgets, binding, "max_actuations", 3)),
                            segment_retries=int(binding.get("segment_retries", 0)), cancelled=cancelled)
@@ -228,11 +239,15 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
                                "executor": n.get("executor") or "scripted",
                                "tunables_sha": (n.get("diagnostics") or {}).get("tunables_sha")}
                          for nid, n in nodes.items()}}
+        if seed_brief.get("replay"):
+            row["replayed_from"] = Path(seed_brief["replay"]).stem
         for n in row["trail"]:   # final state from the result: a replan reset the live trail
             r = nodes.get(n["id"]) or {}
             diag = r.get("diagnostics") or {}
             if n["ok"] is None and "success" in r:
                 n["ok"] = bool(r["success"])
+            if r.get("replayed"):
+                n["replayed"] = True
             n["steps"] = n["steps"] if n["steps"] is not None else r.get("steps")
             if "failure_mode" in diag or n["failure_mode"] is not None:
                 n["failure_mode"] = n["failure_mode"] or diag.get("failure_mode")
@@ -276,13 +291,18 @@ def _child_main(spec_path: Path) -> int:
     marker = Path(spec["cancel_marker"]) if spec.get("cancel_marker") else None
 
     def progress(**kw):
+        # a one-seed child of a parallel suite reports its place in the whole suite
+        if "seed_index" in kw and spec.get("seeds_total"):
+            kw["seed_index"], kw["seeds_total"] = spec.get("seed_index", kw["seed_index"]), spec["seeds_total"]
         print("@@" + json.dumps(kw, default=str), flush=True)
 
     out = run_suite(spec["task"], binding, [int(s) for s in spec["seeds"]], spec["arm"],
                     Path(spec["skills_root"]), spec["tunables"],
                     media_dir=Path(spec["media_dir"]) if spec.get("media_dir") else None,
                     budgets=spec.get("budgets"), progress=progress, media_prefix=spec.get("media_prefix", "media"),
-                    cancelled=(lambda: marker.exists()) if marker else None, episode=bool(spec.get("episode")))
+                    cancelled=(lambda: marker.exists()) if marker else None, episode=bool(spec.get("episode")),
+                    replay_dir=Path(spec["replay_dir"]) if spec.get("replay_dir") else None,
+                    replay={str(s): spec["replay"] for s in spec["seeds"]} if spec.get("replay") else None)
     Path(spec["out"]).write_text(json.dumps(out, default=str))
     return 0
 
@@ -398,7 +418,7 @@ def _phases(n: dict) -> str:
 
 def _node_line(n: dict, faults: int = 0) -> str:
     mark = {True: "ok", False: "FAIL", None: "-"}[n.get("ok")]
-    s = f"{n['id']} {mark}"
+    s = f"{'⟲' if n.get('replayed') else ''}{n['id']} {mark}"
     if n.get("steps") is not None:
         s += f" {n['steps']}st"
     if n.get("failure_mode"):
@@ -428,7 +448,9 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict 
     faults = faults or {}
     head = (f"seed {seed}: {'SUCCESS' if s.get('success') else 'FAIL'}"
             + (f", first death {s['first_death']}" if s.get("first_death") else "")
-            + (f" ({s['failure_mode']})" if s.get("failure_mode") else "") + f", {s.get('elapsed_s')} s")
+            + (f" ({s['failure_mode']})" if s.get("failure_mode") else "") + f", {s.get('elapsed_s')} s"
+            + (f" -- replayed from {s['replayed_from']} (⟲ nodes copied from that seed's previous run)"
+               if s.get("replayed_from") else ""))
     lines = [head, "  " + " · ".join(_node_line(n, faults.get((str(seed), n["id"]), 0)) for n in ran)
              + (f" · ({left} nodes not reached)" if left else "")]
     dead = next((n for n in trail if n.get("id") == s.get("first_death")), None)
@@ -779,8 +801,9 @@ Method (one hypothesis at a time):
    hypothesis).
 2. Localise the cause at the highest layer that explains it (a recovery or approach
    decision before a numeric knob). Read the code that produced the observed numbers.
-3. Make the smallest edit that tests the hypothesis; run the failing seed AND a passing
-   seed before evaluating; read the result; iterate.
+3. Make the smallest edit that tests the hypothesis; run the failing seed (from its death
+   node when nothing before it changed) AND a passing seed before evaluating; read the
+   result; iterate.
 4. When a state looks better, call evaluate: it runs EVERY development seed paired against
    the incumbent. Accepted iff more milestones are gained than lost across all seeds AND the
    number of seeds that complete the whole task does not drop. An accepted state becomes the
@@ -809,7 +832,11 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "tunable", "name": "<declared knob>", "value": <number>}}
   {{"action": "trace", "seed": <seed>, "node": "<node id>"}}   per-step motion series of that node in its last run
   {{"action": "run", "seed": <development seed>}}                one episode of the copy on that seed
-  {{"action": "run", "seeds": [<seed>, <seed>]}}                  several seeds at once (one probe each)
+  {{"action": "run", "seeds": [<seed>, <seed>]}}                  several seeds at once, in parallel (one probe each)
+  {{"action": "run", "seed": <seed>, "from": "<node id>"}}       start from the world that seed's LAST run had on
+      reaching that node (earlier nodes are copied in, marked ⟲) at a fraction of the time. The world is the
+      same; controller memory is re-anchored, so step counts can differ from a full run -- evaluate always
+      runs full episodes. Use it when nothing before that node changed
   {{"action": "evaluate", "summary": "<what changed and why, <=600 chars>"}}   the paired suite; accepted = incumbent
   {{"action": "branch", "from": "incumbent" | "stock" | <accepted round number>}}   restart the copy from that
       state (exact; your edits so far are discarded). Acceptance is always judged against the incumbent.
@@ -934,7 +961,7 @@ class Agent:
                 what += (f", gained {[g.split(':', 1)[1] for g in c['gains']]}" if c.get("gains") else "") \
                     + (f", LOST {[g.split(':', 1)[1] for g in c['regressions']]}" if c.get("regressions") else "") \
                     + ("" if c.get("gains") or c.get("regressions") else ", no milestone change")
-            lines.append(f"{p['label']} seed {p['seed']} → {what}  @ {p.get('state', '?')}")
+            lines.append(f"{p['label']} seed {p['seed']}{' from ' + p['from'] if p.get('from') else ''} → {what}  @ {p.get('state', '?')}")
         lines += self.verdicts
         return "--- this round so far (harness-kept) ---\n" + "\n".join(lines)
 
@@ -1201,48 +1228,53 @@ class Agent:
                     f"{step}th); base=[x,y,yaw] eef=[x,y,z]; after | the command mode and its nonzero components\n"
                     + "\n".join(lines)), []
         if name == "run":
-            if isinstance(a.get("seeds"), list):   # several seeds: each one is a probe, results together
-                texts, images = [], []
-                for seed in a["seeds"]:
-                    try:
-                        t, im = self._tool("run", {"seed": seed})
-                    except ValueError as exc:
-                        texts.append(f"seed {seed}: error: {exc}")
-                        break
-                    texts.append(t)
-                    images = im
-                return "\n\n".join(texts), images
-            seed = a.get("seed")
-            if isinstance(seed, bool) or not isinstance(seed, int) or seed not in self.dev_seeds:
-                raise ValueError(f"run.seed must be one of the development seeds {self.dev_seeds}")
-            if len(self.probes) >= self.max_probes:
-                raise ValueError("single-seed run budget exhausted: finish or give_up")
+            seeds = a["seeds"] if isinstance(a.get("seeds"), list) else [a.get("seed")]
+            for seed in seeds:
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed not in self.dev_seeds:
+                    raise ValueError(f"run.seed must be one of the development seeds {self.dev_seeds}")
+            if len(self.probes) + len(seeds) > self.max_probes:
+                raise ValueError(f"single-seed run budget exhausted ({self.max_probes - len(self.probes)} left): finish or give_up")
             if why := self.ws.protected_ok():
                 raise ValueError(why)
+            node = a.get("from")
+            replay: dict[str, str] = {}
+            if node:
+                for seed in seeds:
+                    last = self.last_runs.get(str(seed)) or {}
+                    rdir = Path(last["replay_dir"]) / str(seed) if last.get("replay_dir") else None
+                    point = rdir / f"{node}.json" if rdir else None
+                    if point is None or not point.is_file():
+                        have = sorted(q.stem for q in rdir.glob("*.json")) if rdir and rdir.is_dir() else []
+                        raise ValueError(f"seed {seed}: no replay point at {node!r} in its last run; "
+                                         f"available: {have or 'none (that run left no replay points)'}")
+                    replay[str(seed)] = str(point)
             # the simulator is deterministic per seed: the same code and knobs give the same
             # episode, so a repeat run buys nothing and is refused without spending a probe
-            identity = (self.ws.digest(), json.dumps(self.tunables, sort_keys=True))
-            if self.ran.get(seed) == identity:
-                raise ValueError(f"seed {seed} already ran with exactly this code and these knobs (see its result above); "
-                                 "edit something or run another seed")
-            self.ran[seed] = identity
+            identity = (self.ws.digest(), json.dumps(self.tunables, sort_keys=True), node)
+            for seed in seeds:
+                if self.ran.get(seed) == identity:
+                    raise ValueError(f"seed {seed} already ran with exactly this code and these knobs"
+                                     f"{' from ' + node if node else ''} (see its result above); edit something or run another seed")
             label = f"probe-{len(self.probes)}"
-            self.probes.append({"seed": seed, "label": label, "state": self._state()})
+            state = self._state()
+            for seed in seeds:
+                self.ran[seed] = identity
+                self.probes.append({"seed": seed, "label": label, "state": state, **({"from": node} if node else {})})
             self.tick(phase="probe", probe_index=len(self.probes) - 1)
             try:
-                suite = self.run_seed([seed], label)
+                suite = self.run_seed(seeds, label, replay or None)
             except Exception as exc:  # noqa: BLE001 -- the candidate crashed the episode: evidence
-                self.probes[-1]["error"] = str(exc)[:500]
+                for p in self.probes[-len(seeds):]:
+                    p["error"] = str(exc)[:500]
                 raise ValueError(f"the episode raised before finishing:\n{str(exc)[-2500:]}") from None
             finally:
                 self.tick(phase="propose", llm_calls=self.calls)
-            self.last_runs[str(seed)] = suite
-            row = suite["seeds"][str(seed)]
-            self.probes[-1].update(success=row["success"], first_death=row.get("first_death"),
-                                   failure_mode=row.get("failure_mode"),
-                                   compare=compare({"seeds": {str(seed): self.baseline["seeds"][str(seed)]}}, suite))
-            text = describe_suite(suite, self.baseline)
-            return text, keyframe_parts(self.session, suite, 3)
+            for p in self.probes[-len(seeds):]:
+                row = suite["seeds"][str(p["seed"])]
+                self.last_runs[str(p["seed"])] = suite
+                p.update(success=row["success"], first_death=row.get("first_death"), failure_mode=row.get("failure_mode"),
+                         compare=compare({"seeds": {str(p["seed"]): self.baseline["seeds"][str(p["seed"])]}}, suite))
+            return describe_suite(suite, self.baseline), keyframe_parts(self.session, suite, 3)
         raise ValueError(f"unknown action {name!r}; use read/grep/edit/write/tunable/trace/run/evaluate/finish/give_up")
 
 
@@ -1465,57 +1497,114 @@ def main(argv=None) -> int:
 
     round_cost = {"episode_attempts": 0, "sim_s": 0.0}
 
-    def suite(seed_list: list[int], workspace: Path | None, tunables: dict, label: str, media_on: bool = True) -> dict:
-        """One suite in a CHILD process mapped onto ``workspace`` (None = the stock card).
-        The retest also records each seed's whole-episode video (the round's rollout)."""
+    def suite(seed_list: list[int], workspace: Path | None, tunables: dict, label: str, media_on: bool = True,
+              replay: dict | None = None) -> dict:
+        """One suite = one CHILD PROCESS PER SEED, PARALLEL_SEEDS at a time, each mapped onto
+        ``workspace`` (None = the stock card); the per-seed results merge into one suite.
+        The retest also records each seed's whole-episode video (the round's rollout).
+        Every seed drops replay points under ``work/replay/<label>/<seed>/``; ``replay`` =
+        {seed: replay point file} starts that seed from the saved world."""
         prefix = f"media/rsi/{args.task}/round-{live['round']}/{label}"
         work = store.dir / "work"
         work.mkdir(parents=True, exist_ok=True)
-        spec_path, out_path = work / f"suite-{label}.json", work / f"suite-{label}.out.json"
-        spec_path.write_text(json.dumps({
-            "task": args.task, "seeds": seed_list, "arm": arm, "skills_root": str(args.skills_root),
-            "tunables": tunables,
-            "media_dir": str(args.session / prefix) if media_on else None, "media_prefix": prefix,
-            "episode": label.startswith("retest"),
-            "budgets": budgets, "out": str(out_path), "cancel_marker": str(args.cancel_marker) if args.cancel_marker else None}))
+        replay_dir = work / "replay" / label
+        shutil.rmtree(replay_dir, ignore_errors=True)   # a label's points belong to its newest run
         env = {**os.environ}
         env.pop(OVERLAY_ENV, None)
         if workspace is not None:
             env[OVERLAY_ENV] = json.dumps({pkg: str(workspace)})
-        cmd = [sys.executable, str(Path(__file__).resolve()), "--suite", str(spec_path)]
+        pending = []
+        for i, seed in enumerate(seed_list):
+            spec_path, out_path = work / f"suite-{label}-{seed}.json", work / f"suite-{label}-{seed}.out.json"
+            out_path.unlink(missing_ok=True)
+            spec_path.write_text(json.dumps({
+                "task": args.task, "seeds": [seed], "seed_index": i, "seeds_total": len(seed_list), "arm": arm,
+                "skills_root": str(args.skills_root), "tunables": tunables,
+                "media_dir": str(args.session / prefix) if media_on else None, "media_prefix": prefix,
+                "episode": label.startswith("retest"), "budgets": budgets, "out": str(out_path),
+                "replay_dir": str(replay_dir), "replay": (replay or {}).get(str(seed)),
+                "cancel_marker": str(args.cancel_marker) if args.cancel_marker else None}))
+            pending.append((seed, spec_path, out_path))
         t0 = time.monotonic()
         started = 0
-        proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        err_buf: list[str] = []
-        threading.Thread(target=lambda: err_buf.append(proc.stderr.read()), daemon=True).start()
+        events: queue.Queue = queue.Queue()
+        procs: dict[int, subprocess.Popen] = {}
+        errs: dict[int, list[str]] = {}
+        eofs: dict[int, int] = {}
+        failures: list[str] = []
+        outs: dict[int, dict] = {}
+
+        def pump(seed, stream, kind):
+            for line in stream:
+                events.put((kind, seed, line))
+            events.put(("eof", seed, None))
+
+        def reap(seed, out_path):
+            proc = procs.pop(seed)
+            proc.wait()
+            err = "".join(errs.get(seed) or [])
+            if proc.returncode != 0 or not out_path.exists():
+                # the traceback, not the simulator's import warnings that pad stderr around it
+                tb = err.rfind("Traceback (most recent call last)")
+                failures.append(f"seed {seed} exited {proc.returncode}:\n{(err[tb:] if tb >= 0 else err).strip()[-3000:]}")
+            else:
+                outs[seed] = json.loads(out_path.read_text())
+
         try:
-            for line in proc.stdout:
-                if line.startswith("@@"):
+            while pending or procs:
+                while pending and len(procs) < PARALLEL_SEEDS and not cancelled():
+                    seed, spec_path, out_path = pending.pop(0)
+                    procs[seed] = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--suite", str(spec_path)],
+                                                   cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE, text=True)
+                    errs[seed], eofs[seed] = [], 0
+                    threading.Thread(target=pump, args=(seed, procs[seed].stdout, "out"), daemon=True).start()
+                    threading.Thread(target=pump, args=(seed, procs[seed].stderr, "err"), daemon=True).start()
+                    outs.setdefault("_paths", {})[seed] = out_path
+                if not procs:
+                    break
+                try:
+                    kind, seed, line = events.get(timeout=1.0)
+                except queue.Empty:
+                    if cancelled():
+                        pending.clear()
+                        for proc in procs.values():
+                            if proc.poll() is None:
+                                proc.terminate()
+                    continue
+                if kind == "err":
+                    errs[seed].append(line)
+                elif kind == "out" and line.startswith("@@"):
                     try:
                         kw = json.loads(line[2:])
                     except ValueError:
                         continue
                     started += int(kw.get("seed_started_at") is not None)
                     tick(**kw)
-                if cancelled() and proc.poll() is None:
-                    proc.terminate()
-            proc.wait()
+                elif kind == "eof":
+                    eofs[seed] += 1
+                    if eofs[seed] == 2:   # both pipes drained: the child is done
+                        reap(seed, outs["_paths"][seed])
         finally:
             elapsed = time.monotonic() - t0
             round_cost["episode_attempts"] += started
             round_cost["sim_s"] += elapsed
             live["sim_s"] += elapsed
+        outs.pop("_paths", None)
         if cancelled():
             raise RuntimeError("cancelled")
-        err = (err_buf[0] if err_buf else "") or ""
-        if proc.returncode != 0 or not out_path.exists():
-            # the traceback, not the simulator's import warnings that pad stderr around it
-            tb = err.rfind("Traceback (most recent call last)")
-            raise RuntimeError(f"suite exited {proc.returncode}:\n{(err[tb:] if tb >= 0 else err).strip()[-3000:]}")
-        out = json.loads(out_path.read_text())
-        out.update(task=args.task, arm=arm, media=_media(args.session, args.task, seed_list, prefix) if media_on else [],
-                   media_dropped=_dropped(args.session, args.task, seed_list, prefix) if media_on else {})
-        return out
+        if failures:
+            raise RuntimeError("suite failed:\n" + "\n".join(failures))
+        per: dict = {}
+        logs: list[str] = []
+        for seed in seed_list:
+            per.update(outs[seed]["seeds"])
+            logs += (outs[seed].get("logs") or [])[-(MAX_LOG_LINES // len(seed_list)):]
+        return {"count": sum(bool(r.get("success")) for r in per.values()), "seeds": per, "sha": sha_json(per),
+                "elapsed_s": round(elapsed, 3), "logs": logs, "task": args.task, "arm": arm, "label": label,
+                "replay_dir": str(replay_dir),
+                "media": _media(args.session, args.task, seed_list, prefix) if media_on else [],
+                "media_dropped": _dropped(args.session, args.task, seed_list, prefix) if media_on else {}}
 
     tick()
     base = None
@@ -1648,7 +1737,7 @@ def main(argv=None) -> int:
                     "Nothing has been evaluated for this state yet.")
 
         agent = Agent(ep, ws, pkg=pkg, tunables=tunables, knobs=dict(knobs_from),
-                      run_seed=lambda sl, label, ws=ws, tunables=tunables: suite(sl, ws.path, tunables, label),
+                      run_seed=lambda sl, label, replay=None, ws=ws, tunables=tunables: suite(sl, ws.path, tunables, label, replay=replay),
                       dev_seeds=dev, baseline=before, session=args.session,
                       notebook=notebook.text(limit=12_000, diffs=1), proposal=prop,
                       max_steps=args.max_steps, max_probes=args.max_probes,
@@ -1760,7 +1849,8 @@ def main(argv=None) -> int:
             entry.append(f"- tunables: {json.dumps(tun_changes)}")
         for p in agent.probes:
             c = p.get("compare") or {}
-            entry.append(f"- probe seed {p['seed']}: " + (f"error {p['error'][:200]}" if p.get("error") else
+            entry.append(f"- probe seed {p['seed']}{' from ' + p['from'] if p.get('from') else ''}: "
+                         + (f"error {p['error'][:200]}" if p.get("error") else
                          f"{'success' if p.get('success') else 'fail at ' + str(p.get('first_death'))} "
                          f"{p.get('failure_mode') or ''} gains {c.get('gains')} lost {c.get('regressions')}")
                          + (f"  @ {p['state']}" if p.get("state") else ""))

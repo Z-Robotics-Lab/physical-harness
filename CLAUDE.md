@@ -70,8 +70,10 @@ agent session over a WORKING COPY of the card package that drives the task: the
 model first diagnoses from the evidence (`diagnose`: the numbers that separate
 passing from failing seeds, one hypothesis, the smallest edit; earlier rounds'
 diagnoses and verdicts are tabled), then reads the card's source (and, read-only,
-the mission card), edits it, runs development seeds (`run`), reads the milestone
-trail / pose trace / failure keyframes, and calls `evaluate` (up to `max_evals` per round; `finish` ends the
+the mission card), edits it, runs development seeds (`run`; seeds run in
+parallel child processes, and `from: <node>` restarts a seed from the replay
+point its last run left at that node), reads the milestone trail / pose trace /
+failure keyframes, and calls `evaluate` (up to `max_evals` per round; `finish` ends the
 round). An evaluation runs the full paired development suite against the
 incumbent; accepted iff more frozen milestones are gained than lost across the
 seeds and the number of seeds completing the whole task does not drop; a

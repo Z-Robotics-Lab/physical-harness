@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import importlib
 import itertools
+import json
 from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from harness import media, opstream, predicates, protocol
@@ -795,6 +797,64 @@ def _graph_problems(plan: Mapping, prev_plan: Mapping | None, done_ids,
 NO_PROGRESS_HINT = "same graph already tried; change args/executor or add a recovery node"
 
 
+def _jsonable(v):
+    """numpy scalars/arrays -> plain JSON values, recursively (bundles are JSON)."""
+    import numpy as np
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, Mapping):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
+
+
+def save_replay_point(directory, node_id: str, ep: EpisodeContext, plan: Mapping, nodes_out: Mapping,
+                      done_specs: Mapping, actuations: int, replans: int) -> None:
+    """Drop the world as it stands BEFORE ``node_id`` is dispatched: the MuJoCo state
+    vector plus the loop's ledger (the plan in force, every finished node's sealed
+    entry minus its diagnostics, done specs, budgets). First reach of a node wins; an
+    env without ``sim`` (the stdlib fakes) leaves nothing. A later run can start from
+    it (``brief["replay"]``) and pay only for the nodes from there on."""
+    sim = getattr(ep.env, "sim", None)
+    if sim is None:
+        return
+    p = Path(directory) / f"{node_id}.json"
+    if p.exists():
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    slim = {k: {kk: vv for kk, vv in v.items() if kk != "diagnostics"} for k, v in nodes_out.items()}
+    p.write_text(json.dumps(_jsonable({
+        "node": node_id, "graph_sha": protocol.graph_sha(plan), "plan": plan,
+        "state": sim.get_state().flatten(), "cursor": ep.cursor,
+        "nodes_out": slim, "done_specs": done_specs, "actuations": actuations, "replans": replans})))
+
+
+def _restore_replay_point(ep: EpisodeContext, bundle: Mapping) -> None:
+    """Put the persistent episode's world back to the bundle's state and refresh the
+    running obs off it; the sub-goal cursor follows."""
+    import numpy as np
+    sim = ep.env.sim
+    sim.set_state_from_flattened(np.asarray(bundle["state"], dtype=float))
+    sim.forward()
+    for robot in getattr(ep.env, "robots", None) or []:
+        # the ARM controllers' goals re-anchor on the restored pose (an OSC goal is memory
+        # outside qpos); the base controller keeps its reset-time origin, which the same
+        # seed's env.reset() already reproduced -- re-anchoring it would change how the
+        # driver's velocity commands map onto motion
+        cc = getattr(robot, "composite_controller", None)
+        if cc is not None and hasattr(cc, "part_controllers"):
+            cc.update_state()
+            for name, ctrl in cc.part_controllers.items():
+                if name in (getattr(cc, "arms", None) or ()) and hasattr(ctrl, "reset_goal"):
+                    ctrl.reset_goal()
+    if hasattr(ep.env, "_get_observations"):
+        ep.obs = ep.env._get_observations(force_update=True)
+    ep.cursor = int(bundle.get("cursor") or 0)
+
+
 def run(brief: Mapping, kernel: Kernel, *, seed: int,
         max_replans: int = 3, max_actuations: int = 3,
         segment_retries: int = 0, cancelled=None) -> dict[str, Any]:
@@ -817,7 +877,17 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
     loop breaks to its single exit, the world closes exactly once, and the sealed
     note says in its own faults that a human stopped it -- which is what keeps
     board.store.session_progress from tallying it as a failure. ``None`` (the
-    default, and every non-runtime caller) is today's path, byte-identical."""
+    default, and every non-runtime caller) is today's path, byte-identical.
+
+    ``brief["replay_dir"]`` (persistent episodes only) drops a replay point before
+    every segment node reached on a clean prefix (``save_replay_point``);
+    ``brief["replay"]`` names one such file: the nodes it had finished are copied in
+    as sealed (``replayed``), the world is restored right before the node it was
+    taken at, and the plan in force then is executed as-is for that attempt --
+    later faults replan normally. From that node on the loop measures the same world
+    a full run would; arm-controller goals are re-anchored on the restored pose, so
+    fine timing (stall step counts) can differ -- a replay is a probe, never the
+    paired evaluation."""
     arm = str(brief.get("arm", "scripted"))  # brief validation: before any mount
     if arm != "auto" and arm not in ARMS:  # auto: the planner picks per node.executor
         raise ValueError(f"unknown arm {arm!r}; known arms: {sorted(ARMS)}")
@@ -919,6 +989,17 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
         embodiment = str(brief.get("embodiment") or env_ref)   # the binding's ref, not an overlay
         brief = {**brief, "facts": facts, "objects": objects, "embodiment": embodiment,
                  "plans": [r for r in skills if r.get("kind") == "plan"]}
+        replay_dir = brief.get("replay_dir") if episode is not None else None
+        replay_plan: Mapping | None = None
+        restore_pending, bundle = False, None
+        if brief.get("replay"):
+            if episode is None:
+                raise ValueError("replay needs a persistent episode (the brief must declare 'episodic')")
+            bundle = json.loads(Path(brief["replay"]).read_text())
+            nodes_out.update({k: {**v, "replayed": True} for k, v in bundle["nodes_out"].items()})
+            done_specs.update(bundle["done_specs"])
+            actuations, replans = int(bundle["actuations"]), int(bundle["replans"])
+            replay_plan, restore_pending = bundle["plan"], True
         while True:
             # Replanning observes the world left by the preceding attempt. The
             # reset facts used to validate the complete graph remain unchanged.
@@ -931,8 +1012,8 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
             # nodes labelled by task) is executed as-is; its planner provenance rides
             # the graph, so the mounted planner is never asked.
             is_retry = retry_plan is not None
-            plan = retry_plan if is_retry else brief.get("graph") or planner.plan(brief)
-            retry_plan = None
+            plan = retry_plan if is_retry else replay_plan or brief.get("graph") or planner.plan(brief)
+            retry_plan, replay_plan = None, None
             ok, msg = validate_plan(
                 plan, catalogue, oracles, done=tuple(done_specs.values()),
                 requirements=brief.get("planning_context"))
@@ -1007,6 +1088,13 @@ def run(brief: Mapping, kernel: Kernel, *, seed: int,
                     prior = nodes_out.get(node["id"])
                     if prior is not None and prior["success"]:
                         continue
+                    if restore_pending:   # the replayed world: from here on every step is real
+                        _restore_replay_point(episode, bundle)
+                        restore_pending = False
+                    if (replay_dir and node.get("kind") == "segment"
+                            and all(v["success"] for k, v in nodes_out.items() if k != node["id"])):
+                        save_replay_point(replay_dir, node["id"], episode, plan, nodes_out, done_specs,
+                                          actuations, replans)
                     # The model-independent floor, enforced BEFORE dispatch: no
                     # planner, however eloquent, can mint extra actuations.
                     if actuations >= max_actuations:
