@@ -301,11 +301,13 @@ def milestones(row: dict) -> dict[str, bool]:
 
 def compare(before: dict, after: dict) -> dict:
     """Paired, per seed: gains = milestones newly passed, regressions = milestones lost.
-    Accepted iff the net milestone count rises (more gained than lost) AND no seed that
-    completed the whole task before fails it now (``lost_success``). Trading a partial
-    milestone on one seed for two on another is progress; losing a finished seed is not.
-    Missing after-rows regress."""
+    Accepted iff the net milestone count rises (more gained than lost) AND the number of
+    seeds completing the whole task does not drop (``successes`` = [before, after]).
+    Trading a partial milestone on one seed for two on another is progress, and so is one
+    finished seed swapped for another; fewer finished seeds is not, whatever else is
+    gained. Missing after-rows regress."""
     gains, losses, lost_success = [], [], []
+    done = [0, 0]
     for seed, b in before["seeds"].items():
         a = (after.get("seeds") or {}).get(seed) or {}
         mb, ma = milestones(b), milestones(a)
@@ -314,10 +316,12 @@ def compare(before: dict, after: dict) -> dict:
                 gains.append(f"{seed}:{k}")
             elif mb.get(k) and not ma.get(k):
                 losses.append(f"{seed}:{k}")
+        done[0] += bool(b.get("success"))
+        done[1] += bool(a.get("success"))
         if b.get("success") and not a.get("success"):
             lost_success.append(str(seed))
-    return {"gains": gains, "regressions": losses, "lost_success": lost_success,
-            "accepted": len(gains) > len(losses) and not lost_success}
+    return {"gains": gains, "regressions": losses, "lost_success": lost_success, "successes": done,
+            "accepted": len(gains) > len(losses) and done[1] >= done[0]}
 
 
 def score(suite: dict) -> list:
@@ -333,33 +337,70 @@ def _f(v) -> str:
     return f"{v:.2f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else "?"
 
 
-def _node_line(n: dict) -> str:
+def _bearing(base, target):
+    """Where the target lies as seen from the base: the angle from the base yaw to the
+    base→target direction, in degrees (0 = along the yaw axis, ±180 = behind it)."""
+    if not (isinstance(base, list) and len(base) >= 3 and isinstance(target, list) and len(target) >= 2):
+        return None
+    ang = math.atan2(target[1] - base[1], target[0] - base[0]) - base[2]
+    return round(math.degrees((ang + math.pi) % (2 * math.pi) - math.pi))
+
+
+def _deg(v) -> str:
+    return f"{v}°" if v is not None else "?"
+
+
+def _reach(base, eef):
+    """Horizontal distance from the base to the end effector: how far the arm is extended."""
+    if not (isinstance(base, list) and len(base) >= 2 and isinstance(eef, list) and len(eef) >= 2):
+        return None
+    return round(math.dist(base[:2], eef[:2]), 3)
+
+
+def _faults(suite: dict) -> dict[tuple[str, str], int]:
+    """``{(seed, node): task.fault rows}`` from the suite's log excerpt: a node that passed
+    after faults passed on a recovery retry."""
+    counts: dict = {}
+    for line in suite.get("logs") or []:
+        m = re.match(r"seed (\S+) task\.fault .*?\"node\": \"([^\"]+)\"", line)
+        if m:
+            counts[(m.group(1), m.group(2))] = counts.get((m.group(1), m.group(2)), 0) + 1
+    return counts
+
+
+def _node_line(n: dict, faults: int = 0) -> str:
     mark = {True: "ok", False: "FAIL", None: "-"}[n.get("ok")]
     s = f"{n['id']} {mark}"
     if n.get("steps") is not None:
         s += f" {n['steps']}st"
     if n.get("failure_mode"):
         s += f" {n['failure_mode']}"
+    if faults and n.get("ok") is True:
+        s += f" (after {faults} fault{'s' if faults > 1 else ''}: passed on a recovery retry)"
     end = n.get("trace_end") or {}
     if not end and n.get("motion_end") and n.get("ok") is not True:
         me = n["motion_end"]
         s += f" [ended at step {me.get('step')}: base {me.get('base')} eef {me.get('eef')} (harness pose trace; no target)]"
     if end and n.get("ok") is not True:
-        s += (f" [eef→target {_f(end.get('d_eef_target'))} m, base→target {_f(end.get('d_base_target'))} m;"
+        s += (f" [eef→target {_f(end.get('d_eef_target'))} m, base→target {_f(end.get('d_base_target'))} m,"
+              f" target bearing {_deg(_bearing(end.get('base'), end.get('target')))} from base yaw,"
+              f" arm extended {_f(_reach(end.get('base'), end.get('eef')))} m;"
               f" eef {end.get('eef')} target {end.get('target')} base {end.get('base')}]")
     elif end:
         s += f" [d_eef {_f(end.get('d_eef_target'))} d_base {_f(end.get('d_base_target'))}]"
     return s
 
 
-def describe_seed(seed, s: dict, baseline_row: dict | None = None) -> str:
+def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict | None = None) -> str:
     trail = s.get("trail") or []
     ran = [n for n in trail if n.get("ok") is not None]
     left = len(trail) - len(ran)
+    faults = faults or {}
     head = (f"seed {seed}: {'SUCCESS' if s.get('success') else 'FAIL'}"
             + (f", first death {s['first_death']}" if s.get("first_death") else "")
             + (f" ({s['failure_mode']})" if s.get("failure_mode") else "") + f", {s.get('elapsed_s')} s")
-    lines = [head, "  " + " · ".join(_node_line(n) for n in ran) + (f" · ({left} nodes not reached)" if left else "")]
+    lines = [head, "  " + " · ".join(_node_line(n, faults.get((str(seed), n["id"]), 0)) for n in ran)
+             + (f" · ({left} nodes not reached)" if left else "")]
     dead = next((n for n in trail if n.get("id") == s.get("first_death")), None)
     if dead and dead.get("upstream"):
         u = dead["upstream"]
@@ -386,7 +427,8 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None) -> str:
 
 
 def describe_suite(suite: dict, baseline: dict | None = None, logs: bool = True) -> str:
-    out = [describe_seed(seed, s, (baseline or {}).get("seeds", {}).get(seed) if baseline else None)
+    faults = _faults(suite)
+    out = [describe_seed(seed, s, (baseline or {}).get("seeds", {}).get(seed) if baseline else None, faults)
            for seed, s in suite["seeds"].items()]
     fails: dict = {}
     for seed, s in suite["seeds"].items():
@@ -420,6 +462,34 @@ def keyframe_parts(session: Path, suite: dict, limit: int = MAX_IMAGES) -> list[
                 parts.append({"type": "text", "text": f"[seed {seed} {s.get('first_death')} keyframe {Path(rel).name}]"})
                 parts.append(part)
     return parts
+
+
+def _trace_lines(rows: list, keep: int = 40) -> tuple[list[str], int]:
+    """Every phase change plus an even sample of the rest, one short line per step with
+    only the nonzero command components: a node's whole motion in a few KB."""
+    if not rows:
+        return [], 1
+    step = max(1, len(rows) // keep)
+    picked, last = [], object()
+    for i, r in enumerate(rows):
+        if i % step == 0 or r.get("phase") != last or i == len(rows) - 1:
+            picked.append(r)
+        last = r.get("phase")
+    out = []
+    for r in picked:
+        cmd = r.get("cmd") or {}
+        vals = cmd.get("values") or {}
+        nz = " ".join(f"{k}={v:.2f}" for k, v in vals.items() if isinstance(v, (int, float)) and abs(v) > 1e-3)
+        s = f"{r.get('step')}" + (f" {r['phase']}" if r.get("phase") else "")
+        if "d_eef" in r or "d_base" in r:
+            s += f" d_eef {_f(r.get('d_eef'))} d_base {_f(r.get('d_base'))}"
+        s += f" eef {r.get('eef')} base {r.get('base')}"
+        if "grip" in r:
+            s += f" grip {r.get('grip')}"
+        if cmd:
+            s += f" | {cmd.get('mode', '')} {nz}".rstrip()
+        out.append(s)
+    return out, step
 
 
 def _series(suite: dict, seed, node) -> list:
@@ -577,21 +647,34 @@ class Workspace:
                 return f"{name} differs from the installed card; it is frozen"
         return None
 
-    def diff(self, against: Path | None = None, limit: int = 160) -> str:
-        """Unified diff of the copy against its parent (the incumbent's copy or the stock)."""
-        against = self.parent if against is None else against
-        out = []
+    def _changed_files(self, against: Path | None = None):
+        """``(rel, parent lines, copy lines)`` of every .py that differs from ``against``."""
+        against = Path(self.parent if against is None else against)
         names = {p.relative_to(self.path) for p in self.path.rglob("*.py") if "__pycache__" not in p.parts}
-        names |= {p.relative_to(against) for p in Path(against).rglob("*.py") if "__pycache__" not in p.parts}
+        names |= {p.relative_to(against) for p in against.rglob("*.py") if "__pycache__" not in p.parts}
         for rel in sorted(names):
-            a, b = Path(against) / rel, self.path / rel
+            a, b = against / rel, self.path / rel
             ta = a.read_text().splitlines() if a.exists() else []
             tb = b.read_text().splitlines() if b.exists() else []
             if ta != tb:
-                out += list(difflib.unified_diff(ta, tb, f"a/{rel}", f"b/{rel}", lineterm="", n=2))
+                yield str(rel), ta, tb
+
+    def diff(self, against: Path | None = None, limit: int = 160) -> str:
+        """Unified diff of the copy against its parent (the incumbent's copy or the stock)."""
+        out = []
+        for rel, ta, tb in self._changed_files(against):
+            out += list(difflib.unified_diff(ta, tb, f"a/{rel}", f"b/{rel}", lineterm="", n=2))
         if len(out) > limit:
             out = out[:limit] + [f"... ({len(out) - limit} more diff lines)"]
         return "\n".join(out)
+
+    def diffstat(self, against: Path | None = None) -> str:
+        """``file +added/-removed, ...`` against the parent; empty when identical."""
+        out = []
+        for rel, ta, tb in self._changed_files(against):
+            body = [l for l in difflib.unified_diff(ta, tb, lineterm="", n=0) if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+            out.append(f"{rel} +{sum(l[0] == '+' for l in body)}/-{sum(l[0] == '-' for l in body)}")
+        return ", ".join(out)
 
     def changed(self) -> bool:
         return bool(self.diff(limit=10 ** 9))
@@ -664,11 +747,15 @@ Method (one hypothesis at a time):
 3. Make the smallest edit that tests the hypothesis; run the failing seed; read the
    result; iterate. Do not repeat an experiment the notebook already records.
 4. When a state looks better, call evaluate: it runs EVERY development seed paired against
-   the incumbent. Accepted iff more milestones are gained than lost across all seeds AND no
-   seed that completed the whole task before fails it now. An accepted state becomes the
+   the incumbent. Accepted iff more milestones are gained than lost across all seeds AND the
+   number of seeds that complete the whole task does not drop. An accepted state becomes the
    incumbent immediately and you keep working on top of it (up to {max_evals} evaluations
    per round). finish ends the round (evaluating the current state if it changed since the
    last evaluate); give_up ends it without evaluating.
+Every result ends with a harness-kept ledger of this round: what your copy currently changes
+against the incumbent (file +added/-removed, changed knobs) and every probe and evaluation so
+far with the state it ran on. Trust it over your memory: earlier results get elided from this
+conversation as it grows, the ledger does not.
 The mission card (planner, verify predicates, recovery table) is readable as mission/<file>
 and the stock card as stock/<file>; neither is editable. If the incumbent's own patch is the
 obstacle, branch from the stock card or an earlier accepted round instead of patching the patch.
@@ -699,6 +786,16 @@ model calls are capped at {max_calls}), {max_probes} single-seed runs. finish is
 def _text(content) -> str:
     return content if isinstance(content, str) else " ".join(
         p.get("text", "[image]") for p in content if isinstance(p, dict) and p.get("type") != "image_url") or "[image]"
+
+
+def _tag(name: str, a: dict) -> str:
+    """``read drivers.py 1-120`` -- what a result held, for its elision placeholder."""
+    if name == "trace":
+        return f"trace seed {a.get('seed')} {a.get('node')}"
+    arg = a.get("path") or a.get("seed") or a.get("seeds") or a.get("name") or a.get("from") or ""
+    if name == "read" and (a.get("start", 1) != 1 or a.get("end")):
+        arg = f"{arg} {a.get('start', 1)}-{a.get('end') or ''}"
+    return f"{name} {arg}".strip()
 
 
 def _parse_actions(raw: str) -> list[dict]:
@@ -744,6 +841,9 @@ class Agent:
         for seed in baseline["seeds"]:
             self.last_runs[seed] = baseline
         self.probes: list[dict] = []
+        self.verdicts: list[str] = []      # one line per evaluation, for the ledger
+        self.tags: dict[int, str] = {}     # message index -> the actions whose results it holds
+        self.bare: dict[int, str] = {}     # message index -> its text without the ledger footer
         self.ran: dict[int, tuple] = {}   # seed -> (copy digest, knobs) of its last run
         self.usage = {"prompt": 0, "completion": 0, "cache_hit": 0}
         self.calls = 0
@@ -775,7 +875,42 @@ class Agent:
             parts += keyframe_parts(self.session, self.baseline)
         return parts if len(parts) > 1 else parts[0]["text"]
 
-    def _user(self, text: str, images: list | None = None) -> None:
+    def _state(self) -> str:
+        """What the copy changes against the incumbent right now, knobs included."""
+        knobs = ", ".join(f"{k} {self.knobs_from.get(k)}→{v}" for k, v in self.knobs.items() if self.knobs_from.get(k) != v)
+        code = self.ws.diffstat()
+        return " · ".join(x for x in (code, f"knobs {knobs}" if knobs else "") if x) or "identical to the incumbent"
+
+    def _ledger(self) -> str:
+        lines = [f"copy vs incumbent now: {self._state()}"]
+        for p in self.probes:
+            c = p.get("compare") or {}
+            if p.get("error"):
+                what = f"error {p['error'][:80]}"
+            else:
+                what = ("SUCCESS" if p.get("success") else f"died at {p.get('first_death')} {p.get('failure_mode') or ''}".strip())
+                what += (f", gained {[g.split(':', 1)[1] for g in c['gains']]}" if c.get("gains") else "") \
+                    + (f", LOST {[g.split(':', 1)[1] for g in c['regressions']]}" if c.get("regressions") else "") \
+                    + ("" if c.get("gains") or c.get("regressions") else ", no milestone change")
+            lines.append(f"{p['label']} seed {p['seed']} → {what}  @ {p.get('state', '?')}")
+        lines += self.verdicts
+        return "--- this round so far (harness-kept) ---\n" + "\n".join(lines)
+
+    def _user(self, text: str, images: list | None = None, tag: str | None = None, ledger: bool = False) -> None:
+        # the ledger rides only the NEWEST message: the previous one goes back to its bare text
+        for i, bare in list(self.bare.items()):
+            m = self.messages[i]
+            if isinstance(m.get("content"), list):
+                m["content"][0] = {"type": "text", "text": bare}
+            elif not (isinstance(m["content"], str) and m["content"].startswith("[elided")):
+                m["content"] = bare
+            del self.bare[i]
+        idx = len(self.messages)
+        if tag:
+            self.tags[idx] = tag
+        if ledger:
+            self.bare[idx] = text
+            text = text + "\n\n" + self._ledger()
         if images and self.images:
             # keyframes ride only the NEWEST message: every earlier image becomes a one-line
             # placeholder, or each call would resend every frame the round has ever shown
@@ -798,8 +933,12 @@ class Agent:
         i = 2
         while size() > MAX_CONTEXT_CHARS // 2 and i < len(self.messages) - 8:
             m = self.messages[i]
-            if m["role"] == "user" and not (isinstance(m["content"], str) and m["content"].startswith("[elided")):
-                m["content"] = f"[elided earlier result, {len(json.dumps(m['content'], default=str))} chars]"
+            n = len(json.dumps(m["content"], default=str))
+            # small results (edit receipts, verdict lines) stay; only bulk is elided, and the
+            # placeholder names what it held so a re-read is a choice, not a guess
+            if m["role"] == "user" and n > 1200 and not (isinstance(m["content"], str) and m["content"].startswith("[elided")):
+                m["content"] = f"[elided earlier result of: {self.tags.get(i) or 'a tool call'} ({n} chars)]"
+                self.bare.pop(i, None)
             i += 1
 
     def _persist(self, status: str, extra: dict | None = None) -> None:
@@ -870,7 +1009,7 @@ class Agent:
             self.messages.append({"role": "assistant", "content": raw})
             # a batch runs to its end, its first error, or its first run/finish/give_up; every
             # executed action counts against the budget, the results come back as ONE message
-            outputs, images = [], []
+            outputs, images, done = [], [], []
             try:
                 batch = _parse_actions(raw)
             except Exception as exc:  # noqa: BLE001 -- an unparsable reply is feedback, not a crash
@@ -879,6 +1018,7 @@ class Agent:
             for k, act in enumerate(batch):
                 name = act["action"]
                 self.actions[name] = self.actions.get(name, 0) + 1
+                done.append(_tag(name, act))
                 # reading is free: the budget counts what changes or simulates something
                 # (edit/write/tunable/run); model calls are capped at twice that separately
                 steps += 1 if name in ("edit", "write", "tunable", "run") else 0
@@ -913,7 +1053,7 @@ class Agent:
                     break
             if result is None:
                 self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} changes left, "
-                           f"{max(0, self.max_calls - self.calls)} calls left)", images)
+                           f"{max(0, self.max_calls - self.calls)} calls left)", images, tag="; ".join(done), ledger=True)
             self._persist("running")
         self._persist(result["status"], result)
         return result
@@ -934,12 +1074,14 @@ class Agent:
             raise ValueError(why)
         self.evals += 1
         self.last_eval_identity = self.state_identity()
+        state = self._state()
         self.tick(phase="retest", tried={"kind": "edit", "node": None})
         try:
             receipt = self.evaluate_cb(self.evals, str(a.get("summary") or a.get("thought") or "")[:600])
         finally:
             self.tick(phase="propose", llm_calls=self.calls)
         if receipt.get("error"):
+            self.verdicts.append(f"evaluation {self.evals} → did not run (the suite raised)  @ {state}")
             return f"evaluation {self.evals} failed to run: {receipt['error'][-1500:]}"
         after = receipt["after"]
         text = describe_suite(after, self.baseline, logs=False)
@@ -953,7 +1095,8 @@ class Agent:
                 self.last_runs[seed] = after
             self.ran = {}
         conf = receipt.get("confirm")
-        return (f"evaluation {self.evals}/{self.max_evals} on all development seeds -- {verdict}"
+        self.verdicts.append(f"evaluation {self.evals} → {verdict}  @ {state}")
+        return (f"evaluation {self.evals}/{self.max_evals} on all development seeds -- {verdict}\nevaluated state: {state}"
                 + (f"\nfresh-seed check {conf}" if conf else "") + "\n" + text)
 
     def _tool(self, name: str, a: dict) -> tuple[str, list]:
@@ -991,13 +1134,14 @@ class Agent:
                 if not rows:
                     ids = [n["id"] for n in (suite["seeds"][seed].get("trail") or []) if n.get("trace") or n.get("motion")]
                     raise ValueError(f"no motion trace for {node!r} on seed {seed}; traced nodes: {ids}")
-                step = max(1, len(rows) // 60)
+                lines, step = _trace_lines(rows)
                 return (f"{node} on seed {seed}: harness pose trace, {len(rows)} samples (every {step}th shown); "
                         "base=[x,y,yaw] eef=[x,y,z] in world frame; the target is whatever the stage computes\n"
-                        + "\n".join(json.dumps(r, default=str) for r in rows[::step])), []
-            step = max(1, len(rows) // 60)
-            return (f"{node} on seed {seed}: {len(rows)} sampled steps (every {step}th shown)\n"
-                    + "\n".join(json.dumps(r, default=str) for r in rows[::step])), []
+                        + "\n".join(lines)), []
+            lines, step = _trace_lines(rows)
+            return (f"{node} on seed {seed}: {len(rows)} sampled steps, {len(lines)} shown (every phase change + every "
+                    f"{step}th); base=[x,y,yaw] eef=[x,y,z]; after | the command mode and its nonzero components\n"
+                    + "\n".join(lines)), []
         if name == "run":
             if isinstance(a.get("seeds"), list):   # several seeds: each one is a probe, results together
                 texts, images = [], []
@@ -1025,7 +1169,7 @@ class Agent:
                                  "edit something or run another seed")
             self.ran[seed] = identity
             label = f"probe-{len(self.probes)}"
-            self.probes.append({"seed": seed, "label": label})
+            self.probes.append({"seed": seed, "label": label, "state": self._state()})
             self.tick(phase="probe", probe_index=len(self.probes) - 1)
             try:
                 suite = self.run_seed([seed], label)
@@ -1376,7 +1520,8 @@ def main(argv=None) -> int:
             cmp = compare(before, after)
             accepted = cmp["accepted"]
             why = (f"gained {cmp['gains']}, lost {cmp['regressions']}" if accepted else
-                   f"a finished seed failed: {cmp['lost_success']}" if cmp["lost_success"] else
+                   f"fewer seeds finish the task ({cmp['successes'][0]} → {cmp['successes'][1]}; lost {cmp['lost_success']})"
+                   if cmp["successes"][1] < cmp["successes"][0] else
                    f"lost {cmp['regressions']} for {cmp['gains']}: no net gain" if cmp["regressions"] or cmp["gains"] else
                    "no milestone gained")
             confirm = None
@@ -1388,7 +1533,7 @@ def main(argv=None) -> int:
                     ca = suite(cs, ws.path, tunables, f"confirm-after-{k}", media_on=False)
                     check = compare(cb, ca)
                     confirm = {"seeds": cs, "before": cb["count"], "after": ca["count"], "regressions": check["regressions"]}
-                    if check["lost_success"] or len(check["regressions"]) > len(check["gains"]):
+                    if check["successes"][1] < check["successes"][0] or len(check["regressions"]) > len(check["gains"]):
                         accepted, why = False, f"fresh seeds {cs} regressed {check['regressions']}"
                 except Exception as exc:
                     if cancelled():
@@ -1465,8 +1610,7 @@ def main(argv=None) -> int:
         if pending and outcome["status"] in ("finished", "error", "exhausted") and not ws.protected_ok():
             last = agent.probes[-1] if agent.probes else None
             if (last and agent.ran.get(last["seed"]) == agent.state_identity()
-                    and ((last.get("compare") or {}).get("lost_success") or
-                         len((last.get("compare") or {}).get("regressions") or []) > len((last.get("compare") or {}).get("gains") or []))):
+                    and len((last.get("compare") or {}).get("regressions") or []) > len((last.get("compare") or {}).get("gains") or [])):
                 # deterministic simulator: this exact state already lost on its own last probe
                 evals.append({"k": len(evals) + 1, "summary": outcome.get("summary") or "", "accepted": False,
                               "compare": last["compare"], "confirm": None,
@@ -1550,7 +1694,8 @@ def main(argv=None) -> int:
             c = p.get("compare") or {}
             entry.append(f"- probe seed {p['seed']}: " + (f"error {p['error'][:200]}" if p.get("error") else
                          f"{'success' if p.get('success') else 'fail at ' + str(p.get('first_death'))} "
-                         f"{p.get('failure_mode') or ''} gains {c.get('gains')} lost {c.get('regressions')}"))
+                         f"{p.get('failure_mode') or ''} gains {c.get('gains')} lost {c.get('regressions')}")
+                         + (f"  @ {p['state']}" if p.get("state") else ""))
         for e in evals:
             entry.append(f"- evaluation {e['k']}: {'ACCEPTED' if e['accepted'] else 'REJECTED'} -- {e.get('why')}"
                          + (f" ({e.get('summary')[:200]})" if e.get("summary") else ""))
@@ -1602,7 +1747,8 @@ def cluster_geometry(baseline: dict) -> str:
         return ""
     node = max(set(deaths), key=deaths.count)
     lines = [f"## {node} across seeds (the most common first death; passing seeds included)",
-             "seed | outcome | steps | end: eef→target, base→target, base [x,y,yaw] | target | stage geometry"]
+             ("seed | outcome | steps | end: eef→target, base→target, target bearing from base yaw, arm extended | "
+              "base [x,y,yaw] | target | stage geometry")]
     for seed, s in baseline["seeds"].items():
         n = next((n for n in s.get("trail") or [] if n.get("id") == node), None)
         if not n:
@@ -1611,8 +1757,10 @@ def cluster_geometry(baseline: dict) -> str:
         end = n.get("trace_end") or {}
         me = n.get("motion_end") or {}
         base = end.get("base") or me.get("base")
+        eef = end.get("eef") or me.get("eef")
         lines.append(f"{seed} | {'ok' if n.get('ok') else 'FAIL ' + str(n.get('failure_mode') or '')} | {n.get('steps')} | "
-                     f"{_f(end.get('d_eef_target'))}, {_f(end.get('d_base_target'))}, {base} | {end.get('target')} | "
+                     f"{_f(end.get('d_eef_target'))}, {_f(end.get('d_base_target'))}, "
+                     f"{_deg(_bearing(base, end.get('target')))}, {_f(_reach(base, eef))} | {base} | {end.get('target')} | "
                      f"{_flat({k: v for k, v in (n.get('geometry') or {}).items() if k not in ('base', 'point')})}")
     return "\n".join(lines)
 

@@ -243,18 +243,27 @@ def test_compare_accepts_a_net_milestone_gain_but_never_a_lost_success():
     before = {"seeds": {"1": _row([True, True, True, False], False), "2": _row([True, True, None, None], False)}}
     assert evolve.milestones(before["seeds"]["1"]) == {"n1": True, "n3": False, "task": False}
     gain = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, True, None, None], False)}}
-    assert evolve.compare(before, gain) == {"gains": ["1:n3", "1:task"], "regressions": [], "lost_success": [], "accepted": True}
+    assert evolve.compare(before, gain) == {"gains": ["1:n3", "1:task"], "regressions": [], "lost_success": [],
+                                            "successes": [0, 1], "accepted": True}
     # a trade that gains more than it loses is progress
     swap = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, False, None, None], False)}}
-    assert evolve.compare(before, swap) == {"gains": ["1:n3", "1:task"], "regressions": ["2:n1"], "lost_success": [], "accepted": True}
+    assert evolve.compare(before, swap) == {"gains": ["1:n3", "1:task"], "regressions": ["2:n1"], "lost_success": [],
+                                            "successes": [0, 1], "accepted": True}
     # an even trade is not
     even = {"seeds": {"1": _row([True, True, True, True], False), "2": _row([True, False, None, None], False)}}
     assert evolve.compare(before, even)["accepted"] is False
-    # a seed that had completed the whole task must keep completing it, whatever else is gained
+    # the number of seeds finishing the task may not drop: one finished seed swapped for
+    # another (same count, net milestone gain) passes; a finished seed lost for partial
+    # milestones elsewhere does not, whatever the net
     done = {"seeds": {"1": _row([True, True, True, True], True), "2": _row([True, True, None, None], False)}}
-    breaks = {"seeds": {"1": _row([True, True, True, False], False), "2": _row([True, True, True, True], True)}}
-    c = evolve.compare(done, breaks)
-    assert c["lost_success"] == ["1"] and c["accepted"] is False and c["gains"] == ["2:n3", "2:task"]
+    swapped = {"seeds": {"1": _row([True, True, True, True], False), "2": _row([True, True, True, True], True)}}
+    c = evolve.compare(done, swapped)
+    assert c["lost_success"] == ["1"] and c["successes"] == [1, 1] and c["accepted"] is True
+    partial = {"seeds": {"1": _row([True, True, True, False], False), "2": _row([True, True, True, True], False),
+                         "3": _row([True, True, True, True], False)}}
+    done3 = {"seeds": {**done["seeds"], "3": _row([True, False, None, None], False)}}
+    c = evolve.compare(done3, partial)
+    assert c["successes"] == [1, 0] and len(c["gains"]) > len(c["regressions"]) and c["accepted"] is False
     assert evolve.compare(before, before)["accepted"] is False
     assert evolve.compare(before, {"seeds": {}})["regressions"] == ["1:n1", "2:n1"]   # unmeasured = lost
     # no verify kind: every node's ok is the oracle's verify row

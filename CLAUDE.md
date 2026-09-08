@@ -72,8 +72,8 @@ development seeds (`run`), reads the milestone trail / pose trace / failure
 keyframes, and calls `evaluate` (up to `max_evals` per round; `finish` ends the
 round). An evaluation runs the full paired development suite against the
 incumbent; accepted iff more frozen milestones are gained than lost across the
-seeds and no seed that completed the task before fails it now; a whole-task gain
-is re-checked on fresh development seeds. An accepted state becomes the incumbent
+seeds and the number of seeds completing the whole task does not drop; a
+whole-task gain is re-checked on fresh development seeds. An accepted state becomes the incumbent
 at once (snapshot under `work/`) and the session continues on top of it;
 `campaigns/evolve-<task>/notebook.md` (hypothesis, diff, measured outcome per
 round) is the memory the next round reads. `predicates.py` and the mission
