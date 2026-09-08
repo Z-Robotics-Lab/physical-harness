@@ -261,6 +261,8 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
             if motion:
                 n["motion"] = motion[::max(1, len(motion) // 80)]
                 n["motion_end"] = motion[-1]
+            if (diag.get("media") or {}).get("objects_end"):
+                n["objects_end"] = diag["media"]["objects_end"]
         _link_upstream(row["trail"], dead, skills)
         if dead:   # the layout around the death, once per seed (fixtures + objects, harness.media.read_scene)
             scene = ((nodes.get(dead) or {}).get("diagnostics") or {}).get("media", {}).get("scene")
@@ -412,7 +414,8 @@ def _phases(n: dict) -> str:
                    if isinstance(grips[i], (int, float)) and isinstance(grips[i - 1], (int, float))
                    and grips[i] < 0 < grips[i - 1]), None)
     if opened is not None:
-        out.append(f"gripper opened at step {opened}")
+        at = next((r for r in rows if r.get("step") == opened), {})
+        out.append(f"gripper opened at step {opened}" + (f" (eef→target {_f(at['d_eef'])} m then)" if "d_eef" in at else ""))
     return "; ".join(out)
 
 
@@ -467,6 +470,11 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None, faults: dict 
                            if isinstance(v.get("pos"), list) and len(v["pos"]) >= 2), key=lambda t: t[0])[:8]
             lines.append("  layout near the base (dist m: name pos size): " + "; ".join(
                 f"{d:.2f}: {k} {v['pos']}{' ' + str(v['size']) if v.get('size') else ''}" for d, k, v in near))
+    if dead and dead.get("objects_end"):
+        target = (dead.get("trace_end") or {}).get("target") or (dead.get("geometry") or {}).get("point")
+        objs = sorted(dead["objects_end"].items(), key=lambda kv: math.dist(kv[1][:2], target[:2]) if target else 0)
+        lines.append("  task objects when the node ended (pos" + ("; horizontal distance to the node's target" if target else "") + "): "
+                     + "; ".join(f"{k[4:]} {v}" + (f" {math.dist(v[:2], target[:2]):.2f} m" if target else "") for k, v in objs[:6]))
     if s.get("fault"):
         lines.append(f"  fault: {json.dumps(s['fault'], default=str)[:300]}")
     if baseline_row is not None:

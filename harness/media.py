@@ -196,7 +196,11 @@ class SegmentRecorder:
         had_src, had_frames = self._src is not None, bool(self.frames)
         motion, self.motion = self.motion, []
         scene, self.scene = self.scene, None
-        extra = {**({"motion": motion} if motion else {}), **({"scene": scene} if scene else {})}
+        # where the task objects ended up (a released object may have rolled or fallen)
+        objects = {k: v["pos"] for k, v in (read_scene(self._env) or {}).items() if k.startswith("obj:")} \
+            if self._env is not None else {}
+        extra = {**({"motion": motion} if motion else {}), **({"scene": scene} if scene else {}),
+                 **({"objects_end": objects} if objects else {})}
         path = self.keep(node) if ok else None
         if path is not None:
             return {"kept": True, "file": str(path.relative_to(self.root)), **extra}
