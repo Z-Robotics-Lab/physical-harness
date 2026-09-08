@@ -1715,6 +1715,14 @@ def main(argv=None) -> int:
         per: dict = {}
         logs: list[str] = []
         for seed in seed_list:
+            if (replay or {}).get(str(seed)):
+                # a replayed run executes only from its start node: the points its source run
+                # left before that node are still this world's, so they ride along
+                src, dst = Path(replay[str(seed)]).parent, replay_dir / str(seed)
+                dst.mkdir(parents=True, exist_ok=True)
+                for f in src.glob("*.json"):
+                    if not (dst / f.name).exists():
+                        shutil.copy2(f, dst / f.name)
             per.update(outs[seed]["seeds"])
             logs += (outs[seed].get("logs") or [])[-(MAX_LOG_LINES // len(seed_list)):]
         return {"count": sum(bool(r.get("success")) for r in per.values()), "seeds": per, "sha": sha_json(per),
