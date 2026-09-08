@@ -35,6 +35,12 @@ KEYFRAME_QUALITY = 60   # 128px JPEG at q60: a few KB, well under the ~25 KB bud
 #: passed or failed, streamed to ``<seed>/episode.mp4`` at this size -- the operator's
 #: "watch the best round's rollout" view, never evidence. mp4 only (imageio+ffmpeg).
 EPISODE_SIZE = 256
+#: Failure keyframes are what a vision model reasons over: larger than the clips.
+KEYFRAME_SIZE = 256
+#: Driver-independent motion trace: base/eef pose read off the simulator every
+#: MOTION_EVERY driver steps (``read_pose``), so a segment's evidence never depends on
+#: what the stage driver chose to report.
+MOTION_EVERY = 2
 
 
 class SegmentRecorder:
@@ -48,6 +54,9 @@ class SegmentRecorder:
         self._ep = None            # the streaming episode writer, opened on the first frame
         self._ep_frames = 0
         self.frames: list[Any] = []   # PIL RGB images, SIZE x SIZE
+        self.big: list[Any] = []      # the same frames at KEYFRAME_SIZE, for the failure keyframes
+        self.motion: list[dict] = []  # [{step, base:[x,y,yaw], eef:[x,y,z]}] of the running segment
+        self._env = None
         self._src = None
         self._driver = None
         self._untap = None
@@ -57,7 +66,8 @@ class SegmentRecorder:
     # -- recording -------------------------------------------------------------
     def start(self, env: Any, driver: Any, embodiment: Any = None) -> None:
         self.stop()
-        self.frames, self._n, self.error, self._driver = [], 0, None, driver
+        self.frames, self.big, self.motion, self._n, self.error = [], [], [], 0, None
+        self._driver, self._env = driver, env
         emb = getattr(embodiment, "frame", None)
         src = getattr(driver, "frame", None) or getattr(env, "frame", None)
         # one callable(obs): the embodiment reads the obs, the legacy sources ignore it
@@ -75,6 +85,10 @@ class SegmentRecorder:
 
     def capture(self, obs: Any = None) -> None:
         self._n += 1
+        if self._n % MOTION_EVERY == 0 and self._env is not None:
+            pose = read_pose(self._env)
+            if pose:
+                self.motion.append({"step": self._n, **pose})
         if self._n % self.every or self._src is None:
             return
         try:
@@ -82,6 +96,7 @@ class SegmentRecorder:
             img = _to_image(raw)
             if img is not None:
                 self.frames.append(img)
+                self.big.append(_to_image(raw, KEYFRAME_SIZE))
                 if self.episode:
                     self._episode_frame(_to_image(raw, EPISODE_SIZE))
         except Exception as exc:  # noqa: BLE001 -- a lost frame never touches the task
@@ -131,7 +146,8 @@ class SegmentRecorder:
         """Discard the clip; with ``node``, first save up to 3 failure keyframes
         (``<node>.fail-<i>.jpg``, SIZE px JPEG) and return their file names."""
         self.stop()
-        frames, self.frames = self.frames, []
+        frames, self.frames = (self.big or self.frames), []
+        self.big = []
         if node is None or not frames:
             return []
         stall = getattr(self._driver, "last_progress_step", None)
@@ -152,7 +168,7 @@ class SegmentRecorder:
         """Encode the segment's frames to ``<root>/<task>/<seed>/<node>.(mp4|gif)``
         and index it. None when nothing was captured or every encode failed."""
         self.stop()
-        frames, self.frames = self.frames, []
+        frames, self.frames, self.big = self.frames, [], []
         if not frames:
             return None
         try:
@@ -176,13 +192,14 @@ class SegmentRecorder:
         same reason is indexed under ``index.json["dropped"]`` so a run with no
         clip at all still leaves a readable trace under media/."""
         had_src, had_frames = self._src is not None, bool(self.frames)
+        motion, self.motion = self.motion, []
         path = self.keep(node) if ok else None
         if path is not None:
-            return {"kept": True, "file": str(path.relative_to(self.root))}
+            return {"kept": True, "file": str(path.relative_to(self.root)), **({"motion": motion} if motion else {})}
         keyframes = self.drop(node)
         reason = ("verify_failed" if not ok else "no_frame_source" if not had_src
                   else "no_frames" if not had_frames else "encode_failed")
-        out = {"kept": False, "reason": reason}
+        out = {"kept": False, "reason": reason, **({"motion": motion} if motion else {})}
         if self.error:
             out["error"] = self.error
         try:
@@ -203,6 +220,28 @@ def recorder_for(brief: Any, seed: int) -> SegmentRecorder | None:
 
 
 # -- helpers -------------------------------------------------------------------
+
+def read_pose(env: Any) -> dict | None:
+    """Base ``[x, y, yaw]`` and end-effector ``[x, y, z]`` read straight off a
+    robosuite-style MuJoCo env (``env.sim``, ``env.robots``), duck-typed and
+    import-free; whichever half is absent is simply omitted. None when the env
+    exposes neither (the stdlib fakes)."""
+    sim, robots = getattr(env, "sim", None), getattr(env, "robots", None)
+    if sim is None:
+        return None
+    import contextlib
+    import math
+    out: dict = {}
+    with contextlib.suppress(Exception):   # fixed-base robots have no mobile base body
+        bid = sim.model.body_name2id("mobilebase0_base")
+        p, r = sim.data.body_xpos[bid], sim.data.body_xmat[bid]
+        out["base"] = [round(float(p[0]), 3), round(float(p[1]), 3), round(math.atan2(float(r[3]), float(r[0])), 3)]
+    with contextlib.suppress(Exception):   # no arm site: nothing to read
+        site = robots[0].eef_site_id
+        site = site["right"] if isinstance(site, dict) else site
+        out["eef"] = [round(float(v), 3) for v in sim.data.site_xpos[site][:3]]
+    return out or None
+
 
 def _to_image(raw: Any, size: int = SIZE):
     """A frame from any source shape -> size x size PIL RGB image. ``bytes`` is

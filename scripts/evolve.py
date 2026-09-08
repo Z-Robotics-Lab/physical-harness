@@ -241,6 +241,10 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
                 n["trace_end"] = diag["trace"]["end"]
             if diag.get("trace"):
                 n["trace"], n["geometry"] = diag["trace"], diag.get("geometry")
+            motion = (diag.get("media") or {}).get("motion") or []   # harness.media.read_pose, driver-independent
+            if motion:
+                n["motion"] = motion[::max(1, len(motion) // 80)]
+                n["motion_end"] = motion[-1]
         _link_upstream(row["trail"], dead, skills)
         per[str(seed)] = row
         logs += _log_excerpt(seed, log.rows(), dead, MAX_LOG_LINES // len(seeds))
@@ -325,6 +329,9 @@ def _node_line(n: dict) -> str:
     if n.get("failure_mode"):
         s += f" {n['failure_mode']}"
     end = n.get("trace_end") or {}
+    if not end and n.get("motion_end") and n.get("ok") is not True:
+        me = n["motion_end"]
+        s += f" [ended at step {me.get('step')}: base {me.get('base')} eef {me.get('eef')} (harness pose trace; no target)]"
     if end and n.get("ok") is not True:
         s += (f" [eef→target {_f(end.get('d_eef_target'))} m, base→target {_f(end.get('d_base_target'))} m;"
               f" eef {end.get('eef')} target {end.get('target')} base {end.get('base')}]")
@@ -863,8 +870,15 @@ class Agent:
                 raise ValueError(f"seed must be one of {self.dev_seeds}")
             rows = _series(suite, seed, node)
             if not rows:
-                ids = [n["id"] for n in (suite["seeds"][seed].get("trail") or []) if n.get("trace")]
-                raise ValueError(f"no motion trace for {node!r} on seed {seed}; traced nodes: {ids}")
+                row = next((n for n in (suite["seeds"][seed].get("trail") or []) if n.get("id") == node), None)
+                rows = (row or {}).get("motion") or []
+                if not rows:
+                    ids = [n["id"] for n in (suite["seeds"][seed].get("trail") or []) if n.get("trace") or n.get("motion")]
+                    raise ValueError(f"no motion trace for {node!r} on seed {seed}; traced nodes: {ids}")
+                step = max(1, len(rows) // 60)
+                return (f"{node} on seed {seed}: harness pose trace, {len(rows)} samples (every {step}th shown); "
+                        "base=[x,y,yaw] eef=[x,y,z] in world frame; the target is whatever the stage computes\n"
+                        + "\n".join(json.dumps(r, default=str) for r in rows[::step])), []
             step = max(1, len(rows) // 60)
             return (f"{node} on seed {seed}: {len(rows)} sampled steps (every {step}th shown)\n"
                     + "\n".join(json.dumps(r, default=str) for r in rows[::step])), []
