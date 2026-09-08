@@ -32,6 +32,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -246,6 +247,10 @@ def run_suite(task: str, binding: dict, seeds: list[int], arm: str, skills_root:
                 n["motion"] = motion[::max(1, len(motion) // 80)]
                 n["motion_end"] = motion[-1]
         _link_upstream(row["trail"], dead, skills)
+        if dead:   # the layout around the death, once per seed (fixtures + objects, harness.media.read_scene)
+            scene = ((nodes.get(dead) or {}).get("diagnostics") or {}).get("media", {}).get("scene")
+            if scene:
+                next(n for n in row["trail"] if n["id"] == dead)["scene"] = scene
         per[str(seed)] = row
         logs += _log_excerpt(seed, log.rows(), dead, MAX_LOG_LINES // len(seeds))
         tick(per_seed_partial=per_seed({"seeds": per}))
@@ -362,6 +367,13 @@ def describe_seed(seed, s: dict, baseline_row: dict | None = None) -> str:
                      f"({u.get('steps')} steps)")
     if dead and dead.get("geometry"):
         lines.append(f"  target geometry: {json.dumps(dead['geometry'], default=str)[:400]}")
+    if dead and dead.get("scene"):
+        base = (dead.get("trace_end") or {}).get("base") or (dead.get("motion_end") or {}).get("base")
+        if base:
+            near = sorted(((math.dist(base[:2], v["pos"][:2]), k, v) for k, v in dead["scene"].items()
+                           if isinstance(v.get("pos"), list) and len(v["pos"]) >= 2), key=lambda t: t[0])[:8]
+            lines.append("  layout near the base (dist m: name pos size): " + "; ".join(
+                f"{d:.2f}: {k} {v['pos']}{' ' + str(v['size']) if v.get('size') else ''}" for d, k, v in near))
     if s.get("fault"):
         lines.append(f"  fault: {json.dumps(s['fault'], default=str)[:300]}")
     if baseline_row is not None:
@@ -450,6 +462,12 @@ class Workspace:
             shutil.rmtree(path)
         shutil.copytree(source, path, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         return cls(path, stock, source)
+
+    def reset_from(self, source: Path) -> None:
+        """Replace the copy's contents with ``source`` (the stock card or an accepted
+        snapshot); ``parent`` (what acceptance is judged against) is unchanged."""
+        shutil.rmtree(self.path)
+        shutil.copytree(Path(source), self.path, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
     def _resolve(self, rel: str) -> Path:
         p = (self.path / rel).resolve()
@@ -652,7 +670,8 @@ Method (one hypothesis at a time):
    per round). finish ends the round (evaluating the current state if it changed since the
    last evaluate); give_up ends it without evaluating.
 The mission card (planner, verify predicates, recovery table) is readable as mission/<file>
-and the stock card as stock/<file>; neither is editable.
+and the stock card as stock/<file>; neither is editable. If the incumbent's own patch is the
+obstacle, branch from the stock card or an earlier accepted round instead of patching the patch.
 
 Reply with ONE JSON object per turn, no prose outside it. Inside JSON strings escape
 double quotes (or quote code with single quotes); an unparsable reply wastes an action.
@@ -668,6 +687,8 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "run", "seed": <development seed>}}                one episode of the copy on that seed
   {{"action": "run", "seeds": [<seed>, <seed>]}}                  several seeds at once (one probe each)
   {{"action": "evaluate", "summary": "<what changed and why, <=600 chars>"}}   the paired suite; accepted = incumbent
+  {{"action": "branch", "from": "incumbent" | "stock" | <accepted round number>}}   restart the copy from that
+      state (exact; your edits so far are discarded). Acceptance is always judged against the incumbent.
   {{"action": "finish", "summary": "<what changed and why, <=600 chars>"}}
   {{"action": "give_up", "reason": "..."}}
 Budget this round: {max_steps} changes (edit/write/tunable/run count; read/grep/trace are free,
@@ -703,8 +724,9 @@ class Agent:
     def __init__(self, ep, ws: Workspace, *, pkg: str, tunables: dict, knobs: dict, run_seed,
                  dev_seeds: list[int], baseline: dict, session: Path, notebook: str, proposal: dict | None,
                  max_steps: int, max_probes: int, max_tokens: int, options: dict, cancelled, audit_path: Path,
-                 tick, frontier: str | None = None, evaluate=None, max_evals: int = 3) -> None:
-        self.frontier = frontier
+                 tick, frontier: str | None = None, evaluate=None, max_evals: int = 3,
+                 branch=None, branches: str | None = None) -> None:
+        self.frontier, self.branch_cb, self.branches = frontier, branch, branches
         self.evaluate_cb, self.max_evals, self.evals = evaluate, max_evals, 0
         # reads are free of the change budget but not of tokens: the call cap bounds a round
         self.max_calls = max_steps + 20
@@ -742,6 +764,8 @@ class Agent:
                 + json.dumps(self.knobs, sort_keys=True),
                 "## Incumbent on the development seeds (what you must beat)\n" + describe_suite(self.baseline),
                 *([frontier] if frontier else []),
+                *([cluster_geometry(self.baseline)] if cluster_geometry(self.baseline) else []),
+                *([self.branches] if self.branches else []),
                 "## Notebook of previous rounds\n" + notebook]
         if proposal:
             text.append("## Operator proposal pending -- evaluate it first\n" + json.dumps(proposal, ensure_ascii=False)[:2000])
@@ -948,6 +972,13 @@ class Agent:
             self.knobs[k] = v
             self.tunables.setdefault(self.pkg, {}).setdefault("tunables", {})[k] = v
             return f"{k} = {v} for the next run (was {self.knobs_from.get(k)})", []
+        if name == "branch":
+            if self.branch_cb is None:
+                raise ValueError("branching is not available in this run")
+            text = self.branch_cb(str(a.get("from", "incumbent")))
+            self.knobs = dict(self.knobs_from)
+            self.ran = {}
+            return text, []
         if name == "trace":
             seed, node = str(a.get("seed")), a.get("node")
             suite = self.last_runs.get(seed)
@@ -1388,6 +1419,26 @@ def main(argv=None) -> int:
             evals.append(receipt)
             return receipt
 
+        # branch points: the stock card, the incumbent, every accepted round whose snapshot survives
+        points = {"stock": stock, "incumbent": inc_dir or stock}
+        blines = ["stock — the installed card as shipped", f"incumbent — round {incumbent.get('round') or 0}"]
+        for r in doc["rounds"]:
+            if r.get("accepted") and r.get("workspace") and (args.session / r["workspace"]).is_dir() \
+                    and r["round"] != incumbent.get("round"):
+                points[str(r["round"])] = args.session / r["workspace"]
+                blines.append(f"round {r['round']} — accepted then, score {r.get('after_score')}")
+        branches_text = "## Branch points (branch action)\n" + "\n".join(blines)
+
+        def branch_from(source: str, *, ws=ws, tunables=tunables, points=points) -> str:
+            src = points.get(source)
+            if src is None:
+                raise ValueError(f"branch.from must be one of {sorted(points)}")
+            ws.reset_from(src)
+            tunables.clear()
+            tunables.update(copy.deepcopy(incumbent["tunables"]))
+            return (f"copy reset to {source} ({Path(src).name}); knobs back to the incumbent's. "
+                    "Nothing has been evaluated for this state yet.")
+
         agent = Agent(ep, ws, pkg=pkg, tunables=tunables, knobs=dict(knobs_from),
                       run_seed=lambda sl, label, ws=ws, tunables=tunables: suite(sl, ws.path, tunables, label),
                       dev_seeds=dev, baseline=before, session=args.session,
@@ -1395,7 +1446,8 @@ def main(argv=None) -> int:
                       max_tokens=args.max_output_tokens, options=thinking, cancelled=cancelled,
                       audit_path=store.dir / "llm" / f"round-{rnd}.json", tick=tick,
                       frontier=failure_frontier(doc["rounds"], before, dev),
-                      evaluate=evaluate_state, max_evals=args.max_evals)
+                      evaluate=evaluate_state, max_evals=args.max_evals,
+                      branch=branch_from, branches=branches_text)
         try:
             outcome = agent.loop()
         except RuntimeError:   # a cancelled suite inside evaluate
@@ -1508,8 +1560,10 @@ def main(argv=None) -> int:
             entry.append("- result per seed:\n  " + "\n  ".join(
                 describe_seed(sd, after["seeds"][sd], before0["seeds"].get(sd)).split("\n")[0] for sd in after["seeds"]))
         notebook.append("\n".join(entry))
-        _trim_workspaces(store.dir / "work", keep={Path(incumbent["workspace"]).name} if incumbent.get("workspace") else set(),
-                         last=rnd)
+        keep = {Path(r["workspace"]).name for r in doc["rounds"] if r.get("accepted") and r.get("workspace")}
+        if incumbent.get("workspace"):
+            keep.add(Path(incumbent["workspace"]).name)
+        _trim_workspaces(store.dir / "work", keep=keep, last=rnd)
         _trim_episodes(args.session, args.task, int(incumbent.get("round") or 0), rnd)
         completed += 1
         if outcome["status"] == "error":
@@ -1525,6 +1579,42 @@ def main(argv=None) -> int:
     tick(phase="done")
     print(json.dumps({"task": args.task, "cursor": doc["cursor"], "best": doc["best"], "status": "done"}))
     return 0
+
+
+def _flat(d: dict, limit: int = 12) -> str:
+    """Numbers and short lists of a geometry dict, one line."""
+    out = []
+    for k, v in (d or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out.append(f"{k}={round(v, 3)}")
+        elif isinstance(v, list) and v and all(isinstance(x, (int, float)) for x in v) and len(v) <= 3:
+            out.append(f"{k}={[round(x, 3) for x in v]}")
+        if len(out) >= limit:
+            break
+    return " ".join(out)
+
+
+def cluster_geometry(baseline: dict) -> str:
+    """The most common first-death node, side by side on EVERY seed -- the ones that pass
+    it included: where the base stood, where the target was, what the stage measured."""
+    deaths = [s.get("first_death") for s in baseline["seeds"].values() if s.get("first_death")]
+    if not deaths:
+        return ""
+    node = max(set(deaths), key=deaths.count)
+    lines = [f"## {node} across seeds (the most common first death; passing seeds included)",
+             "seed | outcome | steps | end: eef→target, base→target, base [x,y,yaw] | target | stage geometry"]
+    for seed, s in baseline["seeds"].items():
+        n = next((n for n in s.get("trail") or [] if n.get("id") == node), None)
+        if not n:
+            lines.append(f"{seed} | not reached")
+            continue
+        end = n.get("trace_end") or {}
+        me = n.get("motion_end") or {}
+        base = end.get("base") or me.get("base")
+        lines.append(f"{seed} | {'ok' if n.get('ok') else 'FAIL ' + str(n.get('failure_mode') or '')} | {n.get('steps')} | "
+                     f"{_f(end.get('d_eef_target'))}, {_f(end.get('d_base_target'))}, {base} | {end.get('target')} | "
+                     f"{_flat({k: v for k, v in (n.get('geometry') or {}).items() if k not in ('base', 'point')})}")
+    return "\n".join(lines)
 
 
 def failure_frontier(rounds: list[dict], baseline: dict, seeds: list[int], window: int = 5) -> str:

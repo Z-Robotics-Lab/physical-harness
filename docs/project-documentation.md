@@ -533,10 +533,13 @@ clone 合法地显示**更多跳过，绝不是失败**：
    （编辑被拒，跑前再校验哈希）；任务的 mission 卡（规划器、验证谓词绑定）根本不在副本里。
 3. **agent 会话**：系统提示给出方法（一次一个假设；先在能解释现象的最高层定位——恢复/
    接近策略先于数值旋钮；最小改动；跑失败种子验证；笔记本里记过的实验不重复）。用户消息给
-   基线证据、副本文件表、当前 tunables、**失败前沿**表（每个种子：incumbent 死在哪、最近 5 轮花了几次试跑、
+   基线证据（每个种子的里程碑轨迹；首死节点的停滞几何、驱动无关的位姿轨迹、附近 fixtures 的位置尺寸）、
+   最常见首死节点在**所有种子**（含通过的）上的几何对照表、可分支的起点（原版卡、incumbent、被接受的快照）、
+   副本文件表、当前 tunables、**失败前沿**表（每个种子：incumbent 死在哪、最近 5 轮花了几次试跑、
    最后一次有增益的轮次）、上一轮为止的**笔记本**、待处理的 operator proposal 和失败关键帧（视觉模型时）。每回合模型回一个 JSON 动作，或一组动作 `{"actions": [...]}`（依次执行，遇错或遇 run 停下，结果合成一条消息返回）：
    `read / grep / edit(old→new，必须唯一命中，写前编译) / write / tunable / trace(某节点的
-   逐步运动序列) / run(seed) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
+   逐步运动序列) / run(seed 或 seeds) / evaluate(summary) / branch(from: stock | incumbent | 被接受的轮次，
+   精确重置副本) / finish(summary) / give_up(reason)`。工具结果作为下一条用户
    消息返回，对话在一轮内累积（超过 12 万字符时最早的工具结果一次折叠到 6 万，关键帧图片只保留最新一条消息里的）。`run` 在副本上跑
    一个开发种子，返回同种子相对 incumbent 的里程碑增减和关键帧。预算是 `max_steps`
    （只数 edit/write/tunable/run，默认 40；read/grep/trace 免费，模型调用上限为其两倍）、`max_probes`

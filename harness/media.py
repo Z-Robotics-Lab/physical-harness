@@ -56,6 +56,7 @@ class SegmentRecorder:
         self.frames: list[Any] = []   # PIL RGB images, SIZE x SIZE
         self.big: list[Any] = []      # the same frames at KEYFRAME_SIZE, for the failure keyframes
         self.motion: list[dict] = []  # [{step, base:[x,y,yaw], eef:[x,y,z]}] of the running segment
+        self.scene: dict | None = None
         self._env = None
         self._src = None
         self._driver = None
@@ -68,6 +69,7 @@ class SegmentRecorder:
         self.stop()
         self.frames, self.big, self.motion, self._n, self.error = [], [], [], 0, None
         self._driver, self._env = driver, env
+        self.scene = read_scene(env)   # the layout at segment start (objects move; fixtures do not)
         emb = getattr(embodiment, "frame", None)
         src = getattr(driver, "frame", None) or getattr(env, "frame", None)
         # one callable(obs): the embodiment reads the obs, the legacy sources ignore it
@@ -193,13 +195,15 @@ class SegmentRecorder:
         clip at all still leaves a readable trace under media/."""
         had_src, had_frames = self._src is not None, bool(self.frames)
         motion, self.motion = self.motion, []
+        scene, self.scene = self.scene, None
+        extra = {**({"motion": motion} if motion else {}), **({"scene": scene} if scene else {})}
         path = self.keep(node) if ok else None
         if path is not None:
-            return {"kept": True, "file": str(path.relative_to(self.root)), **({"motion": motion} if motion else {})}
+            return {"kept": True, "file": str(path.relative_to(self.root)), **extra}
         keyframes = self.drop(node)
         reason = ("verify_failed" if not ok else "no_frame_source" if not had_src
                   else "no_frames" if not had_frames else "encode_failed")
-        out = {"kept": False, "reason": reason, **({"motion": motion} if motion else {})}
+        out = {"kept": False, "reason": reason, **extra}
         if self.error:
             out["error"] = self.error
         try:
@@ -220,6 +224,32 @@ def recorder_for(brief: Any, seed: int) -> SegmentRecorder | None:
 
 
 # -- helpers -------------------------------------------------------------------
+
+def read_scene(env: Any) -> dict | None:
+    """The kitchen as the simulator lays it out for this seed: every fixture's ``pos``
+    (and ``size`` when it has one) plus every task object's body position -- duck-typed
+    off ``env.fixtures`` / ``env.obj_body_id`` (robocasa), import-free. None elsewhere."""
+    import contextlib
+    out: dict = {}
+    fixtures = getattr(env, "fixtures", None)
+    if isinstance(fixtures, dict):
+        for name, fx in fixtures.items():
+            with contextlib.suppress(Exception):
+                pos = getattr(fx, "pos", None)
+                if pos is None:
+                    continue
+                entry = {"pos": [round(float(v), 3) for v in list(pos)[:3]]}
+                size = getattr(fx, "size", None)
+                if size is not None:
+                    entry["size"] = [round(float(v), 3) for v in list(size)[:3]]
+                out[str(name)] = entry
+    objs, sim = getattr(env, "obj_body_id", None), getattr(env, "sim", None)
+    if isinstance(objs, dict) and sim is not None:
+        for name, bid in objs.items():
+            with contextlib.suppress(Exception):
+                out[f"obj:{name}"] = {"pos": [round(float(v), 3) for v in sim.data.body_xpos[bid][:3]]}
+    return out or None
+
 
 def read_pose(env: Any) -> dict | None:
     """Base ``[x, y, yaw]`` and end-effector ``[x, y, z]`` read straight off a
