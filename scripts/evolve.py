@@ -641,7 +641,8 @@ at a run. Keep "thought" to two sentences; the notebook, not the chat, is your m
   {{"action": "run", "seed": <development seed>}}                one episode of the copy on that seed
   {{"action": "finish", "summary": "<what changed and why, <=600 chars>"}}
   {{"action": "give_up", "reason": "..."}}
-Budget this round: {max_steps} actions, {max_probes} single-seed runs. finish is free.
+Budget this round: {max_steps} changes (edit/write/tunable/run count; read/grep/trace are free,
+model calls are capped at {max_calls}), {max_probes} single-seed runs. finish is free.
 """
 
 
@@ -694,7 +695,8 @@ class Agent:
         self.actions: dict[str, int] = {}
         self.finishes: dict[str, int] = {}   # finish_reason counts ("length" = the answer was cut off)
         self.errors: list[str] = []
-        self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes)},
+        self.messages = [{"role": "system", "content": SYSTEM.format(pkg=pkg, max_steps=max_steps, max_probes=max_probes,
+                                                                     max_calls=2 * max_steps)},
                          {"role": "user", "content": self._brief(notebook, proposal)}]
         self.raw: list[str] = []
 
@@ -762,7 +764,7 @@ class Agent:
             if self.cancelled():
                 result = {"status": "cancelled", "reason": "cancelled at an agent step"}
                 break
-            if steps >= self.max_steps:
+            if steps >= self.max_steps or self.calls >= 2 * self.max_steps:
                 result = ({"status": "finished", "summary": "(action budget exhausted; evaluating the edits as they stand)",
                            "reason": "steps_exhausted"} if self.ws.changed() or self.knobs != self.knobs_from
                           else {"status": "exhausted", "reason": "action budget exhausted without an edit"})
@@ -809,7 +811,6 @@ class Agent:
             empties, plain_retry = 0, False
             self.raw.append(raw)
             self.messages.append({"role": "assistant", "content": raw})
-            steps += 1
             # a batch runs to its end, its first error, or its first run/finish/give_up; every
             # executed action counts against the budget, the results come back as ONE message
             outputs, images = [], []
@@ -821,7 +822,9 @@ class Agent:
             for k, act in enumerate(batch):
                 name = act["action"]
                 self.actions[name] = self.actions.get(name, 0) + 1
-                steps += 1 if k else 0
+                # reading is free: the budget counts what changes or simulates something
+                # (edit/write/tunable/run); model calls are capped at twice that separately
+                steps += 1 if name in ("edit", "write", "tunable", "run") else 0
                 if name == "finish":
                     result = {"status": "finished", "summary": str(act.get("summary") or act.get("thought") or "")[:600],
                               "reason": "finish"}
@@ -842,7 +845,8 @@ class Agent:
                     outputs.append("(read this result before the rest of the batch; it was skipped)")
                     break
             if result is None:
-                self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} actions left)", images)
+                self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} changes left, "
+                           f"{max(0, 2 * self.max_steps - self.calls)} calls left)", images)
             self._persist("running")
         self._persist(result["status"], result)
         return result
