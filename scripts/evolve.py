@@ -817,8 +817,9 @@ Method (one hypothesis at a time):
 3. Make the smallest edit that tests the hypothesis; run the failing seed (from its death
    node when nothing before it changed) AND a passing seed before evaluating; read the
    result; iterate.
-4. When a state looks better, call evaluate: it runs EVERY development seed paired against
-   the incumbent. Accepted iff more milestones are gained than lost across all seeds AND the
+4. When a probe of the current state GAINED a milestone, call evaluate: it runs EVERY
+   development seed paired against the incumbent (a state no probe of which gained anything
+   is refused -- the suite confirms gains, it does not look for them). Accepted iff more milestones are gained than lost across all seeds AND the
    number of seeds that complete the whole task does not drop. An accepted state becomes the
    incumbent immediately and you keep working on top of it (up to {max_evals} evaluations
    per round). finish ends the round (evaluating the current state if it changed since the
@@ -1161,6 +1162,19 @@ class Agent:
     def state_identity(self) -> tuple:
         return (self.ws.digest(), json.dumps(self.tunables, sort_keys=True))
 
+    def unproven(self) -> str | None:
+        """Why the current state may not be evaluated: the paired suite confirms a gain a
+        probe already showed, it does not go looking for one. None when some probe of
+        this exact state (a replay counts) gained a milestone."""
+        sid = sha_json(list(self.state_identity()))
+        probed = [p for p in self.probes if p.get("state_id") == sid]
+        if not probed:
+            return "this exact state has not been run on any development seed yet; run it (a replay counts) before evaluate"
+        if not any((p.get("compare") or {}).get("gains") for p in probed):
+            return ("no probe of this exact state gained a milestone; evaluate would only confirm that -- "
+                    "keep working, branch, or finish")
+        return None
+
     def _evaluate(self, a: dict) -> str:
         """The paired suite on every development seed; an accepted state becomes the
         incumbent at once and the session continues on top of it."""
@@ -1171,6 +1185,8 @@ class Agent:
         if not self.ws.changed_code() and self.knobs == self.knobs_from:
             raise ValueError("nothing changed since the incumbent (comments/whitespace do not count)")
         if why := self.ws.protected_ok():
+            raise ValueError(why)
+        if why := self.unproven():
             raise ValueError(why)
         self.evals += 1
         self.last_eval_identity = self.state_identity()
@@ -1275,10 +1291,11 @@ class Agent:
                     raise ValueError(f"seed {seed} already ran with exactly this code and these knobs"
                                      f"{' from ' + node if node else ''} (see its result above); edit something or run another seed")
             label = f"probe-{len(self.probes)}"
-            state = self._state()
+            state, sid = self._state(), sha_json(list(self.state_identity()))
             for seed in seeds:
                 self.ran[seed] = identity
-                self.probes.append({"seed": seed, "label": label, "state": state, **({"from": node} if node else {})})
+                self.probes.append({"seed": seed, "label": label, "state": state, "state_id": sid,
+                                    **({"from": node} if node else {})})
             self.tick(phase="probe", probe_index=len(self.probes) - 1)
             try:
                 suite = self.run_seed(seeds, label, replay or None)
@@ -1781,14 +1798,12 @@ def main(argv=None) -> int:
         # the model finished with a changed state, OR it became unusable (error / silence) with
         # edits pending: the simulator does not need the model, pending edits are still measured
         if pending and outcome["status"] in ("finished", "error", "exhausted") and not ws.protected_ok():
-            last = agent.probes[-1] if agent.probes else None
-            if (last and agent.ran.get(last["seed"]) == agent.state_identity()
-                    and len((last.get("compare") or {}).get("regressions") or []) > len((last.get("compare") or {}).get("gains") or [])):
-                # deterministic simulator: this exact state already lost on its own last probe
+            if why_not := agent.unproven():
+                # the paired suite confirms a gain a probe showed; a state no probe of which
+                # gained anything is sealed as such, without spending the suite on it
                 evals.append({"k": len(evals) + 1, "summary": outcome.get("summary") or "", "accepted": False,
-                              "compare": last["compare"], "confirm": None,
-                              "why": f"rejected without a retest: the last run of this exact state (seed {last['seed']}) "
-                                     f"already lost {last['compare'].get('regressions')}"})
+                              "compare": {"gains": [], "regressions": [], "lost_success": [], "accepted": False},
+                              "confirm": None, "why": f"not evaluated: {why_not}"})
             else:
                 try:
                     evaluate_state(len(evals) + 1, outcome.get("summary") or "")

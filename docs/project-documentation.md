@@ -561,7 +561,11 @@ clone 合法地显示**更多跳过，绝不是失败**：
    （只数 edit/write/tunable/run，默认 40；read/grep/trace 免费，模型调用上限为其两倍）、`max_probes`
    （单种子试跑，默认 8，`run` 可一次给多个种子）和 `max_evals`——不再按字节限流。动作用完而副本已有
    改动时，按 finish 处理。副本外的 mission 卡和原版卡可以 `read`（`mission/<file>`、`stock/<file>`），不能改。
-4. **验收**：`evaluate`（一轮最多 `max_evals`=3 次；`finish` 结束本轮，状态有变则先评一次）让副本跑全部
+4. **验收**：`evaluate`（一轮最多 `max_evals`=3 次；`finish` 结束本轮，状态有变则先评一次）只接受**已有 probe 显示增益**的
+   状态：当前状态没跑过、或跑过但没有任何 probe 拿到新里程碑，evaluate 被拒，finish 时也不跑套件而直接封存为
+   「未评测」——配对套件是确认增益的，不是去找增益的（650 轮模型明知无增益仍评测，白跑一套）。重放 `run` 单独预算
+   `2 × max_probes`。系统提示告知模型可以把 done() 的子条件等写进驱动的 `provenance()`（出现在死亡节点 geometry 行）
+   或 `failure_mode`，自己装探针。通过校验后它让副本跑全部
    开发种子，和 incumbent **同种子配对**比较里程碑向量（每个种子的
    verify 节点是否通过 + 任务是否成功；没有 verify 类节点的计划用全部节点的 oracle 结果）。verify 是 mission
    卡的谓词（世界状态，部分还合取了段落自报），任务成功是本体的 `terminal_success`；两者都在副本之外。
