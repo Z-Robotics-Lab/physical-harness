@@ -51,12 +51,13 @@ EDIT = {"thought": "the standoff is too large", "action": "edit", "path": "stage
 RUN = {"action": "run", "seed": 1}
 FINISH = {"action": "finish", "summary": "lower the loaded standoff so the grab lands"}
 GIVE_UP = {"action": "give_up", "reason": "every seed already succeeds"}
+NOTE = {"action": "note", "text": "STOP lives in stage.py; 0.3 lands the grab", "keep": False}
 
 
 @pytest.fixture(scope="module")
 def runtime(tmp_path_factory):
     rt = _Runtime(tmp_path_factory.mktemp("runs"), card=_CARD,
-                  canned=[READ, DIAGNOSE, EDIT_FROZEN, EDIT, RUN, FINISH, GIVE_UP], mode="evolution")
+                  canned=[READ, DIAGNOSE, EDIT_FROZEN, EDIT, RUN, FINISH, NOTE, GIVE_UP, NOTE], mode="evolution")
     rt.campaign = rt.session / "campaigns" / f"evolve-{TASK}" / "campaign.json"
     yield rt
     rt.stop()
@@ -102,7 +103,10 @@ def test_live_block_shows_every_phase_and_done_at_the_end(runtime, two_rounds):
     texts = {m["text"] for l in _LIVE for m in l["messages"]}
     assert any("LLM 分析" in t for t in texts) and any("单种子试跑" in t for t in texts), texts
     base = [l for l in _LIVE if l["phase"] == "baseline" and l["round"] == 1]
-    assert {l["seed"] for l in base} >= {1, 2} and {"reach-0", "grab-0"} & {l["node"] for l in base}
+    # seeds run as parallel children: a seed too quick for the poller still has its own live row
+    seen = {l["seed"] for l in base} | {int(k) for l in base for k in (l.get("seeds_live") or {})}
+    assert seen >= {1, 2} and {"reach-0", "grab-0"} & ({l["node"] for l in base}
+                                                        | {r.get("node") for l in base for r in (l.get("seeds_live") or {}).values()})
     assert all(l["seeds_total"] == 2 for l in base if l["seed_index"] is not None)
     probe = [l for l in _LIVE if l["phase"] == "probe" and l["seed_index"] is not None]
     assert probe and all(l["seeds_total"] == 1 and l["seed"] == 1 for l in probe)
@@ -128,12 +132,14 @@ def test_round_one_edits_the_copy_and_is_accepted_round_two_gives_up(runtime, tw
     assert r1["accepted_reason"].startswith("gained ") and "1:grab-0" in r1["accepted_reason"]
     assert r1["proposal"]["kind"] == "tunables" and r1["parent"] == 0
     # the read before the diagnosis is refused (a call, not a step); the diagnosis is kept on the row
-    assert r1["llm"]["status"] == "finished" and r1["llm"]["actions"] == {"read": 1, "diagnose": 1, "edit": 2, "run": 1, "finish": 1}
+    assert r1["llm"]["status"] == "finished" and r1["llm"]["actions"] == {"read": 1, "diagnose": 1, "edit": 2, "run": 1, "finish": 1, "note": 1}
     assert any("frozen" in e for e in r1["llm"]["errors"]) and any("diagnose first" in e for e in r1["llm"]["errors"])
     assert r1["diagnosis"] == [DIAGNOSE | {}] or r1["diagnosis"][0]["hypothesis"] == DIAGNOSE["hypothesis"]
     assert [p["seed"] for p in r1["probes"]] == [1] and r1["probes"][0]["success"] is True
     assert r1["probes"][0]["compare"]["gains"] == ["1:grab-0", "1:task"]
-    assert r1["usage"]["model_calls"] == 6 and r1["usage"]["episode_attempts"] == 2 + 1 + 2 + 2 + 2
+    assert r1["usage"]["model_calls"] == 7 and r1["usage"]["episode_attempts"] == 2 + 1 + 2 + 2 + 2
+    # the closing note call wrote the model's notes; they ride into the next brief
+    assert "STOP lives in stage.py" in (runtime.session / f"campaigns/evolve-{TASK}" / "notes.md").read_text()
     # the incumbent IS the edited copy; the next round starts from it
     assert doc["incumbent"] == {"workspace": f"campaigns/evolve-{TASK}/work/r1e1", "round": 1, "tunables": {}}
     assert [e["accepted"] for e in r1["evaluations"]] == [True] and r1["evaluations"][0]["gains"] == ["1:grab-0", "1:task", "2:grab-0", "2:task"]
@@ -148,7 +154,7 @@ def test_round_one_edits_the_copy_and_is_accepted_round_two_gives_up(runtime, tw
     assert "## Round 1 — ACCEPTED" in nb and "+    STOP = 0.3" in nb and "probe seed 1: success" in nb
     assert "## Round 2 — NO EDIT" in nb
     audit = json.loads((runtime.session / f"campaigns/evolve-{TASK}/llm/round-1.json").read_text())
-    assert audit["status"] == "finished" and audit["calls"] == 6 and audit["diagnoses"][0]["plan"] == "lower STOP"
+    assert audit["status"] == "finished" and audit["calls"] == 7 and audit["diagnoses"][0]["plan"] == "lower STOP"
     assert "Operator proposal pending" in audit["messages"][1]["content"]
     assert audit["messages"][2]["content"] == json.dumps(READ)
     # media: verified segments kept as clips per phase, never overwritten across phases

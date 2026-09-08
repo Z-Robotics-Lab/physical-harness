@@ -579,7 +579,8 @@ clone 合法地显示**更多跳过，绝不是失败**：
    （`campaign.json.incumbent = {workspace, round, tunables}`），下一轮从它再复制。
 4b. **跨轮的工作**：`note` 动作写模型自己的持久笔记（`campaigns/evolve-<task>/notes.md`，6 KB 上限，追加或
    `replace` 重写），每轮简报原样带上——代码地图、死路，省掉每轮重读 3000 行代码（651 轮 60 次调用里 55 次是
-   read/grep）。`finish` 带 `keep: true` 把当前副本**停靠**为下一轮的起点（`campaign.json.parked`，未评测，
+   read/grep）。模型这一轮没写笔记的话，轮末 harness 额外发一次调用要一条（可顺带 `keep`），保证跨轮记忆不靠模型自觉。
+   `read "."` 列出副本文件。live 块在 `seeds_live` 下按种子各保留一行（并行子进程各自 tick）。`finish` 带 `keep: true` 把当前副本**停靠**为下一轮的起点（`campaign.json.parked`，未评测，
    简报里给出它相对 incumbent 的 diff），验收仍然对 incumbent；被接受、或下一轮没有再 keep，停靠即清除。
 5. **笔记本**：`campaigns/evolve-<task>/notebook.md` 追加这一轮：判定、假设、tunables 改动、
    每次 diagnose 一行、每次 probe 的结果一行（含它运行时副本相对 incumbent 的改动统计）、相对父副本的

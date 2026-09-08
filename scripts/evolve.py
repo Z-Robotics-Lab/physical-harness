@@ -653,6 +653,8 @@ class Workspace:
         return self._resolve(rel)
 
     def read(self, rel: str, start: int = 1, end: int | None = None) -> str:
+        if rel.strip() in ("", ".", "./"):
+            return "files of the copy:\n  " + "\n  ".join(self.files())
         lines = self._readable(rel).read_text().split("\n")
         a = max(1, int(start or 1))
         b = min(len(lines), int(end) if end else len(lines), a + READ_MAX_LINES - 1)   # bounded: read again for more
@@ -664,7 +666,7 @@ class Workspace:
     def grep(self, pattern: str, path: str | None = None) -> str:
         rx = re.compile(pattern)
         hits = []
-        files = [self._resolve(path)] if path else sorted(self.path.rglob("*.py"))
+        files = [self._resolve(path)] if path and path.strip() not in ("", ".", "./") else sorted(self.path.rglob("*.py"))
         for p in files:
             if "__pycache__" in p.parts or not p.is_file():
                 continue
@@ -849,7 +851,8 @@ Method (one hypothesis at a time):
    per round). finish ends the round (evaluating the current state if it changed since the
    last evaluate); give_up ends it without evaluating.
 Your notes and a parked copy are how work crosses rounds: a round that ends reading is not lost
-if its map went into the notes and its half-built change was kept.
+if its map went into the notes and its half-built change was kept. Every round closes with one
+note call (asked for if you did not write one) that may also set keep.
 Every result ends with a harness-kept ledger of this round: what your copy currently changes
 against the incumbent (file +added/-removed, changed knobs) and every probe and evaluation so
 far with the state it ran on. Trust it over your memory: earlier results get elided from this
@@ -1190,8 +1193,40 @@ class Agent:
                 self._user("\n\n".join(outputs) + f"\n({max(0, self.max_steps - steps)} changes left, "
                            f"{max(0, self.max_calls - self.calls)} calls left)", images, tag="; ".join(done), ledger=True)
             self._persist("running")
+        if result["status"] in ("finished", "gave_up", "exhausted") and self.note_cb is not None and not self.actions.get("note"):
+            self._closing_note(result)
         self._persist(result["status"], result)
         return result
+
+    def _closing_note(self, result: dict) -> None:
+        """One call past the budget: the round's learning goes into the notes whether or
+        not the model thought of it, and it says whether the copy is worth keeping."""
+        self._user("The round is over. Reply with ONE JSON object {\"action\": \"note\", \"text\": \"...\", "
+                   "\"replace\": false, \"keep\": false}: text = what the next round must know that the evidence "
+                   "tables will not tell it (where in the code the relevant logic lives, what you established, what "
+                   "failed and why, the next experiment); replace=true rewrites the notes instead of appending; "
+                   "keep=true parks your current copy as the next round's starting point.", tag="closing note")
+        try:
+            raw = self.ep.chat(self.messages, max_tokens=self.max_tokens, response_format={"type": "json_object"},
+                               thinking={"type": "disabled"})
+        except Exception as exc:  # noqa: BLE001 -- the endpoint is infrastructure; the round is already decided
+            self.errors.append(f"closing note failed: {str(exc)[:200]}")
+            return
+        self.calls += 1
+        u = getattr(self.ep, "last_usage", None) or {}
+        for k in self.usage:
+            self.usage[k] += int(u.get(k) or 0)
+        self.messages.append({"role": "assistant", "content": raw or ""})
+        try:
+            act = _parse_actions(raw or "")[0]
+            text = str(act.get("text") or act.get("note") or "").strip()
+            if text:
+                self.notes = self.note_cb(text, bool(act.get("replace")))
+                self.actions["note"] = self.actions.get("note", 0) + 1
+            if act.get("keep") and result.get("status") == "finished":
+                result["keep"] = True
+        except Exception as exc:  # noqa: BLE001 -- a bad closing note is not worth a crash
+            self.errors.append(f"closing note unusable: {str(exc)[:200]}")
 
     def state_identity(self) -> tuple:
         return (self.ws.digest(), json.dumps(self.tunables, sort_keys=True))
@@ -1565,7 +1600,11 @@ def main(argv=None) -> int:
     def tick(**kw) -> None:
         if kw.get("phase", live["phase"]) != live["phase"]:
             kw = {"phase_started_at": time.time(), "seed": None, "seed_index": None, "node": None, "nodes": [],
-                  "seed_started_at": None, "per_seed_partial": [], **kw}
+                  "seed_started_at": None, "per_seed_partial": [], "seeds_live": {}, **kw}
+        if kw.get("seed") is not None:   # seeds run in parallel: each one's own live row, beside the newest tick
+            row = dict(live.get("seeds_live", {}).get(str(kw["seed"])) or {})
+            row.update({k: kw[k] for k in ("node", "nodes", "seed_index", "seed_started_at") if k in kw})
+            live.setdefault("seeds_live", {})[str(kw["seed"])] = row
         live.update(kw)
         msg = _message(live)
         if msg != live["message"]:
