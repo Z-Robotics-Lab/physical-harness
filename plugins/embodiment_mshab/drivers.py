@@ -150,7 +150,7 @@ class ChainDriver:
                 # spaces flattened into the model's channel-stacked Boxes.
                 from mshab.agents.sac import Agent as SACAgent
 
-                obs_space = self._env._env.single_observation_space
+                obs_space = self._env.single_observation_space
                 pixels_space: spaces.Dict = obs_space["pixels"]
                 model_pixel_obs_space = dict()
                 for k, space in pixels_space.items():

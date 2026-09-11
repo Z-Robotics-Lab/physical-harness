@@ -189,6 +189,12 @@ class MshabChainEnv(MshabEnv):
     def uenv(self):
         return self._env.unwrapped
 
+    @property
+    def single_observation_space(self):
+        """The evaluate-pipeline space (SAC checkpoint reconstruction reads
+        it); named here so the frame overlay's delegation reaches it."""
+        return self._env.single_observation_space
+
     def reset(self):
         obs, _info = self._env.reset(seed=self._seed,
                                      options=dict(reconfigure=True))
