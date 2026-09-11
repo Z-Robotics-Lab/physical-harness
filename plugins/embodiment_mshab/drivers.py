@@ -127,27 +127,70 @@ class ChainDriver:
         key = f"{skill_type}.{target}"
         if key not in self._policies:
             import torch
+            from gymnasium import spaces
 
-            from mshab.agents.ppo import Agent as PPOAgent
+            from mshab.utils.config import parse_cfg
 
             backend = self._backend(skill_type, target)
+            algo = parse_cfg(default_cfg_path=backend.config_path).algo
             device = torch.device("cuda")
-            policy = PPOAgent(self._env.pipeline_obs,
-                              self._env.uenv.single_action_space.shape)
-            policy.eval()
-            policy.load_state_dict(
-                torch.load(backend.checkpoint_path, map_location=device)["agent"])
-            policy.to(device)
-            self._policies[key] = policy
-        policy = self._policies[key]
+            state = torch.load(backend.checkpoint_path, map_location=device)["agent"]
+            act_shape = self._env.uenv.single_action_space.shape
+            if algo.name == "ppo":
+                from mshab.agents.ppo import Agent as PPOAgent
 
-        def act(obs):
-            import torch
+                policy = PPOAgent(self._env.pipeline_obs, act_shape)
+                policy.eval(); policy.load_state_dict(state); policy.to(device)
 
-            with torch.no_grad():
-                return policy.get_action(obs, deterministic=True)
+                def act(obs, policy=policy):
+                    with torch.no_grad():
+                        return policy.get_action(obs, deterministic=True)
+            elif algo.name == "sac":
+                # evaluate.py's SAC branch verbatim: per-camera 4D frame-stacked
+                # spaces flattened into the model's channel-stacked Boxes.
+                from mshab.agents.sac import Agent as SACAgent
 
-        return act
+                obs_space = self._env._env.single_observation_space
+                pixels_space: spaces.Dict = obs_space["pixels"]
+                model_pixel_obs_space = dict()
+                for k, space in pixels_space.items():
+                    shape, low, high, dtype = (space.shape, space.low,
+                                               space.high, space.dtype)
+                    if len(shape) == 4:
+                        shape = (shape[0] * shape[1], shape[-2], shape[-1])
+                        low = low.reshape((-1, *low.shape[-2:]))
+                        high = high.reshape((-1, *high.shape[-2:]))
+                    model_pixel_obs_space[k] = spaces.Box(low, high, shape, dtype)
+                policy = SACAgent(
+                    spaces.Dict(model_pixel_obs_space),
+                    obs_space["state"].shape, act_shape,
+                    actor_hidden_dims=list(algo.actor_hidden_dims),
+                    critic_hidden_dims=list(algo.critic_hidden_dims),
+                    critic_layer_norm=algo.critic_layer_norm,
+                    critic_dropout=algo.critic_dropout,
+                    encoder_pixels_feature_dim=algo.encoder_pixels_feature_dim,
+                    encoder_state_feature_dim=algo.encoder_state_feature_dim,
+                    cnn_features=list(algo.cnn_features),
+                    cnn_filters=list(algo.cnn_filters),
+                    cnn_strides=list(algo.cnn_strides),
+                    cnn_padding=algo.cnn_padding,
+                    log_std_min=algo.actor_log_std_min,
+                    log_std_max=algo.actor_log_std_max,
+                    device=device)
+                policy.eval(); policy.load_state_dict(state); policy.to(device)
+
+                from mshab.utils.array import to_tensor
+
+                def act(obs, policy=policy):
+                    with torch.no_grad():
+                        obs = to_tensor(obs, device=device, dtype="float")
+                        return policy.actor(obs["pixels"], obs["state"],
+                                            compute_pi=False,
+                                            compute_log_pi=False)[0]
+            else:
+                raise ValueError(f"unsupported algo {algo.name!r} for {key}")
+            self._policies[key] = act
+        return self._policies[key]
 
     def _nav_act(self, obs):
         """Scripted differential-drive navigate (the robocasa NavigateDriver
@@ -210,19 +253,61 @@ class ChainDriver:
 
             import torch
 
-            goal = env.uenv.subtask_goals[pointer]
-            p, qt = goal.pose.p, goal.pose.q
-            yaw = math.atan2(
-                2 * (float(qt[0, 0]) * float(qt[0, 3]) + float(qt[0, 1]) * float(qt[0, 2])),
-                1 - 2 * (float(qt[0, 2]) ** 2 + float(qt[0, 3]) ** 2))
-            robot = env.uenv.agent.robot
-            q = robot.get_qpos()
-            q[0, 0], q[0, 1], q[0, 2] = float(p[0, 0]), float(p[0, 1]), yaw
-            robot.set_qpos(q)
-            # pd_joint_delta_pos keeps absolute drive targets: without a
-            # controller re-anchor the PD pulls the base straight back to the
-            # pre-teleport pose (probed: back at origin within 30 steps).
-            env.uenv.agent.controller.reset()
+            uenv = env.uenv
+            goal = uenv.subtask_goals[pointer]
+            gp, gq = goal.pose.p, goal.pose.q
+            gx, gy = float(gp[0, 0]), float(gp[0, 1])
+            w, xq, yq, zq = (float(gq[0, i]) for i in range(4))
+
+            def _rot(vx, vy, vz):
+                # rotate v by the goal quaternion (wxyz), world-frame result
+                return (
+                    (1 - 2 * (yq * yq + zq * zq)) * vx + 2 * (xq * yq - w * zq) * vy + 2 * (xq * zq + w * yq) * vz,
+                    2 * (xq * yq + w * zq) * vx + (1 - 2 * (xq * xq + zq * zq)) * vy + 2 * (yq * zq - w * xq) * vz,
+                )
+
+            robot = uenv.agent.robot
+            scene = uenv.scene
+            def _flush():
+                # GPU sim: push + refresh BEFORE the controller re-anchor, or
+                # reset() reads the stale pre-teleport qpos as its PD target
+                # and drags the base back to origin (probed: within 5 steps).
+                if hasattr(scene, "_gpu_apply_all"):
+                    scene._gpu_apply_all()
+                if hasattr(scene.px, "gpu_update_articulation_kinematics"):
+                    scene.px.gpu_update_articulation_kinematics()
+                if hasattr(scene, "_gpu_fetch_all"):
+                    scene._gpu_fetch_all()
+
+            def _try(px, py):
+                # Land base_link AT (px, py) facing the goal by ITERATION: the
+                # qpos gantry origin sits a yaw-dependent vector away from
+                # base_link (probed: 1.0m); set, measure the residual, correct
+                # -- twice converges with no frame convention trusted.
+                yaw = math.atan2(gy - py, gx - px)
+                for _ in range(3):
+                    q = robot.get_qpos()
+                    bl = uenv.agent.base_link.pose.p
+                    q[0, 0] = float(q[0, 0]) + (px - float(bl[0, 0]))
+                    q[0, 1] = float(q[0, 1]) + (py - float(bl[0, 1]))
+                    q[0, 2] = yaw
+                    robot.set_qpos(q)
+                    _flush()
+                uenv.agent.controller.reset()
+                ev = uenv.evaluate()
+                return bool(ev["navigated_close"][0]) and bool(ev["oriented_correctly"][0])
+
+            # Candidate docking poses, the ENV ITSELF as the oracle: an
+            # articulation goal (fridge) wants the base inside a docking box
+            # in ITS local frame (x 0.93..1.83, lateral +-0.6); a plain marker
+            # wants near + facing. Try local +-x / +-z at docking range, then
+            # the short plain-marker offset; first pose evaluate() admits wins.
+            candidates = [_rot(1.383, 0, 0), _rot(-1.383, 0, 0),
+                          _rot(0, 0, 1.383), _rot(0, 0, -1.383),
+                          _rot(0.7, 0, 0), _rot(-0.7, 0, 0)]
+            for dx, dy in candidates:
+                if _try(gx + dx, gy + dy):
+                    break
             self._act = lambda obs: torch.zeros(1, 13)
         else:
             self._act = self._act_fn(self._skill, self._target or "all")
