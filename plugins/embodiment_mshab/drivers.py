@@ -70,7 +70,9 @@ def provider(**params: Any) -> RolloutPolicies:
 #: Per-skill step caps on the shared chain horizon (the teammate's
 #: build_skill_chain SUBTASK_HORIZONS values): a stuck segment ends at its own
 #: cap instead of eating the whole episode budget.
-_SEGMENT_CAPS = {"navigate": 500, "pick": 200, "place": 200, "open": 200, "close": 200}
+#: pick/place ride the env's widened 300-step budget (task_cfgs horizon in the
+#: chain env): a behaviorally-successful place landed at ~205 driver steps.
+_SEGMENT_CAPS = {"navigate": 500, "pick": 280, "place": 280, "open": 200, "close": 200}
 
 
 class ChainDriver:
@@ -301,10 +303,21 @@ class ChainDriver:
             # dist 8m at place start).
             snap_q = robot.get_qpos().clone()
             snap_obj = None
+            snap_rel = None
             if pointer + 1 < len(plan_all):
                 _o = uenv.subtask_objs[pointer + 1]
                 if _o is not None:
                     snap_obj = (_o, _o.pose.p.clone(), _o.pose.q.clone())
+                    if held:
+                        # the held object's pose RELATIVE to the tcp: a base
+                        # teleport moves only the robot, and the ring path was
+                        # losing the grasp at every candidate (probed: force 0
+                        # close/orient pass, grasp 0 -- the apple stayed at
+                        # the fridge). Re-attach it at each landing.
+                        from mani_skill.utils.structs.pose import Pose as _P
+
+                        snap_rel = uenv.agent.tcp.pose.inv() * _P.create_from_pq(
+                            p=snap_obj[1], q=snap_obj[2])
 
             def _restore():
                 q = robot.get_qpos()
@@ -358,6 +371,15 @@ class ChainDriver:
                     q[0, 1] = float(q[0, 1]) + (py - float(bl[0, 1]))
                     q[0, 2] = yaw
                     robot.set_qpos(q)
+                    _flush()
+                if held and snap_rel is not None and snap_obj is not None:
+                    # the carried object rides the teleport at its recorded
+                    # tcp-relative pose; a free body would stay behind.
+                    snap_obj[0].set_pose(uenv.agent.tcp.pose * snap_rel)
+                    for setter in ("set_linear_velocity", "set_angular_velocity"):
+                        fn = getattr(snap_obj[0], setter, None)
+                        if callable(fn):
+                            fn(torch.zeros(1, 3, device=snap_q.device))
                     _flush()
                 uenv.agent.controller.reset()
                 already = int(uenv.subtask_pointer[0]) > pointer
@@ -486,6 +508,13 @@ class ChainDriver:
                     _restore()
                 if not docked:
                     _restore()   # honest stay-put: better than a random pose
+            # Zero the env's per-subtask force ledger after docking: rejected
+            # penetrating candidates racked up FICTITIOUS billions of N (all
+            # restored, never a real trajectory), and the leftover balance
+            # made place's 7500N limit unpassable forever. Same semantics as
+            # the env's own reset at a subtask transition -- the next segment
+            # is billed only from its true start.
+            uenv.robot_cumulative_force[:] = 0
             self._act = lambda obs: hold
         else:
             self._act = self._act_fn(self._skill, self._target or "all")

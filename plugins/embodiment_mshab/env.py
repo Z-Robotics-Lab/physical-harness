@@ -271,10 +271,15 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                 "require_build_configs_repeated_equally_across_envs": False,
                 "add_event_tracker_info": True,
                 "invisible_goals_in_human_render": False,
-                # The RL navigate policy was never trained to retract the arm;
-                # without this its subtask NEVER passes the success check (the
-                # teammate's chain runner sets the same flag).
-                "task_cfgs": {"navigate": {"ignore_arm_checkers": True}},
+                # navigate: the RL policy was never trained to retract the
+                # arm; without the flag its subtask NEVER passes (the
+                # teammate's chain runner sets the same one). pick/place:
+                # +100 steps of budget headroom -- the teleport-dock probes
+                # after the nav subtask seals are billed to the NEXT subtask
+                # (a behaviorally-successful place once timed out at -40).
+                "task_cfgs": {"navigate": {"ignore_arm_checkers": True},
+                              "pick": {"horizon": 400},
+                              "place": {"horizon": 400}},
             },
         )
         return MshabChainEnv(mshab_make_env(env_cfg), seed=spec.seed)
