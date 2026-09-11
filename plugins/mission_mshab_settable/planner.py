@@ -122,7 +122,7 @@ def provider(**params: Any):
     checks nothing). Explicit params win, so an A/B against another endpoint
     is a binding edit away."""
     merged: dict[str, Any] = {
-        "endpoint_params": {"base_url": "http://127.0.0.1:30000/v1",
+        "endpoint_params": {"base_url": "http://127.0.0.1:30001/v1",
                             "api_key_env": "QWEN38_API_KEY", "model": None,
                             # IQ4 27B on the Vulkan llama.cpp build generates
                             # ~43 tok/s; the 60s default cuts a full plan off
