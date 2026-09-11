@@ -938,7 +938,18 @@ cd $REPO
 ~/Desktop/maniskill-agentic-library/.venv/bin/python -m pytest tests/test_mshab_marker.py -m mshab
 ```
 
----
+**VLM 规划链（`mshab_settable_vlm`，2026-09-12 现状）**：`mission_mshab_settable` 卡 =
+planner_vlm（本地 llama.cpp GGUF Qwen @30000，thinking 关闭，卡内 `_SegmentStamp`
+给节点盖 `kind="segment"` 章——planner_vlm 不产 kind，默认会走 manipulate 撞
+SKILL_SPECS）+ `ChainDriver`（按 segment 经队友 SkillLibrary 加载官方 RL
+checkpoint）+ `mshab_settable_chain` 链环境（官方 sequential plan 0 的 8:14 切片，
+grounding 权威在 env）。**已证明**：VLM 从场景事实自主产出正确六节点图（含
+open-before-pick 推理与全 verify 覆盖）、validate 通过、错序图在 enter_segment
+诚实拒绝、失败折回 replan、诚实封存。**未通**：navigate 段在本 driver 下原地
+打转不推进 subtask_pointer，而同 seed 同 plan 同策略经 `mshab.evaluate`
+（评估链 runner）nav→pick 全部通过（A/B 已做）——残差在 evaluate act 循环的
+obs 处理与本 driver 的差异，待查。PLANNING_CONTEXT 带 `objects` 时必须同时给
+`required_per_object_order`（validate 的 requirements 检查）。
 
 ## 6. 接入你自己的模型
 

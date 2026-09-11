@@ -1,0 +1,27 @@
+# The mshab VLM-planned chain mission: {"kind":"task","task":"mshab_settable_vlm"}
+# on session-mshab. The VLM designs the GRAPH (skill selection, order, REQUIRES
+# edges, verify coverage) from scene facts; the grounding (scene, targets, goal
+# poses) is a slice of an OFFICIAL set_table sequential TaskPlan baked into the
+# chain env (embodiment_mshab TASKS["mshab_settable_chain"]), and the env's own
+# subtask order is the authority -- a graph in a physically wrong order fails
+# at the mismatched segment and folds back into replan.
+#
+# No [mounts.*]; every cross-card reach is by ref (basket_smoke_vlm verbatim).
+# The planner ref is this card's thin provider wrapping planner_vlm with the
+# LOCAL sglang endpoint (the DeepSeek default has no balance on this machine).
+needs_sim = true
+
+[task_bindings.mshab_settable_vlm]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:chain_provider"
+planner = "plugins.mission_mshab_settable.planner:provider"
+catalogue = "plugins.mission_mshab_settable.planner:CATALOGUE"
+oracles = "plugins.mission_mshab_settable.planner:ORACLES"
+skill_docs = "plugins.mission_mshab_settable.planner:SKILL_DOCS"
+planning_context = "plugins.mission_mshab_settable.planner:PLANNING_CONTEXT"
+default_instruction = "plugins.mission_mshab_settable.planner:DEFAULT_INSTRUCTION"
+episodic = true
+episode = "plugins.mission_mshab_settable.planner:EPISODE"
+segment_specs = "plugins.mission_mshab_settable.planner:SEGMENT_SPECS"
+max_actuations = 16
+segment_retries = 1

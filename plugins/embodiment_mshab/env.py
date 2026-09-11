@@ -32,6 +32,14 @@ TASKS: dict[str, dict] = {
     "mshab_place": {"hab_task": "tidy_house", "subtask": "place"},
     "mshab_open": {"hab_task": "tidy_house", "subtask": "open"},
     "mshab_close": {"hab_task": "tidy_house", "subtask": "close"},
+    # A persistent SequentialTask-v0 chain whose grounding (scene, targets,
+    # goal poses) is a slice of an OFFICIAL sequential TaskPlan, derived once
+    # by scripts/build_skill_chain.py in the mshab checkout. The VLM planner
+    # designs the GRAPH over it; it never invents grounding.
+    "mshab_settable_chain": {
+        "hab_task": "set_table",
+        "chain_plan": "task_plans/set_table/custom/apple_vlm_train.json",
+    },
 }
 
 
@@ -166,6 +174,66 @@ class MshabEnv:
         return np.asarray(value, dtype=np.float32).reshape(-1)
 
 
+class MshabChainEnv(MshabEnv):
+    """Old-gym adapter over ONE SequentialTask-v0 chain (the evaluate obs
+    pipeline: depth obs + cat_state + frame_stack, exactly what the official
+    RL checkpoints were trained on). The raw pipeline obs rides
+    ``pipeline_obs`` for the chain driver; the loop-facing obs stays the small
+    Mapping every other embodiment returns."""
+
+    def __init__(self, env: Any, seed: int):
+        super().__init__(env, seed)
+        self.pipeline_obs: Any = None
+
+    @property
+    def uenv(self):
+        return self._env.unwrapped
+
+    def reset(self):
+        obs, _info = self._env.reset(seed=self._seed,
+                                     options=dict(reconfigure=True))
+        self.pipeline_obs = obs
+        self._success = False
+        return self._loop_obs()
+
+    def step(self, action):
+        import torch
+
+        if not isinstance(action, torch.Tensor):
+            action = torch.as_tensor(np.asarray(action, dtype=np.float32))
+        if action.ndim == 1:
+            action = action[None]
+        obs, reward, terminated, truncated, info = self._env.step(action)
+        self.pipeline_obs = obs
+        flag = info.get("success") if hasattr(info, "get") else None
+        if flag is not None:
+            self._success = bool(_scalar(flag))
+        done = bool(_scalar(terminated)) or bool(_scalar(truncated))
+        return self._loop_obs(), _scalar(reward), done, {"success": self._success}
+
+    def render_frame(self) -> np.ndarray | None:
+        render = getattr(self.uenv, "render_rgb_array", None)
+        img = render() if callable(render) else self._env.render()
+        if img is None:
+            return None
+        if hasattr(img, "detach"):
+            img = img.detach().cpu().numpy()
+        img = np.asarray(img)
+        if img.ndim == 4:
+            img = img[0]
+        if img.dtype != np.uint8:
+            img = (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8)
+        return img
+
+    def _loop_obs(self) -> dict:
+        pointer = int(_scalar(self.uenv.subtask_pointer))
+        plan = self.uenv.task_plan
+        current = plan[min(pointer, len(plan) - 1)].type if plan else "?"
+        return {"success": np.float32(self._success),
+                "subtask_pointer": np.float32(pointer),
+                "subtask_type": current, **self._proprio()}
+
+
 def make_env(spec: EpisodeSpec) -> MshabEnv:
     """Build one seeded SubtaskTrain env for `spec` and wrap it old-gym."""
     import gymnasium as gym
@@ -176,6 +244,35 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
     from mshab.envs.planner import plan_data_from_file
 
     cfg = task_config(spec)
+    if "chain_plan" in cfg:
+        from mshab.envs.make import EnvConfig, make_env as mshab_make_env
+
+        rearrange = ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
+        env_cfg = EnvConfig(
+            env_id="SequentialTask-v0",
+            num_envs=1,
+            max_episode_steps=int(spec.horizon),
+            continuous_task=True,
+            # Mirror the teammate's PROVEN chain-runner config bit for bit
+            # (A/B: same seed, same plan, his stack completes nav->pick, ours
+            # span in place until these matched).
+            render_mode="all",
+            task_plan_fp=str(rearrange / cfg["chain_plan"]),
+            spawn_data_fp=None,
+            record_video=False,
+            extra_stat_keys=[],
+            env_kwargs={
+                "require_build_configs_repeated_equally_across_envs": False,
+                "add_event_tracker_info": True,
+                "invisible_goals_in_human_render": False,
+                # The RL navigate policy was never trained to retract the arm;
+                # without this its subtask NEVER passes the success check (the
+                # teammate's chain runner sets the same flag).
+                "task_cfgs": {"navigate": {"ignore_arm_checkers": True}},
+            },
+        )
+        return MshabChainEnv(mshab_make_env(env_cfg), seed=spec.seed)
+
     rearrange = ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
     plans = plan_data_from_file(
         rearrange / "task_plans" / cfg["hab_task"] / cfg["subtask"] / "train" / "all.json")

@@ -61,9 +61,9 @@ def test_fold_over_real_runs():
     # mcp_segment, no mounts; 28th: skill_graph_robocasa, the PR #5 unified
     # skill-graph card; 29th: the inactive embodiment_mshab fourth-simulator
     # card; 30th: mission_mshab_rollout, its four persistent-episode rollout
-    # bindings).
+    # bindings; 31st: mission_mshab_settable, the VLM-planned chain binding).
     assert {STACK, ADC, EB} <= set(by_id)
-    assert sum(n["kind"] == "package" for n in g["nodes"]) == 30
+    assert sum(n["kind"] == "package" for n in g["nodes"]) == 31
     assert sum(n["kind"] == "capability" for n in g["nodes"]) == 10
 
     stack = by_id[STACK]
