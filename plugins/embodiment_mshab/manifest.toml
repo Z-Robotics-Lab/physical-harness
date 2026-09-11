@@ -1,0 +1,22 @@
+# The ManiSkill-HAB embodiment card: SAPIEN/PhysX home-rearrangement subtasks
+# (mshab, checkout at ~/Desktop/maniskill-agentic-library) behind the same
+# embodiment.env seam the robosuite/robocasa/libero cards own. It rides the
+# checkout's own venv (torch + sapien + numpy 2.x -- ABI-incompatible with the
+# harness venv, and MSHAB_PYTHON in cockpit points at it, NOT ../sims/) and its
+# own resident runtime (runs/session-mshab), per docs/project-documentation.md §5.7.
+#
+# enabled = false -> installed but INACTIVE, exactly the robocasa precedent: it
+# re-claims embodiment.env, so discover() keeps it out of the folded base plan
+# (base_profile sha untouched); the mission_mshab_rollout bindings mount it
+# per-session by ref.
+enabled = false
+
+actuation = "sim"
+needs_sim = true
+# The third-party surface no OTHER card may import (test_boundaries reads this).
+# mani_skill is the simulator, mshab the benchmark package, sapien/torch its
+# substrate, gymnasium its env registry face.
+third_party = ["mani_skill", "mshab", "sapien", "torch", "gymnasium"]
+
+[mounts."embodiment.env"]
+ref = "plugins.embodiment_mshab:provider"

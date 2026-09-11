@@ -186,9 +186,11 @@ def dump(env, path: str | None = None) -> None:
     ``path`` (default: the armed live-viewport file).
 
     NEVER raises (the opstream.emit contract): a lost frame is a stale viewport,
-    a raised one would kill the task. Creates the sim's offscreen render context
-    lazily -- the production envs are built windowless AND cameraless, so none
-    exists yet. The image is flipped vertically (mjr_readPixels is bottom-up).
+    a raised one would kill the task. An env exposing ``render_frame()`` (a
+    non-mujoco adapter) renders its own frame; otherwise the mujoco path
+    creates the sim's offscreen render context lazily -- the production envs
+    are built windowless AND cameraless, so none exists yet -- and flips the
+    image vertically (mjr_readPixels is bottom-up).
 
     The armed check gates BOTH destinations, so keyframes follow ``--frames``:
     frames off, nothing renders anywhere.
@@ -197,17 +199,27 @@ def dump(env, path: str | None = None) -> None:
         return
     dest = path or _PATH
     try:
-        sim = env.sim
-        if sim._render_context_offscreen is None:
-            from robosuite.utils.binding_utils import MjRenderContextOffscreen
-            MjRenderContextOffscreen(sim, device_id=-1)
-        names = tuple(getattr(sim.model, "camera_names", ()) or ())
-        camera = next((c for c in CAMERAS if c in names), None)
-        px = sim.render(width=WIDTH, height=HEIGHT, camera_name=camera)
+        render_frame = getattr(env, "render_frame", None)
+        if callable(render_frame):
+            # A non-mujoco embodiment adapter (SAPIEN/ManiSkill: no mujoco
+            # `.sim` handle) publishes its own HWC uint8 RGB frame through
+            # this probe -- already top-down, so no vertical flip.
+            px = render_frame()
+            if px is None:
+                return
+        else:
+            sim = env.sim
+            if sim._render_context_offscreen is None:
+                from robosuite.utils.binding_utils import MjRenderContextOffscreen
+                MjRenderContextOffscreen(sim, device_id=-1)
+            names = tuple(getattr(sim.model, "camera_names", ()) or ())
+            camera = next((c for c in CAMERAS if c in names), None)
+            # mjr_readPixels is bottom-up: flip here, in the mujoco branch only.
+            px = sim.render(width=WIDTH, height=HEIGHT, camera_name=camera)[::-1]
         from PIL import Image
 
         tmp = dest + ".tmp"
-        image = Image.fromarray(px[::-1])
+        image = Image.fromarray(px)
         image.save(tmp, "JPEG", quality=QUALITY)
         os.replace(tmp, dest)
         if path is None:

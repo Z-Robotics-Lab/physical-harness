@@ -59,9 +59,11 @@ def test_fold_over_real_runs():
     # PlanRecord-first planner card, consumed by ref, no mounts; 27th: the
     # executor_mcp_segment MCP segment-executor card, provides executor
     # mcp_segment, no mounts; 28th: skill_graph_robocasa, the PR #5 unified
-    # skill-graph card).
+    # skill-graph card; 29th: the inactive embodiment_mshab fourth-simulator
+    # card; 30th: mission_mshab_rollout, its four persistent-episode rollout
+    # bindings).
     assert {STACK, ADC, EB} <= set(by_id)
-    assert sum(n["kind"] == "package" for n in g["nodes"]) == 28
+    assert sum(n["kind"] == "package" for n in g["nodes"]) == 30
     assert sum(n["kind"] == "capability" for n in g["nodes"]) == 10
 
     stack = by_id[STACK]

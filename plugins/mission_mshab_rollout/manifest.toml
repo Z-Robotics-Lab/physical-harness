@@ -1,0 +1,58 @@
+# The mshab ROLLOUT mission card: one persistent-episode binding per ManiSkill-HAB
+# subtask, the operator's whole tuning surface being {task name, seed, budgets} on
+# a plain {"kind":"task"} brief to session-mshab. Dropping this dir makes
+# {"kind":"task","task":"mshab_pick"} (…place/open/close) an accepted brief.
+#
+# It declares NO [mounts.*], so base_profile's sha is untouched; `env`/`policy`
+# name the mshab embodiment card (enabled=false, out of the base fold) by ref --
+# harness_runtime._mount_plan overrides the base robosuite mounts with these for
+# THIS session only, the robocasa precedent verbatim (docs §5.2, §5.7).
+#
+# Each binding is one node: a `rollout` segment whose truth is "the rollout drove"
+# (the env's own success flag is UNAUDITED and rides diagnostics only). Rollout
+# length = the episode block's horizon; frames stream via cockpit's --frames.
+needs_sim = true
+
+[task_bindings.mshab_pick]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:provider"
+planner = "plugins.mission_mshab_rollout.planner:provider"
+catalogue = "plugins.mission_mshab_rollout.planner:CATALOGUE"
+oracles = "plugins.mission_mshab_rollout.planner:ORACLES"
+episodic = true
+episode = "plugins.mission_mshab_rollout.planner:EPISODE_PICK"
+segment_specs = "plugins.mission_mshab_rollout.planner:SEGMENT_SPECS"
+max_actuations = 4
+
+[task_bindings.mshab_place]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:provider"
+planner = "plugins.mission_mshab_rollout.planner:provider"
+catalogue = "plugins.mission_mshab_rollout.planner:CATALOGUE"
+oracles = "plugins.mission_mshab_rollout.planner:ORACLES"
+episodic = true
+episode = "plugins.mission_mshab_rollout.planner:EPISODE_PLACE"
+segment_specs = "plugins.mission_mshab_rollout.planner:SEGMENT_SPECS"
+max_actuations = 4
+
+[task_bindings.mshab_open]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:provider"
+planner = "plugins.mission_mshab_rollout.planner:provider"
+catalogue = "plugins.mission_mshab_rollout.planner:CATALOGUE"
+oracles = "plugins.mission_mshab_rollout.planner:ORACLES"
+episodic = true
+episode = "plugins.mission_mshab_rollout.planner:EPISODE_OPEN"
+segment_specs = "plugins.mission_mshab_rollout.planner:SEGMENT_SPECS"
+max_actuations = 4
+
+[task_bindings.mshab_close]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:provider"
+planner = "plugins.mission_mshab_rollout.planner:provider"
+catalogue = "plugins.mission_mshab_rollout.planner:CATALOGUE"
+oracles = "plugins.mission_mshab_rollout.planner:ORACLES"
+episodic = true
+episode = "plugins.mission_mshab_rollout.planner:EPISODE_CLOSE"
+segment_specs = "plugins.mission_mshab_rollout.planner:SEGMENT_SPECS"
+max_actuations = 4

@@ -37,6 +37,11 @@ def pytest_configure(config):
         "libero: needs the libero venv (LIBERO+robosuite-1.4); "
         "auto-skipped when libero is unimportable (harness .venv)",
     )
+    config.addinivalue_line(
+        "markers",
+        "mshab: needs the mshab venv (mani_skill+sapien, the ManiSkill-HAB "
+        "checkout); auto-skipped when mani_skill is unimportable (harness .venv)",
+    )
 
 
 def _auto_skip(items, pkg, marker, reason):
@@ -106,4 +111,8 @@ def pytest_collection_modifyitems(config, items):
     _auto_skip(
         items, "libero", "libero",
         "libero unimportable (libero venv only)",
+    )
+    _auto_skip(
+        items, "mani_skill", "mshab",
+        "mani_skill unimportable (mshab venv only)",
     )

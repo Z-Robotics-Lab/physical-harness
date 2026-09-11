@@ -74,6 +74,7 @@ SESSION_DIR="runs/session-main"          # cockpit's canonical resident session
 STACK_EVOLUTION_SESSION_DIR="runs/session-main-rsi"
 ROBOCASA_SESSION_DIR="runs/session-robocasa"
 EVOLUTION_SESSION_DIR="runs/session-robocasa-rsi"  # evolution runtime; ON by default
+MSHAB_SESSION_DIR="runs/session-mshab"             # ManiSkill-HAB runtime; ON when its venv exists
 
 usage() {
   cat <<EOF
@@ -137,7 +138,7 @@ Before serving it renders \$DSH_HOME/cordis.patch.yml from
 profiles/dsh/cordis.patch.template.yml (the console's MCP tools, LLM route and
 default agent preset) and seeds the workspace record. Both are idempotent.
 
-Starting (no --stop) brings up five things and leaves them running:
+Starting (no --stop) brings up six things and leaves them running:
   1. the resident harness_runtime on $SESSION_DIR --
        ADOPTED if one is already serving it (PID printed, not restarted, not
        killed by --stop), otherwise SPAWNED (nohup, logged) and recorded for
@@ -153,7 +154,10 @@ Starting (no --stop) brings up five things and leaves them running:
      These are all inboxes the console submits into; an un-managed dead
      runtime on either is how briefs got dropped into a dead inbox. Both are
      skipped with one warning when the robocasa venv is absent.
-  5. the web console (the ph-station fork build).
+  5. the MSHAB runtime on $MSHAB_SESSION_DIR (--frames, the ManiSkill-HAB
+       checkout's own venv, MSHAB_PYTHON=... overrides) -- adopt-or-spawn,
+       skipped with one warning when that venv is absent.
+  6. the web console (the ph-station fork build).
 
 serves the ph-station fork build (native brand). use this instead of running
 'npx @deepseek-ai/dsh web' or a second terminal for the runtime.
@@ -270,6 +274,9 @@ PH_STATION="${PH_STATION:-$REPO/../ph-station}"
 # robocasa runtime interpreter: its venv is a SIBLING of the repo (see
 # docs/project-documentation.md §5.1 -- numpy 1/2 ABI forces a separate venv).
 ROBOCASA_PYTHON="${ROBOCASA_PYTHON:-$REPO/../sims/robocasa-venv/bin/python}"
+# mshab runtime interpreter: the ManiSkill-HAB checkout carries its OWN venv
+# (NOT under ../sims/ -- the checkout predates that convention); overridable.
+MSHAB_PYTHON="${MSHAB_PYTHON:-$HOME/Desktop/maniskill-agentic-library/.venv/bin/python}"
 PIDFILE="$REPO/$SESSION_DIR/cockpit.pids"
 RUNTIME_LOG="$REPO/$SESSION_DIR/runtime.log"
 
@@ -634,6 +641,18 @@ if [ "$NO_RUNTIME" -eq 0 ]; then
     } > "$REPO/$EVOLUTION_SESSION_DIR/cockpit.pids"
   else
     echo "cockpit: WARNING robocasa venv missing at $ROBOCASA_PYTHON; NEITHER robocasa runtime started ($ROBOCASA_SESSION_DIR, $EVOLUTION_SESSION_DIR)" >&2
+  fi
+  # --- the mshab runtime (ManiSkill-HAB, its checkout's own venv) ------------
+  # Same adopt-or-spawn + exact-PID pidfile discipline; headless (SAPIEN
+  # ignores MUJOCO_GL -- harmless). No evolution twin yet: no mshab RSI.
+  if [ -x "$MSHAB_PYTHON" ]; then
+    runtime_up "$MSHAB_SESSION_DIR" "$MSHAB_PYTHON" 0 --frames
+    {
+      echo "runtime_pid=$RT_PID"
+      echo "runtime_adopted=$RT_ADOPTED"
+    } > "$REPO/$MSHAB_SESSION_DIR/cockpit.pids"
+  else
+    echo "cockpit: WARNING mshab venv missing at $MSHAB_PYTHON; mshab runtime not started ($MSHAB_SESSION_DIR)" >&2
   fi
 fi
 

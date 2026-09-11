@@ -58,6 +58,7 @@ physical-harness/
 │     embodiment_robosuite/    机械臂 + robosuite
 │     embodiment_robocasa/     厨房机器人（独立 venv）
 │     embodiment_libero/       LIBERO（脚手架）
+│     embodiment_mshab/        ManiSkill-HAB（独立 venv，§5.7）
 │     mission_*/               任务图 + planner（纯数据 manifest）
 │     candidates/<name>/       候选卡：不进 base fold，evolve 经 PH_PLUGINS_EXTRA 按提案挂载
 │     task/                    通用任务机器：workload、validate
@@ -471,6 +472,7 @@ test_skill_planning.py       generated unified_skill_graph.json not present
 test_planning_faces.py       generated unified_skill_graph.json not present
 test_unified_skill_graph.py  generated unified_skill_graph.json not present
 test_libero_marker.py        libero unimportable (libero venv only)
+test_mshab_marker.py         mani_skill unimportable (mshab venv only)
 AST green                    test_boundaries + test_kernel
 deselected                   robosuite- 与 robocasa-marked items
 ```
@@ -479,8 +481,9 @@ deselected                   robosuite- 与 robocasa-marked items
 
 **全量对照（卡在场）**：同一条命令在 harness `.venv` 里跑，robosuite 在场。robocasa 标记项
 在这条命令里被 `-m "not robocasa"` **反选**掉（隔离与全量两边都是），只在 `../sims/robocasa-venv`
-里经 `pytest -m robocasa` 跑；libero 标记项没有被反选，`test_libero_marker.py` 照样跳过，真正的
-libero 用例只在仓库内的 `sims/libero-venv` 里跑。所以两边唯一的区别是 camera-env 跳过项在卡在场时变成
+里经 `pytest -m robocasa` 跑；libero/mshab 标记项没有被反选，`test_libero_marker.py`、
+`test_mshab_marker.py` 照样跳过，真正的 libero/mshab 用例只在各自 venv 里跑（`sims/libero-venv`、
+mshab checkout 的 `.venv`）。所以两边唯一的区别是 camera-env 跳过项在卡在场时变成
 通过。跳过清单之外出现新的跳过或任何失败，才是需要看的信号。
 
 ### 3.3 fresh clone 的合法差异
@@ -899,6 +902,41 @@ obs 是 dict：逐物体 `{name}_pos/_quat/_to_robot0_eef_*`、robot0 proprio、
 动作 7 维（OSC 6 + gripper 1）。谓词面：bddl goal（如
 `(On akita_black_bowl_1 plate_1)`）是 terminal oracle 候选——先审计其区分度再当
 gate 用。
+
+### 5.7 mshab（ManiSkill-HAB，第四个 venv：rollout 通路已通）
+
+SAPIEN/PhysX 的家庭重排 benchmark（ICLR 2025）。venv 是 checkout 自带的
+`~/Desktop/maniskill-agentic-library/.venv`（**不在** `../sims/`，cockpit 的
+`MSHAB_PYTHON=…` 可覆盖；py3.12 + torch + mani_skill 3.0.0b18-mshab 分支 +
+numpy 2.x）。资产在 `~/.maniskill/data`（ycb + ReplicaCAD + ReplicaCADRearrange，
+4.5G）。装法（2026-09-11 实测）：checkout 里 `uv pip install -e ./ManiSkill -e .`，
+再 `pip install -e $REPO`（底座）。坑：setuptools ≥81 删了 pkg_resources 而 sapien
+还在 import，venv 必须钉 `setuptools<81`。
+
+卡片：`plugins/embodiment_mshab/`（`enabled=false`，embodiment.env 座 + 老 gym
+适配器 `MshabEnv`）+ `plugins/mission_mshab_rollout/`（四个 task binding =
+`mshab_pick/place/open/close`，各一个 `rollout` segment 节点驱动持久 episode，
+episodic 机制与 kitchen_thaw 同构）。驱动是冻结的种子化随机策略
+（`embodiment_mshab/drivers.py`）——段真值 = "rollout 驱动了"（诚实完成语义）；
+env 自带的 success flag **未审计**，只进 segment_diagnostics，永不做 gate；接入
+训练好的 checkpoint 时换 binding 的 policy ref。取景窗走 `MshabEnv.render_frame()`
+探针（frame_dump 的非 mujoco 分支——SAPIEN 没有 mujoco `.sim` 句柄）。
+
+操作面（UI）：brief = `{"kind":"task","task":"mshab_pick","seed":N}` 投
+`session-mshab`（cockpit 第 5 项，venv 在场即拉起）。调参面 = 任务名（四选一）+
+seed（场景/spawn 随机化）+ max_actuations；rollout 步长是卡数据
+（`planner.py` 的 `_HORIZON`）。
+
+已知坑（全部实测）：num_envs=1 拒绝跨多个 ReplicaCAD build config 的 task plan
+列表（make_env 只切一个 plan——单场景 rollout）；GPU sim + render 在 19GB 显存被
+常驻模型占用时 num_envs=1/state obs 仍可跑（README 的 252 env 配方要 ~10GB，不行）。
+
+冒烟：
+
+```bash
+cd $REPO
+~/Desktop/maniskill-agentic-library/.venv/bin/python -m pytest tests/test_mshab_marker.py -m mshab
+```
 
 ---
 
