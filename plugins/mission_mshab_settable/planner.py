@@ -74,7 +74,7 @@ DEFAULT_INSTRUCTION = (
 #: The ONE episode: the SequentialTask-v0 chain env. Horizon covers the
 #: per-segment caps (3x500 navigate + 3x200 manipulation = 2100) with slack --
 #: the kitchen_thaw c3 lesson: a horizon equal to the cap sum dies on the clock.
-EPISODE: dict[str, Any] = {"task": "mshab_settable_chain", "horizon": 2400}
+EPISODE: dict[str, Any] = {"task": "mshab_settable_chain", "horizon": 9000}  # 3 real-driving navs (~1200 steps each) + manipulation + dock overhead
 
 #: Segment re-tasking: the ChainDriver parses ``chain-<skill>.<target>`` and
 #: the allowed_args tables are the static grounding boundary (an object with

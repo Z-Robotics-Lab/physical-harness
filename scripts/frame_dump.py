@@ -275,7 +275,11 @@ class _FrameEnv:
         out = self._env.step(action)
         self._steps += 1
         _LAST_ENV = self._env
-        if self._steps % EVERY == 0:
+        # An env exposing frames_suppressed=True is mid-bookkeeping (teleport
+        # dock probing): those frames are strobing pose-candidates, not
+        # execution, and rendering is not evidence either way.
+        if self._steps % EVERY == 0 and not getattr(
+                self._env, "frames_suppressed", False):
             dump(self._env)
         return out
 

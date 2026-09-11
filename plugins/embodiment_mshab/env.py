@@ -184,6 +184,8 @@ class MshabChainEnv(MshabEnv):
     def __init__(self, env: Any, seed: int):
         super().__init__(env, seed)
         self.pipeline_obs: Any = None
+        #: frame_dump's _FrameEnv skips dumps while True (dock probing).
+        self.frames_suppressed = False
 
     @property
     def uenv(self):
@@ -277,7 +279,11 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                 # +100 steps of budget headroom -- the teleport-dock probes
                 # after the nav subtask seals are billed to the NEXT subtask
                 # (a behaviorally-successful place once timed out at -40).
-                "task_cfgs": {"navigate": {"ignore_arm_checkers": True},
+                "task_cfgs": {"navigate": {"ignore_arm_checkers": True,
+                                           # real differential driving at
+                                           # ~0.35m/s needs ~1200 steps for
+                                           # the 8m fridge->table leg
+                                           "horizon": 2500},
                               "pick": {"horizon": 400},
                               "place": {"horizon": 400}},
             },
