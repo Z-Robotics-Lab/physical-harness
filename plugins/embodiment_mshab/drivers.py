@@ -96,6 +96,7 @@ class ChainDriver:
         self._mismatch: str | None = None
         self._policies: dict[str, Any] = {}
         self._library = None
+        self._spawn_cache: dict[str, Any] = {}
 
     @property
     def identity(self) -> str:
@@ -268,6 +269,21 @@ class ChainDriver:
 
             robot = uenv.agent.robot
             scene = uenv.scene
+            # While CARRYING, every settle/wait action must keep the gripper
+            # closed: dim 7 at 0 drifts the fingers toward the middle and
+            # drops the object (probed: -1 holds a grasp 20 steps, +1 opens).
+            held = False
+            plan_all = uenv.task_plan
+            if pointer + 1 < len(plan_all):
+                nxt_obj = uenv.subtask_objs[pointer + 1]
+                if nxt_obj is not None:
+                    try:
+                        held = bool(uenv.agent.is_grasping(nxt_obj)[0])
+                    except Exception:  # noqa: BLE001 -- partial-env objs; hold is best-effort
+                        held = False
+            hold = torch.zeros(1, 13)
+            hold[0, 7] = -1.0 if held else 0.0
+
             def _flush():
                 # GPU sim: push + refresh BEFORE the controller re-anchor, or
                 # reset() reads the stale pre-teleport qpos as its PD target
@@ -278,6 +294,56 @@ class ChainDriver:
                     scene.px.gpu_update_articulation_kinematics()
                 if hasattr(scene, "_gpu_fetch_all"):
                     scene._gpu_fetch_all()
+
+            # Snapshot for restore: a FAILED docking candidate must leave no
+            # side effect -- an abandoned attempt once teleported the held
+            # apple to a tcp pose and then walked away without it (obj-goal
+            # dist 8m at place start).
+            snap_q = robot.get_qpos().clone()
+            snap_obj = None
+            if pointer + 1 < len(plan_all):
+                _o = uenv.subtask_objs[pointer + 1]
+                if _o is not None:
+                    snap_obj = (_o, _o.pose.p.clone(), _o.pose.q.clone())
+
+            def _restore():
+                q = robot.get_qpos()
+                q[0, :] = snap_q[0]
+                robot.set_qpos(q)
+                if snap_obj is not None:
+                    from mani_skill.utils.structs.pose import Pose
+
+                    o, p0, q0 = snap_obj
+                    o.set_pose(Pose.create_from_pq(p=p0, q=q0))
+                    for setter in ("set_linear_velocity", "set_angular_velocity"):
+                        fn = getattr(o, setter, None)
+                        if callable(fn):
+                            fn(torch.zeros(1, 3, device=snap_q.device))
+                _flush()
+                uenv.agent.controller.reset()
+
+            def _probe_clean():
+                # 3 wiggle steps (arm dim 0 alternating +-0.3 keeps is_static
+                # False -> the env cannot seal navigate mid-probe), then read
+                # force + grasp. True = pose admitted for a real settle.
+                for i in range(3):
+                    a = hold.clone()
+                    # amplitude matters: 0.3 flung a freshly-teleported grasp
+                    # out of the gripper; 0.08 still defeats is_static.
+                    a[0, 0] = 0.08 if i % 2 == 0 else -0.08
+                    self._env.step(a)
+                ev = uenv.evaluate()
+                # A held object IS a contact: the gripper squeeze alone reads
+                # thousands of N (4751 at a clean pick-end pose), so <5N is
+                # physically impossible while carrying. Penetration reads in
+                # the MILLIONS -- the tiers are orders of magnitude apart.
+                limit = 8000.0 if held else 5.0
+                if float(ev.get("robot_force", [0.0])[0]) >= limit:
+                    return False
+                if held and snap_obj is not None and not bool(
+                        uenv.agent.is_grasping(snap_obj[0])[0]):
+                    return False
+                return True
 
             def _try(px, py):
                 # Land base_link AT (px, py) facing the goal by ITERATION: the
@@ -294,39 +360,133 @@ class ChainDriver:
                     robot.set_qpos(q)
                     _flush()
                 uenv.agent.controller.reset()
+                already = int(uenv.subtask_pointer[0]) > pointer
                 ev = uenv.evaluate()
-                if not (bool(ev["navigated_close"][0])
-                        and bool(ev["oriented_correctly"][0])):
+                if not already and not (
+                        bool(ev.get("navigated_close", [False])[0])
+                        and bool(ev.get("oriented_correctly", [False])[0])):
                     return False
-                # COLLISION leg: the navigate check knows nothing about
-                # geometry -- a candidate can pass it while standing inside
-                # the fridge or a wall (watched happen: robot in the void on
-                # the nav-to-apple marker). One settle step, then the env's
-                # own contact-force reading rejects penetrating poses.
-                self._env.step(torch.zeros(1, 13))
-                if int(uenv.subtask_pointer[0]) > pointer:
-                    return True   # the settle step already sealed the subtask
+                # COLLISION leg with the JIGGLE TRICK: navigate success
+                # requires is_static, so probing with a small arm wiggle keeps
+                # the env from SEALING the subtask on a candidate we have not
+                # admitted yet (a penetrating pose once advanced the pointer
+                # irreversibly at 4.1e6 N). Only after force and grasp read
+                # clean do we hold still and let the env pass it for real.
+                if not _probe_clean():
+                    return False
+                if already or int(uenv.subtask_pointer[0]) > pointer:
+                    return True
+                for _ in range(4):
+                    self._env.step(hold)
                 ev = uenv.evaluate()
-                return (bool(ev.get("navigated_close", [False])[0])
-                        and bool(ev.get("oriented_correctly", [False])[0])
-                        and float(ev.get("robot_force", [0.0])[0]) < 5.0)
+                return (int(uenv.subtask_pointer[0]) > pointer
+                        or (bool(ev.get("navigated_close", [False])[0])
+                            and bool(ev.get("oriented_correctly", [False])[0])
+                            and float(ev.get("robot_force", [0.0])[0]) < 5.0))
+
+            def _spawn_dock():
+                # Dock FROM THE NEXT SUBTASK'S OWN SPAWN DISTRIBUTION: the
+                # official spawn_data rows carry the full 15-dof qpos (base +
+                # torso + arm) TUNED to the target object's pose. Rank rows by
+                # distance between their episode's object pose and OUR live
+                # object, try the closest few. Pick-only for now: a full-qpos
+                # teleport is safe with an empty gripper; a held object would
+                # be left behind.
+                ptr = self._entry
+                plan = uenv.task_plan
+                if ptr + 1 >= len(plan) or plan[ptr + 1].type not in ("pick", "place"):
+                    return False
+                nxt = plan[ptr + 1].type
+                obj = uenv.subtask_objs[ptr + 1]
+                if obj is None:
+                    return False
+                from mani_skill import ASSET_DIR
+
+                sd = self._spawn_cache.get(nxt)
+                if sd is None:
+                    sd = torch.load(
+                        ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
+                        / f"spawn_data/set_table/{nxt}/train/spawn_data.pt",
+                        map_location="cpu")
+                    self._spawn_cache[nxt] = sd
+                if nxt == "pick":
+                    # rows whose EPISODE object sat closest to OUR live object
+                    anchor = obj.pose.p[0, :2].cpu()
+                    field = "obj_raw_pose"
+                else:
+                    # place: rows whose robot stood closest to OUR goal spot
+                    anchor = uenv.subtask_goals[ptr + 1].pose.p[0, :2].cpu()
+                    field = "robot_pos"
+                ranked = []
+                for key, entry in sd.items():
+                    dmin = torch.norm(entry[field][:, :2] - anchor, dim=1).min(0)
+                    ranked.append((float(dmin.values), key, int(dmin.indices)))
+                ranked.sort()
+                for _, key, row in ranked[:24]:
+                    q_row = sd[key]["robot_qpos"][row]
+                    q = robot.get_qpos()
+                    q[0, :] = q_row.to(q.device)
+                    robot.set_qpos(q)
+                    _flush()
+                    if nxt == "place":
+                        # the held object teleports WITH the hand: the spawn
+                        # row stores its pose RELATIVE TO the tcp; compose with
+                        # the freshly-set tcp pose -- the joint robot+object
+                        # state place trained on.
+                        from mani_skill.utils.structs.pose import Pose
+
+                        rel = sd[key]["obj_raw_pose_wrt_tcp"][row]
+                        rel_pose = Pose.create_from_pq(
+                            p=rel[None, :3].to(q.device),
+                            q=rel[None, 3:7].to(q.device))
+                        obj.set_pose(uenv.agent.tcp.pose * rel_pose)
+                        for setter in ("set_linear_velocity", "set_angular_velocity"):
+                            fn = getattr(obj, setter, None)
+                            if callable(fn):
+                                fn(torch.zeros(1, 3, device=q.device))
+                        _flush()
+                    uenv.agent.controller.reset()
+                    # jiggle-probe first (see _probe_clean: the env cannot
+                    # seal navigate while we are not static), then a real
+                    # settle only for an admitted pose.
+                    grasp_needed = (nxt == "place")
+                    if not _probe_clean() or (
+                            grasp_needed
+                            and not bool(uenv.agent.is_grasping(obj)[0])):
+                        _restore()
+                        continue
+                    for _ in range(4):
+                        self._env.step(hold)
+                    ev = uenv.evaluate()
+                    if (int(uenv.subtask_pointer[0]) > ptr
+                            or (bool(ev.get("navigated_close", [False])[0])
+                                and bool(ev.get("oriented_correctly", [False])[0]))):
+                        return True
+                    _restore()
+                return False
 
             # Candidate docking poses, the ENV ITSELF as the oracle: an
             # articulation goal (fridge) wants the base inside a docking box
             # in ITS local frame (x 0.93..1.83, lateral +-0.6); a plain marker
             # wants near + facing -- and NOT inside the furniture holding it,
             # hence the ring out to 1.4m with the collision leg above.
-            candidates = [_rot(1.383, 0, 0), _rot(-1.383, 0, 0),
-                          _rot(0, 0, 1.383), _rot(0, 0, -1.383),
-                          _rot(0.7, 0, 0), _rot(-0.7, 0, 0)]
-            for dist in (0.9, 1.2, 1.4):
-                for k in range(8):
-                    b = k * math.pi / 4
-                    candidates.append((dist * math.cos(b), dist * math.sin(b)))
-            for dx, dy in candidates:
-                if _try(gx + dx, gy + dy):
-                    break
-            self._act = lambda obs: torch.zeros(1, 13)
+            if not _spawn_dock():
+                candidates = [_rot(1.383, 0, 0), _rot(-1.383, 0, 0),
+                              _rot(0, 0, 1.383), _rot(0, 0, -1.383),
+                              _rot(0.7, 0, 0), _rot(-0.7, 0, 0)]
+                for dist in (0.9, 1.2, 1.4):
+                    for k in range(8):
+                        b = k * math.pi / 4
+                        candidates.append((dist * math.cos(b), dist * math.sin(b)))
+                docked = False
+                for dx, dy in candidates:
+                    if _try(gx + dx, gy + dy):
+                        docked = True
+                        break
+                    _restore()
+                if not docked:
+                    _restore()   # honest stay-put: better than a random pose
+            self._act = lambda obs: hold
         else:
             self._act = self._act_fn(self._skill, self._target or "all")
 
