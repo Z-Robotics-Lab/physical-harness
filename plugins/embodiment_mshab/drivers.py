@@ -149,6 +149,33 @@ class ChainDriver:
 
         return act
 
+    def _nav_act(self, obs):
+        """Scripted differential-drive navigate (the robocasa NavigateDriver
+        precedent): privileged goal off the env's own subtask goal marker,
+        rotate-then-drive on the base dims (11 forward in heading frame, 12
+        yaw rate -- probed 2026-09-12). The RL navigate checkpoint measured
+        1/3 in its OWN env and ~0 in chain context (official evaluate long-
+        horizon defaults to TELEPORT nav for a reason); straight-line drive
+        with no planner -- an obstacle in the way is an honest failure."""
+        import math
+
+        import torch
+
+        del obs
+        robot = self._env.uenv.agent.robot
+        q = robot.get_qpos()[0]
+        x, y, yaw = float(q[0]), float(q[1]), float(q[2])
+        goal = self._env.uenv.subtask_goals[self._entry]
+        gx, gy = float(goal.pose.p[0, 0]), float(goal.pose.p[0, 1])
+        dist = math.hypot(gx - x, gy - y)
+        a = torch.zeros(1, 13)
+        if dist > 0.25:
+            err = (math.atan2(gy - y, gx - x) - yaw + math.pi) % (2 * math.pi) - math.pi
+            a[0, 12] = max(-1.0, min(1.0, 2.0 * err))
+            if abs(err) < 0.6:
+                a[0, 11] = max(-1.0, min(1.0, dist))
+        return a
+
     # -- the segment protocol --------------------------------------------------
 
     def enter_segment(self, env, seg_spec, executor: Any = None) -> None:
@@ -172,7 +199,33 @@ class ChainDriver:
                               f"{self._skill!r} -- the official chain order is the "
                               "grounding authority")
             return
-        self._act = self._act_fn(self._skill, self._target or "all")
+        if self._skill == "navigate":
+            # TELEPORT nav, the official MS-HAB long-horizon evaluation mode
+            # (the RL navigate checkpoint measured 1/3 in its OWN env, ~0 in
+            # chain context, and straight-line scripted drive dies on the
+            # first wall -- no path planner exists in this benchmark). The
+            # base is SET to the env's own subtask goal pose; the settle
+            # steps then let the env's navigate check pass on its own terms.
+            import math
+
+            import torch
+
+            goal = env.uenv.subtask_goals[pointer]
+            p, qt = goal.pose.p, goal.pose.q
+            yaw = math.atan2(
+                2 * (float(qt[0, 0]) * float(qt[0, 3]) + float(qt[0, 1]) * float(qt[0, 2])),
+                1 - 2 * (float(qt[0, 2]) ** 2 + float(qt[0, 3]) ** 2))
+            robot = env.uenv.agent.robot
+            q = robot.get_qpos()
+            q[0, 0], q[0, 1], q[0, 2] = float(p[0, 0]), float(p[0, 1]), yaw
+            robot.set_qpos(q)
+            # pd_joint_delta_pos keeps absolute drive targets: without a
+            # controller re-anchor the PD pulls the base straight back to the
+            # pre-teleport pose (probed: back at origin within 30 steps).
+            env.uenv.agent.controller.reset()
+            self._act = lambda obs: torch.zeros(1, 13)
+        else:
+            self._act = self._act_fn(self._skill, self._target or "all")
 
     def act(self, obs):
         del obs
