@@ -295,16 +295,34 @@ class ChainDriver:
                     _flush()
                 uenv.agent.controller.reset()
                 ev = uenv.evaluate()
-                return bool(ev["navigated_close"][0]) and bool(ev["oriented_correctly"][0])
+                if not (bool(ev["navigated_close"][0])
+                        and bool(ev["oriented_correctly"][0])):
+                    return False
+                # COLLISION leg: the navigate check knows nothing about
+                # geometry -- a candidate can pass it while standing inside
+                # the fridge or a wall (watched happen: robot in the void on
+                # the nav-to-apple marker). One settle step, then the env's
+                # own contact-force reading rejects penetrating poses.
+                self._env.step(torch.zeros(1, 13))
+                if int(uenv.subtask_pointer[0]) > pointer:
+                    return True   # the settle step already sealed the subtask
+                ev = uenv.evaluate()
+                return (bool(ev.get("navigated_close", [False])[0])
+                        and bool(ev.get("oriented_correctly", [False])[0])
+                        and float(ev.get("robot_force", [0.0])[0]) < 5.0)
 
             # Candidate docking poses, the ENV ITSELF as the oracle: an
             # articulation goal (fridge) wants the base inside a docking box
             # in ITS local frame (x 0.93..1.83, lateral +-0.6); a plain marker
-            # wants near + facing. Try local +-x / +-z at docking range, then
-            # the short plain-marker offset; first pose evaluate() admits wins.
+            # wants near + facing -- and NOT inside the furniture holding it,
+            # hence the ring out to 1.4m with the collision leg above.
             candidates = [_rot(1.383, 0, 0), _rot(-1.383, 0, 0),
                           _rot(0, 0, 1.383), _rot(0, 0, -1.383),
                           _rot(0.7, 0, 0), _rot(-0.7, 0, 0)]
+            for dist in (0.9, 1.2, 1.4):
+                for k in range(8):
+                    b = k * math.pi / 4
+                    candidates.append((dist * math.cos(b), dist * math.sin(b)))
             for dx, dy in candidates:
                 if _try(gx + dx, gy + dy):
                     break
