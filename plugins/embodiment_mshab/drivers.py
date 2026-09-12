@@ -573,12 +573,22 @@ class ChainDriver:
         import math as _m
 
         leg = _m.hypot(tx - float(bl0[0, 0]), ty - float(bl0[0, 1]))
-        # Short repositioning (< 1.5m, e.g. fridge-front to apple-front) SNAPS:
-        # there is nothing to watch in a 30cm shuffle, and driving it skims the
-        # OPEN fridge door -- a driven nav_apple left pick failing where the
-        # snapped one passed. Long legs drive for real.
+        # Legs > 1.5m drive for real; anything shorter GLIDES (a smooth
+        # 2.5cm/frame kinematic slide -- visually continuous, no hard cut,
+        # and no driven skim along the OPEN fridge door, which broke pick
+        # whenever the 0.9m fridge->apple leg was actually driven).
         state = {"waypoints": [] if leg < 1.5 else [(tx, ty)],
                  "trail": [], "stalls": 0, "snapped": False}
+
+        def _apply_state():
+            scene = uenv.scene
+            if hasattr(scene, "_gpu_apply_all"):
+                scene._gpu_apply_all()
+            if hasattr(scene.px, "gpu_update_articulation_kinematics"):
+                scene.px.gpu_update_articulation_kinematics()
+            if hasattr(scene, "_gpu_fetch_all"):
+                scene._gpu_fetch_all()
+            uenv.agent.controller.reset()
 
         def _teleport_to_dock():
             q = robot.get_qpos()
@@ -589,14 +599,31 @@ class ChainDriver:
 
                 o, p0, q0 = dock_state["obj"]
                 o.set_pose(Pose.create_from_pq(p=p0, q=q0))
-            scene = uenv.scene
-            if hasattr(scene, "_gpu_apply_all"):
-                scene._gpu_apply_all()
-            if hasattr(scene.px, "gpu_update_articulation_kinematics"):
-                scene.px.gpu_update_articulation_kinematics()
-            if hasattr(scene, "_gpu_fetch_all"):
-                scene._gpu_fetch_all()
-            uenv.agent.controller.reset()
+            _apply_state()
+
+        def _glide_to_dock(n_steps: int):
+            # NO hard cut: interpolate the BASE ONLY (x, y, yaw) to the dock
+            # over rendered steps -- a smooth slide, and the low cylinder base
+            # passes under the open fridge door. The arm is NOT interpolated:
+            # a kinematic arm sweep during the slide raked the fridge shelf
+            # and knocked the apple (pick broke on every glided leg until the
+            # arm was left out). Arm/torso catch up afterwards via the
+            # action-space blend + the final exact correction.
+            q0 = robot.get_qpos().clone()
+            q1 = dock_state["qpos"]
+            for i in range(1, n_steps + 1):
+                t = i / n_steps
+                q = robot.get_qpos()
+                for qi in (0, 1, 2):
+                    q[0, qi] = float(q0[0, qi]) * (1.0 - t) + float(q1[0, qi]) * t
+                robot.set_qpos(q)
+                _apply_state()
+                # wrist wiggle: keeps is_static False so the env cannot seal
+                # navigate MID-glide (it did, at frame 1, leaving the robot
+                # at the spawn with the subtask already 'done').
+                a = hold.clone()
+                a[0, 6] = 0.4 if i % 2 == 0 else -0.4
+                self._env.step(a)
 
         gx, gy = dock_state["goal"]
         #: qpos indices of the 7 arm joints, in ACTION dim order 0..6 (probed:
@@ -610,33 +637,36 @@ class ChainDriver:
             x, y = float(bl[0, 0]), float(bl[0, 1])
             yaw = float(robot.get_qpos()[0, 2])
             if not state["waypoints"]:
-                # arrived: FACE THE GOAL first -- travel heading is whatever
-                # direction we came from (probed: parked at the dock facing
-                # away, oriented_correctly never fired)...
-                err = (math.atan2(gy - y, gx - x) - yaw + math.pi) % (2 * math.pi) - math.pi
-                if abs(err) > 0.15:
-                    a = hold.clone()
-                    a[0, 12] = max(-1.0, min(1.0, 2.0 * err))
-                    return a
-                # ...then BLEND THE ARM to the admitted dock's arm config:
-                # the spawn row's value is half in the arm pose (the next
-                # policy's in-distribution start); driving matched only the
-                # base and pick failed from the fridge-opening arm pose.
-                qnow = robot.get_qpos()[0]
-                errs = [float(dock_state["qpos"][0, qi]) - float(qnow[qi])
-                        for qi in arm_qidx]
-                if max(abs(e) for e in errs) > 0.06:
-                    a = hold.clone()
-                    for j, e in enumerate(errs):
-                        a[0, j] = max(-1.0, min(1.0, 1.5 * e))
-                    return a
                 if not state.get("snapped"):
-                    # centimeter-scale SNAP to the exact admitted qpos: the
-                    # drive covered the distance and the blend the arm, but
-                    # torso height barely actuates and the next policy's
-                    # spawn distribution is exact-state (pick failed from a
-                    # driven pose 10cm + torso off). One imperceptible
-                    # correction, not an 8m cut.
+                    # arrival preparation, ALL inside one act call -- glide
+                    # (short legs), face the goal, action-space arm blend,
+                    # exact residual fix. Piecemeal phases lose a race with
+                    # the env: it seals the subtask the moment its criteria
+                    # hold (mid-procedure), and the next policy starts from
+                    # a half-prepared state (broke pick, then place).
+                    if leg < 1.5 and not state.get("glided"):
+                        _glide_to_dock(max(12, int(leg * 40)))
+                        state["glided"] = True
+                    for _ in range(120):
+                        bl2 = uenv.agent.base_link.pose.p
+                        x2, y2 = float(bl2[0, 0]), float(bl2[0, 1])
+                        yaw2 = float(robot.get_qpos()[0, 2])
+                        err = (math.atan2(gy - y2, gx - x2) - yaw2 + math.pi) % (2 * math.pi) - math.pi
+                        if abs(err) <= 0.15:
+                            break
+                        a = hold.clone()
+                        a[0, 12] = max(-1.0, min(1.0, 2.0 * err))
+                        self._env.step(a)
+                    for _ in range(80):
+                        qnow = robot.get_qpos()[0]
+                        errs = [float(dock_state["qpos"][0, qi]) - float(qnow[qi])
+                                for qi in arm_qidx]
+                        if max(abs(e) for e in errs) < 0.06:
+                            break
+                        a = hold.clone()
+                        for j, e in enumerate(errs):
+                            a[0, j] = max(-1.0, min(1.0, 1.5 * e))
+                        self._env.step(a)
                     _teleport_to_dock()
                     state["snapped"] = True
                 return hold                      # aligned + posed: env seals
