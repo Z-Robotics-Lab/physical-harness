@@ -273,6 +273,23 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                 "require_build_configs_repeated_equally_across_envs": False,
                 "add_event_tracker_info": True,
                 "invisible_goals_in_human_render": False,
+                # Fixed near-plumb camera replacing the default torso-mounted
+                # follow cam (which yaws with the base -- every turn swung the
+                # whole picture). Pose = look_at([1.6,-2.4,10.8],
+                # [-0.5,-3.0,0.0], up=[0.925,0.38,0]): up along the corridor
+                # normal lays the 9m fridge->table line across the 16:9 frame.
+                # Near-plumb is FORCED by the scene, not taste: the fridge
+                # faces EAST and its open/pick docks sit in a slot between the
+                # fridge box and the ceiling-height hallway partition -- every
+                # oblique angle tried (4 sides, 3 heights) hid the robot for
+                # the whole open segment. Frame-verified at all three docks.
+                # far=40 because the default 10 clips the far sightline.
+                "human_render_camera_configs": {"render_camera": {
+                    "pose": [1.6, -2.4, 10.8,
+                             0.6199, -0.1428, 0.7603, 0.1312],
+                    "mount": None, "width": 768, "height": 432,
+                    "fov": 0.66, "near": 0.01, "far": 40.0,
+                }},
                 # navigate: the RL policy was never trained to retract the
                 # arm; without the flag its subtask NEVER passes (the
                 # teammate's chain runner sets the same one). pick/place:

@@ -594,11 +594,30 @@ class ChainDriver:
             q = robot.get_qpos()
             q[0, :] = dock_state["qpos"][0]
             robot.set_qpos(q)
+            # Kill the arrival momentum: set_qpos keeps qvel, and the base
+            # arrives DRIVING (~0.35m/s). Same for the held object below --
+            # a teleported apple that keeps its carry velocity integrates
+            # right out of the now-static fingers on the next step, lands on
+            # the table, and place starts already lost (seen: obj frozen
+            # 15cm off goal for a full 280-step place, grasp False from
+            # step 1). _restore/_spawn_dock already zero object velocity;
+            # this teleport is the one that ran straight after real driving.
+            zv = getattr(robot, "set_qvel", None)
+            if callable(zv):
+                import torch as _t
+
+                zv(_t.zeros_like(robot.get_qvel()))
             if dock_state["obj"] is not None:
                 from mani_skill.utils.structs.pose import Pose
 
                 o, p0, q0 = dock_state["obj"]
                 o.set_pose(Pose.create_from_pq(p=p0, q=q0))
+                import torch as _t
+
+                for setter in ("set_linear_velocity", "set_angular_velocity"):
+                    fn = getattr(o, setter, None)
+                    if callable(fn):
+                        fn(_t.zeros(1, 3, device=p0.device))
             _apply_state()
 
         def _glide_to_dock(n_steps: int):

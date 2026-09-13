@@ -938,18 +938,26 @@ cd $REPO
 ~/Desktop/maniskill-agentic-library/.venv/bin/python -m pytest tests/test_mshab_marker.py -m mshab
 ```
 
-**VLM 规划链（`mshab_settable_vlm`，2026-09-12 现状）**：`mission_mshab_settable` 卡 =
-planner_vlm（本地 llama.cpp GGUF Qwen @30000，thinking 关闭，卡内 `_SegmentStamp`
-给节点盖 `kind="segment"` 章——planner_vlm 不产 kind，默认会走 manipulate 撞
-SKILL_SPECS）+ `ChainDriver`（按 segment 经队友 SkillLibrary 加载官方 RL
-checkpoint）+ `mshab_settable_chain` 链环境（官方 sequential plan 0 的 8:14 切片，
+**VLM 规划链（`mshab_settable_vlm`，2026-09-13 现状：全链已通）**：
+`mission_mshab_settable` 卡 = planner_vlm（本地 llama.cpp GGUF Qwen @30001，
+thinking 关闭，卡内 `_SegmentStamp` 给节点盖 `kind="segment"` 章——planner_vlm
+不产 kind，默认会走 manipulate 撞 SKILL_SPECS）+ `ChainDriver`（按 segment 经
+队友 SkillLibrary 加载官方 RL checkpoint：open/close/navigate=PPO，pick/place
+=SAC）+ `mshab_settable_chain` 链环境（官方 sequential plan 0 的 8:14 切片，
 grounding 权威在 env）。**已证明**：VLM 从场景事实自主产出正确六节点图（含
 open-before-pick 推理与全 verify 覆盖）、validate 通过、错序图在 enter_segment
-诚实拒绝、失败折回 replan、诚实封存。**未通**：navigate 段在本 driver 下原地
-打转不推进 subtask_pointer，而同 seed 同 plan 同策略经 `mshab.evaluate`
-（评估链 runner）nav→pick 全部通过（A/B 已做）——残差在 evaluate act 循环的
-obs 处理与本 driver 的差异，待查。PLANNING_CONTEXT 带 `objects` 时必须同时给
-`required_per_object_order`（validate 的 requirements 检查）。
+诚实拒绝、失败折回 replan、诚实封存；全链 runtime 正路 `plan_complete
+success=true`，env 整任务 success=True。navigate 是停靠搜索 + 短腿滑移/长腿
+真差速驾驶（RL navigate checkpoint 在链上下文 ~0%，官方长程评估同样 teleport
+nav——细节与坑谱见 drivers.py 注释）。取景窗/视频用**固定近垂直俯视机位**
+（env.py 链分支的 `human_render_camera_configs`，up 沿走廊法向让 9m 动线横贯
+16:9 画幅；默认相机 mount 在 torso_lift_link 上会随底盘 yaw 甩镜头。近垂直是
+场景逼出来的：冰箱面朝东，open/pick 停靠点卡在冰箱与顶高走廊隔断的窄槽里，
+四面斜角全被墙挡——三个停靠点均已逐帧核验可见）。
+两个必须知道的坑：① `_teleport_to_dock` 必须清零机器人 qvel 与持物速度——
+真驾驶到站带 ~0.35m/s 冲量，带速度的苹果瞬移进静止指间会在下一步物理积分中
+滑出（place 起手即丢物，280 步烧穿力限额）；② PLANNING_CONTEXT 带 `objects`
+时必须同时给 `required_per_object_order`（validate 的 requirements 检查）。
 
 ## 6. 接入你自己的模型
 
