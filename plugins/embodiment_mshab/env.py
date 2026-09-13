@@ -57,14 +57,17 @@ TASKS: dict[str, dict] = {
     "mshab_settable_full_chain": {
         "hab_task": "set_table",
         "chain_plan": "task_plans/set_table/custom/settable_full_vlm_train.json",
-        # look_at([5.0,1.5,9.5], [0.0,-2.3,0.3]): high-NE 3/4 view -- this
-        # variation's containers sit on an open wall (no ceiling-height
-        # slot), so the oblique angle survives; frame-verified at all three
-        # docks (the near-plumb first take read as a floor plan). Height 9.5
-        # is what clears the hallway block in front of the fridge dock.
-        "chain_camera": {"pose": [5.0, 1.5, 9.5,
-                                  0.2823, 0.4426, 0.1491, -0.838],
-                         "fov": 0.8},
+        # look_at([0.5,4.8,7.2], [0.2,-2.8,0.3]): NORTH view down the
+        # corridor axis. The fridge open/close dock sits in a north-south
+        # slot between the fridge box and the hallway block -- every NE
+        # angle below z=9.5 loses the robot there for whole segments
+        # (real-run frames, not probes, caught this), while the north view
+        # looks straight down the slot. All three docks frame-verified at
+        # the REAL dock coordinates; the near-end manipulation zone renders
+        # the robot about twice the old high view's size.
+        "chain_camera": {"pose": [0.5, 4.8, 7.2,
+                                  0.6465, 0.2596, 0.2496, -0.6726],
+                         "fov": 0.7},
     },
 }
 
