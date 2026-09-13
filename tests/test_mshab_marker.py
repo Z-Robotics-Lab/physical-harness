@@ -27,6 +27,7 @@ def test_mshab_card_task_table():
 
     p = card.provider()
     assert p.tasks() == ("mshab_close", "mshab_open", "mshab_pick",
-                         "mshab_place", "mshab_settable_chain")
+                         "mshab_place", "mshab_settable_chain",
+                         "mshab_settable_full_chain")
     with pytest.raises(KeyError):
         p.object_key(EpisodeSpec(task="mshab_pick", seed=424242))

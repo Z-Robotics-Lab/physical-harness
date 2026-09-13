@@ -74,6 +74,11 @@ def provider(**params: Any) -> RolloutPolicies:
 #: chain env): a behaviorally-successful place landed at ~205 driver steps.
 _SEGMENT_CAPS = {"navigate": 2400, "pick": 280, "place": 280, "open": 200, "close": 200}
 
+#: qpos indices of the 7 arm joints, in ACTION dim order 0..6 (probed:
+#: shoulder_pan, shoulder_lift, upperarm_roll, elbow_flex, forearm_roll,
+#: wrist_flex, wrist_roll).
+_ARM_QIDX = (5, 7, 8, 9, 10, 11, 12)
+
 
 class ChainDriver:
     """Heterogeneous episodic driver over the official MS-HAB RL checkpoints.
@@ -99,8 +104,23 @@ class ChainDriver:
         self._policies: dict[str, Any] = {}
         self._library = None
         self._spawn_cache: dict[str, Any] = {}
+        #: per-(skill, object) allowed spawn-key sets (see _allowed_rows)
+        self._spawn_allow: dict[tuple, set] = {}
+        #: retry rotation over native dock rows (see _ensure_manip_dock)
+        self._dock_rot: dict[tuple, int] = {}
+        #: per-subtask (key, row) the NAV dock search admitted -- the manip
+        #: segment re-applies exactly this row (no visible jump), retries
+        #: rotate from the next row on.
+        self._dock_choice: dict[int, tuple] = {}
+        #: per-subtask entry clock (subtask_steps_left at first entry): a
+        #: RETRY of a manipulation re-enters the same env subtask with the
+        #: previous attempt's burn still on the clock -- once it hits zero,
+        #: fail=True latches and no retry can ever seal (the c3 budget wall).
+        self._clock0: dict[int, int] = {}
         #: episode spawn point, the driving hub (recorded at the first dock)
         self._hub: tuple[float, float] | None = None
+        #: episode-start full qpos (arm at rest), captured at first segment
+        self._rest_q: Any = None
 
     @property
     def identity(self) -> str:
@@ -224,6 +244,211 @@ class ChainDriver:
                 a[0, 11] = max(-1.0, min(1.0, dist))
         return a
 
+    def _real_id(self, idx: int) -> str:
+        """The subtask's REAL grounding id ("024_bowl", "fridge") from the
+        chain JSON via the adapter -- the env scrubs obj_id/actor names to
+        positional "obj_<n>" placeholders, which silently emptied every
+        per-object spawn filter (and the docks ran unfiltered roulette)."""
+        ids = getattr(self._env, "subtask_real_ids", None)
+        if not ids or idx >= len(ids) or not ids[idx]:
+            return ""
+        return str(ids[idx]).rsplit("-", 1)[0]
+
+    def _spawn_rows(self, skill: str):
+        """Lazy-load + cache one skill's official spawn_data table."""
+        import torch
+
+        from mani_skill import ASSET_DIR
+
+        sd = self._spawn_cache.get(skill)
+        if sd is None:
+            sd = torch.load(
+                ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
+                / f"spawn_data/set_table/{skill}/train/spawn_data.pt",
+                map_location="cpu")
+            self._spawn_cache[skill] = sd
+        return sd
+
+    def _allowed_rows(self, skill: str, obj_name: str, anchor,
+                      art_key=None) -> set:
+        """Spawn keys this dock may use. Rows carry no identity, and foreign
+        rows can look nearest by coordinates while being poison: a different
+        OBJECT means a wrong in-hand pose, and for place even the right
+        object from a different SCENE fails (probed 0/6 foreign vs 28-step
+        success on a native row -- native docks are FARTHER from the goal,
+        so nearest-first actively prefers the poison). Filter by the
+        per-object plan file; for place additionally by goal_pos ~= ours,
+        which pins the episodes native to this scene+table."""
+        key = (skill, obj_name, art_key, None if skill != "place"
+               else (round(float(anchor[0]), 1), round(float(anchor[1]), 1)))
+        allowed = self._spawn_allow.get(key)
+        if allowed is not None:
+            return allowed
+        import json as _json
+
+        from mani_skill import ASSET_DIR
+
+        fp = (ASSET_DIR / "scene_datasets/replica_cad_dataset"
+              / f"rearrange/task_plans/set_table/{skill}/train/{obj_name}.json")
+        bc = getattr(self._env, "build_config_name", None)
+        allowed = {}
+        if obj_name and fp.exists():
+            for pl in _json.loads(fp.read_text()).get("plans", []):
+                if skill in ("open", "close"):
+                    # articulations move between scene variations (fridge y
+                    # differs 0.8m across set_table scenes): only rows from
+                    # OUR scene dock at OUR handle.
+                    if bc and pl.get("build_config_name") != bc:
+                        continue
+                for st in pl.get("subtasks", []):
+                    if not st.get("uid"):
+                        continue
+                    if skill in ("open", "close") and art_key is not None:
+                        # one articulation, several drawers: pin the exact
+                        # handle or the dock (and the policy) opens the
+                        # wrong one.
+                        st_key = (st.get("articulation_id"),
+                                  st.get("articulation_handle_link_idx"),
+                                  st.get("articulation_handle_active_joint_idx"))
+                        if st_key != tuple(art_key):
+                            continue
+                    gp = st.get("goal_pos")
+                    if skill == "place":
+                        if (not gp or abs(gp[0] - float(anchor[0])) > 0.12
+                                or abs(gp[1] - float(anchor[1])) > 0.12):
+                            continue
+                    allowed[st["uid"]] = None if not gp else (gp[0], gp[1])
+        self._spawn_allow[key] = allowed
+        return allowed
+
+    def _manip_rows(self, skill: str, ptr: int):
+        """The ordered native dock rows for a manipulation subtask."""
+        import torch
+
+        uenv = self._env.uenv
+        sd = self._spawn_rows(skill)
+        if skill == "place":
+            goal = uenv.subtask_goals[ptr]
+            anchor = goal.pose.p[0, :2].cpu()
+        elif skill == "pick":
+            anchor = uenv.subtask_objs[ptr].pose.p[0, :2].cpu()
+        else:
+            art = uenv.subtask_articulations[ptr]
+            anchor = art.pose.p[0, :2].cpu()
+        obj_name = self._real_id(ptr)
+        art_keys = getattr(self._env, "subtask_art_keys", None)
+        art_key = art_keys[ptr] if art_keys else None
+        allowed = self._allowed_rows(skill, obj_name, anchor, art_key)
+        keys = [k for k in allowed if k in sd]
+        if not keys:
+            return sd, []
+
+        if skill == "place":
+            def _rank(k):
+                gp = allowed.get(k)
+                return (9.9 if gp is None else
+                        (gp[0] - float(anchor[0])) ** 2
+                        + (gp[1] - float(anchor[1])) ** 2)
+        else:
+            field = "obj_raw_pose" if skill == "pick" else "robot_pos"
+
+            def _rank(k):
+                return float(torch.norm(
+                    sd[k][field][:, :2] - anchor, dim=1).min())
+
+        keys.sort(key=_rank)
+        return sd, [(k, r) for k in keys
+                    for r in range(len(sd[k]["robot_qpos"]))]
+
+    def _ensure_manip_dock(self) -> None:
+        """Every manipulation segment STARTS from its own native spawn row:
+        the checkpoints were trained from these exact states, and leaving
+        the start pose to whatever the previous segment happened to end at
+        made every run a dock roulette. First entry re-applies the row the
+        preceding navigate already admitted (same pose -- no visible jump);
+        retries rotate to a different native row with a fresh subtask clock,
+        so each retry is a genuinely independent in-distribution attempt."""
+        import torch
+
+        from mani_skill.utils.structs.pose import Pose
+
+        uenv = self._env.uenv
+        ptr = self._entry
+        skill = self._skill
+        obj = uenv.subtask_objs[ptr] if skill in ("pick", "place") else None
+        sd, rows = self._manip_rows(skill, ptr)
+        if not rows:
+            return
+        rot_key = (skill, ptr)
+        start = self._dock_rot.get(rot_key, 0)
+        self._dock_rot[rot_key] = start + 1
+        choice = self._dock_choice.get(ptr)
+        base = rows.index(choice) if choice in rows else 0
+        if start == 0:
+            # first entry: the nav arrival state IS the admitted dock --
+            # keep it. Only place re-docks here, and only when the carry
+            # broke (object not in the gripper).
+            if skill != "place":
+                return
+            try:
+                if obj is None or bool(uenv.agent.is_grasping(obj)[0]):
+                    return
+            except Exception:  # noqa: BLE001
+                return
+        robot = uenv.agent.robot
+        scene = uenv.scene
+        root_p = robot.pose.p
+
+        def _flush():
+            scene._gpu_apply_all()
+            scene.px.gpu_update_articulation_kinematics()
+            scene._gpu_fetch_all()
+            uenv.agent.controller.reset()
+
+        hold = torch.zeros(1, 13)
+        hold[0, 7] = -1.0 if skill == "place" else 0.0
+        self._env.frames_suppressed = True
+        try:
+            for i in range(min(len(rows), 8)):
+                key, row = rows[(base + start + i) % len(rows)]
+                q_row = sd[key]["robot_qpos"][row]
+                want = sd[key]["robot_pos"][row]
+                q = robot.get_qpos()
+                q[0, :] = q_row.to(q.device)
+                q[0, 0] = (float(want[0]) + float(q_row[0])
+                           - float(root_p[0, 0]))
+                q[0, 1] = (float(want[1]) + float(q_row[1])
+                           - float(root_p[0, 1]))
+                robot.set_qpos(q)
+                robot.set_qvel(torch.zeros_like(robot.get_qvel()))
+                _flush()
+                if skill == "place" and obj is not None:
+                    rel = sd[key]["obj_raw_pose_wrt_tcp"][row]
+                    rel_pose = Pose.create_from_pq(
+                        p=rel[None, :3].to(q.device),
+                        q=rel[None, 3:7].to(q.device))
+                    obj.set_pose(uenv.agent.tcp.pose * rel_pose)
+                    for setter in ("set_linear_velocity",
+                                   "set_angular_velocity"):
+                        fn = getattr(obj, setter, None)
+                        if callable(fn):
+                            fn(torch.zeros(1, 3, device=q.device))
+                    _flush()
+                    # admission: two settle steps with fingers closing, then
+                    # the grasp must actually register.
+                    self._env.step(hold)
+                    self._env.step(hold)
+                    if bool(uenv.agent.is_grasping(obj)[0]):
+                        break
+                else:
+                    break   # pick/open/close: the row pose itself is the dock
+        finally:
+            self._env.frames_suppressed = False
+        # failed attempts / the re-dock racked the subtask force ledger with
+        # junk; restart the account at the docked state (same semantics as
+        # the env's own subtask-transition reset).
+        uenv.robot_cumulative_force[:] = 0
+
     # -- the segment protocol --------------------------------------------------
 
     def enter_segment(self, env, seg_spec, executor: Any = None) -> None:
@@ -287,6 +512,28 @@ class ChainDriver:
                         held = False
             hold = torch.zeros(1, 13)
             hold[0, 7] = -1.0 if held else 0.0
+
+            if self._rest_q is None:
+                # first segment starts at the episode spawn: arm at rest
+                self._rest_q = robot.get_qpos().clone()
+            if not held:
+                # A manipulation that just finished (close, a failed place)
+                # can leave the arm STRETCHED INTO the furniture; ring
+                # candidates near the next goal then all die on the force
+                # probe (seen: nav-after-close burned 3x2400 steps with zero
+                # admissible docks). Blend the arm back to the episode rest
+                # pose in ACTION space first -- kinematic snapping is what
+                # raked the fridge shelf in the glide days.
+                for _ in range(60):
+                    qnow = robot.get_qpos()[0]
+                    errs = [float(self._rest_q[0, qi]) - float(qnow[qi])
+                            for qi in _ARM_QIDX]
+                    if max(abs(e) for e in errs) < 0.08:
+                        break
+                    a = hold.clone()
+                    for j, e in enumerate(errs):
+                        a[0, j] = max(-1.0, min(1.0, 1.5 * e))
+                    self._env.step(a)
 
             def _flush():
                 # GPU sim: push + refresh BEFORE the controller re-anchor, or
@@ -353,10 +600,14 @@ class ChainDriver:
                     self._env.step(a)
                 ev = uenv.evaluate()
                 # A held object IS a contact: the gripper squeeze alone reads
-                # thousands of N (4751 at a clean pick-end pose), so <5N is
-                # physically impossible while carrying. Penetration reads in
-                # the MILLIONS -- the tiers are orders of magnitude apart.
-                limit = 8000.0 if held else 5.0
+                # thousands of N (4751 at a clean pick-end pose). Penetration
+                # reads in the MILLIONS -- the tiers are orders of magnitude
+                # apart. The empty-hand limit was 5.0 for a while and that
+                # rejected workable docks over millinewton wiggle noise
+                # (admission became a coin flip; a stalled nav then poisoned
+                # the whole downstream arc). 2000 stays 500x under the
+                # penetration tier while admitting light furniture kisses.
+                limit = 8000.0 if held else 2000.0
                 if float(ev.get("robot_force", [0.0])[0]) >= limit:
                     return False
                 if held and snap_obj is not None and not bool(
@@ -423,38 +674,75 @@ class ChainDriver:
                 # be left behind.
                 ptr = self._entry
                 plan = uenv.task_plan
-                if ptr + 1 >= len(plan) or plan[ptr + 1].type not in ("pick", "place"):
+                if ptr + 1 >= len(plan) or plan[ptr + 1].type not in (
+                        "pick", "place", "open", "close"):
                     return False
                 nxt = plan[ptr + 1].type
                 obj = uenv.subtask_objs[ptr + 1]
-                if obj is None:
+                if nxt in ("pick", "place") and obj is None:
                     return False
-                from mani_skill import ASSET_DIR
-
-                sd = self._spawn_cache.get(nxt)
-                if sd is None:
-                    sd = torch.load(
-                        ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
-                        / f"spawn_data/set_table/{nxt}/train/spawn_data.pt",
-                        map_location="cpu")
-                    self._spawn_cache[nxt] = sd
+                sd = self._spawn_rows(nxt)
                 if nxt == "pick":
                     # rows whose EPISODE object sat closest to OUR live object
                     anchor = obj.pose.p[0, :2].cpu()
                     field = "obj_raw_pose"
                 else:
-                    # place: rows whose robot stood closest to OUR goal spot
-                    anchor = uenv.subtask_goals[ptr + 1].pose.p[0, :2].cpu()
+                    # place/open/close: rows whose robot stood closest to OUR
+                    # goal (the table spot / the articulation dock)
+                    anchor = torch.tensor([gx, gy])
                     field = "robot_pos"
+                # Spawn rows carry NO object identity, and different-object
+                # episodes dock at the SAME table with near-identical
+                # robot_pos -- nearest-by-coordinate happily returns an
+                # APPLE-grasp row for a BOWL (the object then teleports into
+                # the hand at the wrong relative pose: penetrating fingers,
+                # policy runaway / edge drops). The per-object plan file
+                # enumerates which spawn keys belong to this object; rank
+                # inside that set, whole-table ranking only as fallback.
+                # open/close key on the articulation type instead: their rows
+                # dock INSIDE cluttered nooks the coarse ring never enters
+                # cleanly (a leaning bike rejected every ring candidate at
+                # this scene's fridge on the honest force probe).
+                obj_name = self._real_id(ptr + 1)
+                art_keys = getattr(self._env, "subtask_art_keys", None)
+                art_key = art_keys[ptr + 1] if art_keys else None
+                allowed = self._allowed_rows(nxt, obj_name, anchor, art_key)
+                items = ([(k, v) for k, v in sd.items() if k in allowed]
+                         if allowed else list(sd.items())) or list(sd.items())
                 ranked = []
-                for key, entry in sd.items():
+                for key, entry in items:
                     dmin = torch.norm(entry[field][:, :2] - anchor, dim=1).min(0)
-                    ranked.append((float(dmin.values), key, int(dmin.indices)))
+                    gp = allowed.get(key) if allowed else None
+                    # goal mismatch dominates: the episode native to THIS
+                    # exact goal spot is the one whose policy lands on it
+                    # (probed: exact-goal row placed in 28 steps, 4-6cm-off
+                    # neighbours kept missing the seal).
+                    gm = (0.0 if gp is None else
+                          float(torch.hypot(torch.tensor(gp[0] - float(anchor[0])),
+                                            torch.tensor(gp[1] - float(anchor[1])))))
+                    ranked.append((round(gm, 3), float(dmin.values),
+                                   key, int(dmin.indices)))
                 ranked.sort()
-                for _, key, row in ranked[:24]:
+                root_p = robot.pose.p
+                for _, _, key, row in ranked[:24]:
+                    # Official application (mshab subtask.py) is set_pose(
+                    # robot_pos) THEN set_qpos: robot_pos is the episode's
+                    # ROOT and the row qpos is relative to it. Roots are
+                    # identity-oriented everywhere, so instead of moving OUR
+                    # root (which would break _restore and the glide math),
+                    # fold the frame change into the base joints:
+                    # q[0:2] = robot_pos + row_qpos[0:2] - our_root. Applied
+                    # raw, an other-scene row landed the base near our root,
+                    # admission died, and the ring fallback ran place from an
+                    # OOD carry state -- that is what flung the bowl.
                     q_row = sd[key]["robot_qpos"][row]
+                    want = sd[key]["robot_pos"][row]
                     q = robot.get_qpos()
                     q[0, :] = q_row.to(q.device)
+                    q[0, 0] = (float(want[0]) + float(q_row[0])
+                               - float(root_p[0, 0]))
+                    q[0, 1] = (float(want[1]) + float(q_row[1])
+                               - float(root_p[0, 1]))
                     robot.set_qpos(q)
                     _flush()
                     if nxt == "place":
@@ -487,6 +775,7 @@ class ChainDriver:
                     if (int(uenv.subtask_pointer[0]) > ptr
                             or (bool(ev.get("navigated_close", [False])[0])
                                 and bool(ev.get("oriented_correctly", [False])[0]))):
+                        self._dock_choice[ptr + 1] = (key, row)
                         return True
                     _restore()
                 return False
@@ -552,6 +841,17 @@ class ChainDriver:
                 self._act = self._make_drive_act(dock_state, hold)
         else:
             self._act = self._act_fn(self._skill, self._target or "all")
+            if self._skill in ("pick", "place", "open", "close"):
+                uenv = env.uenv
+                c0 = self._clock0.get(self._entry)
+                if c0 is None:
+                    self._clock0[self._entry] = int(uenv.subtask_steps_left[0])
+                else:
+                    # retry: fresh subtask clock + force ledger, same
+                    # semantics as the env's own subtask-transition reset
+                    uenv.subtask_steps_left[:] = c0
+                    uenv.robot_cumulative_force[:] = 0
+                self._ensure_manip_dock()
 
     def _make_drive_act(self, dock_state, hold):
         """REAL differential driving to the admitted dock (dims probed:
@@ -645,10 +945,7 @@ class ChainDriver:
                 self._env.step(a)
 
         gx, gy = dock_state["goal"]
-        #: qpos indices of the 7 arm joints, in ACTION dim order 0..6 (probed:
-        #: shoulder_pan, shoulder_lift, upperarm_roll, elbow_flex,
-        #: forearm_roll, wrist_flex, wrist_roll).
-        arm_qidx = (5, 7, 8, 9, 10, 11, 12)
+        arm_qidx = _ARM_QIDX
 
         def act(obs):
             del obs
@@ -688,6 +985,13 @@ class ChainDriver:
                         self._env.step(a)
                     _teleport_to_dock()
                     state["snapped"] = True
+                    # The glide is presentation, not behavior: a kinematic
+                    # slide that grazes furniture (a leaning bike, an open
+                    # door) banks MILLIONS of fictitious N and locks the
+                    # navigate seal out forever. Same semantics as the
+                    # post-dock-search zero: the ledger restarts at the
+                    # settled dock.
+                    uenv.robot_cumulative_force[:] = 0
                 return hold                      # aligned + posed: env seals
             wx, wy = state["waypoints"][0]
             dist = math.hypot(wx - x, wy - y)

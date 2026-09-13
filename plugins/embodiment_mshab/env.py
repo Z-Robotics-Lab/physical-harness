@@ -36,9 +36,33 @@ TASKS: dict[str, dict] = {
     # goal poses) is a slice of an OFFICIAL sequential TaskPlan, derived once
     # by scripts/build_skill_chain.py in the mshab checkout. The VLM planner
     # designs the GRAPH over it; it never invents grounding.
+    # chain_camera: per-chain fixed viewport camera. Each custom chain plan
+    # grounds ONE static scene variation, so its camera is probed once against
+    # that scene's real dock spots (teleport + world-point projection) and
+    # frozen here. Near-plumb with `up` along the corridor normal is the
+    # house style: it survives ReplicaCAD's ceiling-height interior walls.
     "mshab_settable_chain": {
         "hab_task": "set_table",
         "chain_plan": "task_plans/set_table/custom/apple_vlm_train.json",
+        # look_at([1.6,-2.4,10.8], [-0.5,-3.0,0], up=[0.925,0.38,0]) --
+        # fridge nook sits in a slot between fridge box and hallway partition.
+        "chain_camera": {"pose": [1.6, -2.4, 10.8,
+                                  0.6199, -0.1428, 0.7603, 0.1312],
+                         "fov": 0.66},
+    },
+    # The WHOLE official episode (16 subtasks, sequential shard all-0 plan 0 =
+    # uid train-1, a DIFFERENT scene variation than the apple slice): bowl out
+    # of the kitchen-counter drawer onto the side table, drawer closed, apple
+    # out of the fridge onto the same table, fridge closed.
+    "mshab_settable_full_chain": {
+        "hab_task": "set_table",
+        "chain_plan": "task_plans/set_table/custom/settable_full_vlm_train.json",
+        # look_at([1.1,-2.3,11.5], [0.85,-2.2,0], up=[0.55,0.84,0]) -- probed
+        # against drawer/fridge/table docks of THIS variation (containers on
+        # an open wall here; no slot).
+        "chain_camera": {"pose": [1.1, -2.3, 11.5,
+                                  0.6167, -0.3299, 0.6273, 0.3426],
+                         "fov": 0.72},
     },
 }
 
@@ -273,22 +297,14 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                 "require_build_configs_repeated_equally_across_envs": False,
                 "add_event_tracker_info": True,
                 "invisible_goals_in_human_render": False,
-                # Fixed near-plumb camera replacing the default torso-mounted
-                # follow cam (which yaws with the base -- every turn swung the
-                # whole picture). Pose = look_at([1.6,-2.4,10.8],
-                # [-0.5,-3.0,0.0], up=[0.925,0.38,0]): up along the corridor
-                # normal lays the 9m fridge->table line across the 16:9 frame.
-                # Near-plumb is FORCED by the scene, not taste: the fridge
-                # faces EAST and its open/pick docks sit in a slot between the
-                # fridge box and the ceiling-height hallway partition -- every
-                # oblique angle tried (4 sides, 3 heights) hid the robot for
-                # the whole open segment. Frame-verified at all three docks.
-                # far=40 because the default 10 clips the far sightline.
+                # Fixed near-plumb camera (per-chain pose from the TASKS
+                # table) replacing the default torso-mounted follow cam,
+                # which yaws with the base -- every turn swung the whole
+                # picture. far=40 because the default 10 clips far sightlines.
                 "human_render_camera_configs": {"render_camera": {
-                    "pose": [1.6, -2.4, 10.8,
-                             0.6199, -0.1428, 0.7603, 0.1312],
+                    **cfg["chain_camera"],
                     "mount": None, "width": 768, "height": 432,
-                    "fov": 0.66, "near": 0.01, "far": 40.0,
+                    "near": 0.01, "far": 40.0,
                 }},
                 # navigate: the RL policy was never trained to retract the
                 # arm; without the flag its subtask NEVER passes (the
@@ -305,7 +321,32 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                               "place": {"horizon": 400}},
             },
         )
-        return MshabChainEnv(mshab_make_env(env_cfg), seed=spec.seed)
+        chain_env = MshabChainEnv(mshab_make_env(env_cfg), seed=spec.seed)
+        # The env scrubs subtask identities to positional names (obj_id AND
+        # actor name become "obj_<n>"), but the spawn-row filters need the
+        # REAL ids ("024_bowl-3", "fridge"). The chain JSON is the grounding
+        # source of truth -- thread its per-subtask ids through the adapter.
+        import json
+
+        plan0 = json.loads(
+            (rearrange / cfg["chain_plan"]).read_text())["plans"][0]
+        chain_env.subtask_real_ids = [
+            st.get("obj_id") or st.get("articulation_type")
+            for st in plan0["subtasks"]]
+        # one kitchen_counter articulation holds SEVERAL drawers: the handle
+        # identity (articulation instance + link + joint) is the only thing
+        # that says WHICH one this subtask opens.
+        chain_env.subtask_art_keys = [
+            (st.get("articulation_id"),
+             st.get("articulation_handle_link_idx"),
+             st.get("articulation_handle_active_joint_idx"))
+            if st.get("articulation_type") else None
+            for st in plan0["subtasks"]]
+        # articulations MOVE between scene variations (fridge y differs by
+        # 0.8m across two set_table scenes): the spawn-row filters need the
+        # scene identity to keep foreign-scene docks out.
+        chain_env.build_config_name = plan0.get("build_config_name")
+        return chain_env
 
     rearrange = ASSET_DIR / "scene_datasets/replica_cad_dataset/rearrange"
     plans = plan_data_from_file(

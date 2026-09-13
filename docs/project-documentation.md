@@ -959,6 +959,21 @@ nav——细节与坑谱见 drivers.py 注释）。取景窗/视频用**固定�
 滑出（place 起手即丢物，280 步烧穿力限额）；② PLANNING_CONTEXT 带 `objects`
 时必须同时给 `required_per_object_order`（validate 的 requirements 检查）。
 
+**完整 episode（`mshab_settable_full_vlm`，2026-09-13 已通）**：官方 sequential
+plan 全 16 段（碗出厨房抽屉上桌、关抽屉、苹果出冰箱上桌、关冰箱），VLM 一次
+自主产出 16 节点图（含两处 open-before-pick、两处 close-after-delivery 与全局
+顺序推理），runtime `plan_complete success=true, replans=0`（21 次 actuation，
+5 次段内重试全部自愈）。可靠性来自停靠行治理（全部在 drivers.py）：spawn 行
+不带物体/场景身份且 qpos 是相对该回合 ROOT 的——必须经 per-object/articulation
+plan 文件圈亲生行（place 还要按 goal_pos 匹配、open/close 按 build_config +
+把手三元组匹配，同一 kitchen_counter 有多个抽屉）+ `robot_pos + row_qpos -
+our_root` 的坐标折算；nav admitted 的行会被记住，manipulation 段首进复用同
+一行（无跳变），段内重试按行轮转并恢复 subtask 时钟与力账（否则重试烧的是
+死时钟，fail 闩死）。空手停靠准入力限 2000N（干净位姿 ~0N、穿模百万 N 级，
+5N 时代的毫牛噪声曾让准入变成掷硬币）。链 JSON 的真实 id 经适配器
+`subtask_real_ids`/`subtask_art_keys`/`build_config_name` 透传（env 会把
+obj_id 洗成 `obj_<n>`）。
+
 ## 6. 接入你自己的模型
 
 三条缝，都已建好并有测试。每条缝 = 一次 manifest 编辑加一条验证命令，**永远不用改

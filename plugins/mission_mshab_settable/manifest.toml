@@ -11,6 +11,29 @@
 # LOCAL sglang endpoint (the DeepSeek default has no balance on this machine).
 needs_sim = true
 
+# The FULL official episode (sequential plan 0, all 16 subtasks): bowl out of
+# the kitchen drawer, apple out of the fridge, both to the table, both
+# containers closed. Doubled graph, close skill unlocked, doubled token
+# budget for the plan JSON.
+[task_bindings.mshab_settable_full_vlm]
+env = "plugins.embodiment_mshab:provider"
+policy = "plugins.embodiment_mshab.drivers:chain_provider"
+planner = "plugins.mission_mshab_settable.planner:provider_full"
+catalogue = "plugins.mission_mshab_settable.planner:CATALOGUE_FULL"
+oracles = "plugins.mission_mshab_settable.planner:ORACLES"
+skill_docs = "plugins.mission_mshab_settable.planner:SKILL_DOCS_FULL"
+planning_context = "plugins.mission_mshab_settable.planner:PLANNING_CONTEXT_FULL"
+default_instruction = "plugins.mission_mshab_settable.planner:DEFAULT_INSTRUCTION_FULL"
+episodic = true
+episode = "plugins.mission_mshab_settable.planner:EPISODE_FULL"
+segment_specs = "plugins.mission_mshab_settable.planner:SEGMENT_SPECS_FULL"
+max_actuations = 40
+# place is a ~60%-per-attempt policy even from native docks; retries rotate
+# the dock row, so 4 attempts puts the segment at ~97% -- and the replan
+# governor rightly refuses a same-graph replan, so in-segment retries are
+# where the odds have to come from.
+segment_retries = 3
+
 [task_bindings.mshab_settable_vlm]
 env = "plugins.embodiment_mshab:provider"
 policy = "plugins.embodiment_mshab.drivers:chain_provider"
@@ -24,4 +47,4 @@ episodic = true
 episode = "plugins.mission_mshab_settable.planner:EPISODE"
 segment_specs = "plugins.mission_mshab_settable.planner:SEGMENT_SPECS"
 max_actuations = 16
-segment_retries = 1
+segment_retries = 3

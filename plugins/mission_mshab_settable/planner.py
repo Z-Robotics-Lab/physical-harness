@@ -91,6 +91,79 @@ SEGMENT_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+# ---- the FULL official episode (sequential plan 0, all 16 subtasks): two
+# ---- objects, two containers, close-after-delivery. Same scene, same env
+# ---- authority; the graph the VLM must design roughly doubles.
+
+CATALOGUE_FULL: dict[str, dict[str, type]] = {
+    **CATALOGUE,
+    "close": {"articulation": str},
+}
+
+SKILL_DOCS_FULL: dict[str, dict[str, Any]] = {
+    **SKILL_DOCS,
+    "close": {"description": "Close the named articulation with the arm. Only "
+                             "sensible once everything needed from inside it "
+                             "has been taken out and delivered.",
+              "kind": "segment", "arguments": {"articulation": "str"},
+              "requires": ["near({articulation})", "open({articulation})"],
+              "ensures": ["closed({articulation})"],
+              "clobbers": ["open({articulation})"]},
+}
+
+PLANNING_CONTEXT_FULL: dict[str, Any] = {
+    "benchmark": "mshab (ManiSkill-HAB set_table, full episode)",
+    "scene": "ReplicaCAD apartment, official set_table sequential plan 0",
+    "objects": ["024_bowl", "013_apple"],
+    "required_per_object_order": ["pick", "place"],
+    "articulations": ["kitchen_counter", "fridge"],
+    "navigate_targets": ["kitchen_counter", "024_bowl", "fridge",
+                         "013_apple", "dining_table"],
+    "facts": [
+        "the bowl (024_bowl) starts INSIDE a CLOSED drawer of the kitchen_counter",
+        "the apple (013_apple) starts INSIDE the CLOSED fridge",
+        "both goal locations are on the dining table",
+        "every manipulation needs a navigate to its target first",
+        "each container must be CLOSED again once the item it held has been "
+        "delivered to the table",
+        # env grounding, not planning help: the baked official plan runs the
+        # bowl arc first -- an apple-first graph would fail its first segment.
+        "the environment enforces this global order: the bowl is delivered and "
+        "its drawer closed BEFORE the fridge is touched for the apple",
+    ],
+    "unavailable_skills": [],
+    "notes": "One skill call per graph node; every node needs a verify entry "
+             "with predicate segment_success.",
+}
+
+DEFAULT_INSTRUCTION_FULL = (
+    "Set the table: fetch the bowl from the kitchen drawer and the apple from "
+    "the fridge, put both on the dining table, and leave both containers "
+    "closed. Design the full skill graph yourself from the scene facts."
+)
+
+#: 16 subtasks: 8 navigates (two of them long real-driving legs) + 4
+#: manipulations + 2 open + 2 close, plus dock-search overhead billed to the
+#: env clock -- the kitchen_thaw c3 lesson says give real slack.
+EPISODE_FULL: dict[str, Any] = {"task": "mshab_settable_full_chain",
+                                "horizon": 24000}
+
+SEGMENT_SPECS_FULL: dict[str, dict[str, Any]] = {
+    "navigate": {"task_template": "chain-navigate.{target}",
+                 "allowed_args": {"target": ("kitchen_counter", "024_bowl",
+                                             "fridge", "013_apple",
+                                             "dining_table")}},
+    "open": {"task_template": "chain-open.{articulation}",
+             "allowed_args": {"articulation": ("kitchen_counter", "fridge")}},
+    "close": {"task_template": "chain-close.{articulation}",
+              "allowed_args": {"articulation": ("kitchen_counter", "fridge")}},
+    "pick": {"task_template": "chain-pick.{object}",
+             "allowed_args": {"object": ("024_bowl", "013_apple")}},
+    "place": {"task_template": "chain-place.{object}",
+              "allowed_args": {"object": ("024_bowl", "013_apple")}},
+}
+
+
 class _SegmentStamp:
     """Stamp ``kind="segment"`` on every catalogue node the VLM emits.
 
@@ -107,7 +180,7 @@ class _SegmentStamp:
         out = dict(self._inner.plan(brief))
         nodes = [dict(n) for n in out.get("nodes") or ()]
         for n in nodes:
-            if n.get("skill") in CATALOGUE:
+            if n.get("skill") in CATALOGUE_FULL:   # superset of CATALOGUE
                 n.setdefault("kind", "segment")
         out["nodes"] = nodes
         return out
@@ -134,3 +207,10 @@ def provider(**params: Any):
     }
     merged.update(params)
     return _SegmentStamp(load_provider("plugins.planner_vlm:provider", merged))
+
+
+def provider_full(**params: Any):
+    """Same endpoint; a ~16-node graph JSON with verify entries runs well past
+    the 6-node budget, so double max_tokens (measured: 6 nodes ~1.6k tokens)."""
+    params.setdefault("max_tokens", 8192)
+    return provider(**params)
