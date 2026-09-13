@@ -298,7 +298,11 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
             env_kwargs={
                 "require_build_configs_repeated_equally_across_envs": False,
                 "add_event_tracker_info": True,
-                "invisible_goals_in_human_render": False,
+                # goal markers are debug geometry: our render path calls
+                # render_rgb_array directly and skips the env's
+                # set_moving_goal_poses_for_render, so visible markers sit at
+                # stale poses and pop around between frames -- the "flicker".
+                "invisible_goals_in_human_render": True,
                 # Fixed near-plumb camera (per-chain pose from the TASKS
                 # table) replacing the default torso-mounted follow cam,
                 # which yaws with the base -- every turn swung the whole

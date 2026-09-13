@@ -906,11 +906,11 @@ class ChainDriver:
         import math as _m
 
         leg = _m.hypot(tx - float(bl0[0, 0]), ty - float(bl0[0, 1]))
-        # Legs > 1.5m drive for real; anything shorter GLIDES (a smooth
-        # 2.5cm/frame kinematic slide -- visually continuous, no hard cut,
-        # and no driven skim along the OPEN fridge door, which broke pick
-        # whenever the 0.9m fridge->apple leg was actually driven).
-        state = {"waypoints": [] if leg < 1.5 else [(tx, ty)],
+        # EVERY leg drives for real -- the kinematic glide translated the
+        # base with the wheels frozen (and through furniture), which reads
+        # as non-physical however smooth. Sub-12cm legs are already at the
+        # dock and go straight to arrival prep.
+        state = {"waypoints": [] if leg < 0.12 else [(tx, ty)],
                  "trail": [], "stalls": 0, "snapped": False}
 
         def _apply_state():
@@ -922,36 +922,6 @@ class ChainDriver:
             if hasattr(scene, "_gpu_fetch_all"):
                 scene._gpu_fetch_all()
             uenv.agent.controller.reset()
-
-        def _teleport_to_dock():
-            q = robot.get_qpos()
-            q[0, :] = dock_state["qpos"][0]
-            robot.set_qpos(q)
-            # Kill the arrival momentum: set_qpos keeps qvel, and the base
-            # arrives DRIVING (~0.35m/s). Same for the held object below --
-            # a teleported apple that keeps its carry velocity integrates
-            # right out of the now-static fingers on the next step, lands on
-            # the table, and place starts already lost (seen: obj frozen
-            # 15cm off goal for a full 280-step place, grasp False from
-            # step 1). _restore/_spawn_dock already zero object velocity;
-            # this teleport is the one that ran straight after real driving.
-            zv = getattr(robot, "set_qvel", None)
-            if callable(zv):
-                import torch as _t
-
-                zv(_t.zeros_like(robot.get_qvel()))
-            if dock_state["obj"] is not None:
-                from mani_skill.utils.structs.pose import Pose
-
-                o, p0, q0 = dock_state["obj"]
-                o.set_pose(Pose.create_from_pq(p=p0, q=q0))
-                import torch as _t
-
-                for setter in ("set_linear_velocity", "set_angular_velocity"):
-                    fn = getattr(o, setter, None)
-                    if callable(fn):
-                        fn(_t.zeros(1, 3, device=p0.device))
-            _apply_state()
 
         def _glide_to_dock(n_steps: int):
             # NO hard cut: interpolate the BASE ONLY (x, y, yaw) to the dock
@@ -987,15 +957,15 @@ class ChainDriver:
             yaw = float(robot.get_qpos()[0, 2])
             if not state["waypoints"]:
                 if not state.get("snapped"):
-                    # arrival preparation, ALL inside one act call -- glide
-                    # (short legs), face the goal, action-space arm blend,
-                    # exact residual fix. Piecemeal phases lose a race with
-                    # the env: it seals the subtask the moment its criteria
-                    # hold (mid-procedure), and the next policy starts from
-                    # a half-prepared state (broke pick, then place).
-                    if leg < 1.5 and not state.get("glided"):
-                        _glide_to_dock(max(12, int(leg * 40)))
-                        state["glided"] = True
+                    # arrival preparation, ALL inside one act call -- face
+                    # the goal, then action-space arm blend. Piecemeal
+                    # phases lose a race with the env: it seals the subtask
+                    # the moment its criteria hold (mid-procedure), and the
+                    # next policy starts from a half-prepared state (broke
+                    # pick, then place). NO residual teleport: the docking
+                    # criteria carry +-0.6m of slack, the 12cm the drive
+                    # parks within is inside it, and the popped correction
+                    # was a visible jump at the end of every leg.
                     for _ in range(120):
                         bl2 = uenv.agent.base_link.pose.p
                         x2, y2 = float(bl2[0, 0]), float(bl2[0, 1])
@@ -1016,14 +986,10 @@ class ChainDriver:
                         for j, e in enumerate(errs):
                             a[0, j] = max(-1.0, min(1.0, 1.5 * e))
                         self._env.step(a)
-                    _teleport_to_dock()
                     state["snapped"] = True
-                    # The glide is presentation, not behavior: a kinematic
-                    # slide that grazes furniture (a leaning bike, an open
-                    # door) banks MILLIONS of fictitious N and locks the
-                    # navigate seal out forever. Same semantics as the
-                    # post-dock-search zero: the ledger restarts at the
-                    # settled dock.
+                    # the dock-probe/drive contact account restarts at the
+                    # settled arrival, same semantics as the env's own
+                    # subtask-transition zero.
                     uenv.robot_cumulative_force[:] = 0
                 return hold                      # aligned + posed: env seals
             wx, wy = state["waypoints"][0]
@@ -1043,7 +1009,11 @@ class ChainDriver:
                     if state["stalls"] == 1 and self._hub is not None:
                         state["waypoints"] = [self._hub, (tx, ty)]
                     else:
-                        _teleport_to_dock()
+                        # last resort for a wedged drive: a slow slide, not
+                        # a cut (a held object rides the gripper physically
+                        # until the slide's own re-seat).
+                        rem = math.hypot(tx - x, ty - y)
+                        _glide_to_dock(max(24, int(rem * 40)))
                         state["waypoints"] = []
                     return hold
             err = (math.atan2(wy - y, wx - x) - yaw + math.pi) % (2 * math.pi) - math.pi
