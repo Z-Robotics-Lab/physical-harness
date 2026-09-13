@@ -67,6 +67,9 @@ _CAPTURED = 0
 #: Latest-rollout video capture. Frames are operational state beside frame.jpg,
 #: never chain evidence. One resident runtime processes one brief at a time.
 VIDEO_FPS = 20
+
+#: last RECORDED video frame, stride-8 subsampled (freeze-skip comparator)
+_VIDEO_PREV = None
 MAX_VIDEO_FRAMES = 6000
 _VIDEO_ACTIVE = False
 _VIDEO_SEQ = 0
@@ -125,12 +128,29 @@ def arm(path) -> None:
                       ignore_errors=True)
 
 
-def _record_video_frame(image) -> None:
-    """Append one already-rendered image to the active rollout staging area."""
-    global _VIDEO_SEQ
+def _record_video_frame(image, px) -> None:
+    """Append one already-rendered image to the active rollout staging area.
+
+    FREEZE-SKIP: a frame whose pixels match the previous RECORDED frame
+    (stride-8 subsample, mean abs diff < 0.015/255) is dropped -- seal
+    waits and settle holds froze a fifth of the assembled video into
+    0.6-3s stills that read as stutter. Dropping identical frames cuts the
+    wait, never the motion: the robot's pose is unchanged across the cut,
+    so no jump can appear. Threshold calibration: a genuinely frozen raw
+    render pair sits near 0.005, the small robot in real motion
+    contributes ~0.03-0.05 on the subsampled grid (0.5 once ate 93% of a
+    run's frames -- the robot spans only ~25 subsample cells)."""
+    global _VIDEO_SEQ, _VIDEO_PREV
     if not _VIDEO_ACTIVE or _PATH is None or _VIDEO_SEQ >= MAX_VIDEO_FRAMES:
         return
     try:
+        import numpy as _np
+
+        small = _np.asarray(px)[::8, ::8].astype(_np.int16)
+        if (_VIDEO_PREV is not None and _VIDEO_PREV.shape == small.shape
+                and float(_np.abs(small - _VIDEO_PREV).mean()) < 0.015):
+            return
+        _VIDEO_PREV = small
         directory = os.path.join(os.path.dirname(_PATH), "rollout-frames")
         os.makedirs(directory, exist_ok=True)
         _VIDEO_SEQ += 1
@@ -143,7 +163,7 @@ def _record_video_frame(image) -> None:
 def _video_event(seq: int, kind: str) -> None:
     """Start/finalize latest-rollout capture from task lifecycle events."""
     del seq
-    global _VIDEO_ACTIVE, _VIDEO_SEQ
+    global _VIDEO_ACTIVE, _VIDEO_SEQ, _VIDEO_PREV
     if _PATH is None:
         return
     root = os.path.dirname(_PATH)
@@ -152,6 +172,7 @@ def _video_event(seq: int, kind: str) -> None:
     if kind == "task_claimed":
         _VIDEO_ACTIVE = True
         _VIDEO_SEQ = 0
+        _VIDEO_PREV = None
         shutil.rmtree(staging, ignore_errors=True)
         try:
             os.remove(output)
@@ -222,10 +243,16 @@ def dump(env, path: str | None = None) -> None:
 
         tmp = dest + ".tmp"
         image = Image.fromarray(px)
-        image.save(tmp, "JPEG", quality=QUALITY)
+        # The viewport copy is capped at 640 wide: the dashboard cell is
+        # small, and a full 720p JPEG every sim step both bloats the b64
+        # long-poll hop and adds ~20ms of encode per step (which drags the
+        # LIVE feed's rhythm). The mp4 keeps the full resolution.
+        view = (image if image.width <= 640 else
+                image.resize((640, image.height * 640 // image.width)))
+        view.save(tmp, "JPEG", quality=75)
         os.replace(tmp, dest)
         if path is None:
-            _record_video_frame(image)
+            _record_video_frame(image, px)
     except Exception:  # noqa: BLE001, S110 -- viewport capture cannot affect the task
         pass
 
