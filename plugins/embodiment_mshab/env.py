@@ -57,12 +57,14 @@ TASKS: dict[str, dict] = {
     "mshab_settable_full_chain": {
         "hab_task": "set_table",
         "chain_plan": "task_plans/set_table/custom/settable_full_vlm_train.json",
-        # look_at([1.1,-2.3,11.5], [0.85,-2.2,0], up=[0.55,0.84,0]) -- probed
-        # against drawer/fridge/table docks of THIS variation (containers on
-        # an open wall here; no slot).
-        "chain_camera": {"pose": [1.1, -2.3, 11.5,
-                                  0.6167, -0.3299, 0.6273, 0.3426],
-                         "fov": 0.72},
+        # look_at([5.0,1.5,9.5], [0.0,-2.3,0.3]): high-NE 3/4 view -- this
+        # variation's containers sit on an open wall (no ceiling-height
+        # slot), so the oblique angle survives; frame-verified at all three
+        # docks (the near-plumb first take read as a floor plan). Height 9.5
+        # is what clears the hallway block in front of the fridge dock.
+        "chain_camera": {"pose": [5.0, 1.5, 9.5,
+                                  0.2823, 0.4426, 0.1491, -0.838],
+                         "fov": 0.8},
     },
 }
 

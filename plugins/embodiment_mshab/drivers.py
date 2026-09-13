@@ -357,8 +357,13 @@ class ChainDriver:
                     sd[k][field][:, :2] - anchor, dim=1).min())
 
         keys.sort(key=_rank)
-        return sd, [(k, r) for k in keys
-                    for r in range(len(sd[k]["robot_qpos"]))]
+        rows = [(k, r) for k in keys
+                for r in range(len(sd[k]["robot_qpos"]))]
+        if skill in ("open", "close"):
+            import random as _random
+            _random.Random(int(getattr(self._spec, "seed", 0)) + ptr
+                           ).shuffle(rows)
+        return sd, rows
 
     def _ensure_manip_dock(self) -> None:
         """Every manipulation segment STARTS from its own native spawn row:
@@ -384,6 +389,13 @@ class ChainDriver:
         self._dock_rot[rot_key] = start + 1
         choice = self._dock_choice.get(ptr)
         base = rows.index(choice) if choice in rows else 0
+        # Distance-ranked neighbours are near-clones of the same dock, so a
+        # +1 retry walk repeats the failure (probed: open 0/4 with all four
+        # attempts on adjacent rows). pick/open/close leap a prime stride
+        # across the ranked list instead; place keeps +1 -- its list is
+        # exact-goal-episode-first and the next row IS the diversity.
+        stride = 1 if skill == "place" else 97
+        rows = rows[:400]
         if start == 0:
             # first entry: the nav arrival state IS the admitted dock --
             # keep it. Only place re-docks here, and only when the carry
@@ -410,7 +422,7 @@ class ChainDriver:
         self._env.frames_suppressed = True
         try:
             for i in range(min(len(rows), 8)):
-                key, row = rows[(base + start + i) % len(rows)]
+                key, row = rows[(base + start * stride + i) % len(rows)]
                 q_row = sd[key]["robot_qpos"][row]
                 want = sd[key]["robot_pos"][row]
                 q = robot.get_qpos()
@@ -422,6 +434,20 @@ class ChainDriver:
                 robot.set_qpos(q)
                 robot.set_qvel(torch.zeros_like(robot.get_qvel()))
                 _flush()
+                if skill == "pick" and "articulation_qpos" in sd[key]:
+                    # the row's container openness is part of the trained
+                    # start state: our own open policy sometimes seals at a
+                    # crack (13-step opens) the pick arm cannot reach past --
+                    # a retry re-docks the DOOR too, exactly as the official
+                    # pick episode spawns it.
+                    art = uenv.subtask_articulations[ptr]
+                    aq = sd[key]["articulation_qpos"][row]
+                    if art is not None and aq.numel() <= art.qpos.shape[1]:
+                        q_art = art.qpos.clone()
+                        q_art[0, :aq.numel()] = aq.to(q_art.device)
+                        art.set_qpos(q_art)
+                        art.set_qvel(art.qvel * 0)
+                        _flush()
                 if skill == "place" and obj is not None:
                     rel = sd[key]["obj_raw_pose_wrt_tcp"][row]
                     rel_pose = Pose.create_from_pq(
@@ -723,6 +749,13 @@ class ChainDriver:
                     ranked.append((round(gm, 3), float(dmin.values),
                                    key, int(dmin.indices)))
                 ranked.sort()
+                if nxt in ("open", "close"):
+                    # nearest-to-handle rows are crowd-the-handle outliers;
+                    # the official env samples spawn rows UNIFORMLY. Restore
+                    # that distribution (seeded: same brief, same order).
+                    import random as _random
+                    _random.Random(int(getattr(self._spec, "seed", 0)) + ptr
+                                   ).shuffle(ranked)
                 root_p = robot.pose.p
                 for _, _, key, row in ranked[:24]:
                     # Official application (mshab subtask.py) is set_pose(
