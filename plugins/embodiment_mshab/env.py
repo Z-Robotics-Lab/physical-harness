@@ -307,9 +307,12 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
                 # table) replacing the default torso-mounted follow cam,
                 # which yaws with the base -- every turn swung the whole
                 # picture. far=40 because the default 10 clips far sightlines.
+                # 720p: the resolution IS the picture quality here (the
+                # default/rt shaders probed near-identical in this flat-lit
+                # interior; minimal renders 720p in 1ms).
                 "human_render_camera_configs": {"render_camera": {
                     **cfg["chain_camera"],
-                    "mount": None, "width": 768, "height": 432,
+                    "mount": None, "width": 1280, "height": 720,
                     "near": 0.01, "far": 40.0,
                 }},
                 # navigate: the RL policy was never trained to retract the

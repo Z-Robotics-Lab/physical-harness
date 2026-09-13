@@ -100,9 +100,10 @@ def _size(raw: str) -> tuple[int, int]:
 #: fills a dashboard grid cell; ~15-50KB as a q70 JPEG depending on the scene).
 WIDTH, HEIGHT = _size(os.environ.get("PH_FRAMES_SIZE", "640x480"))
 
-#: JPEG quality: 70 keeps the 640x480 frame's b64-over-RPC hop cheap (~2x the
-#: old 400x300 q80 bytes for 2.6x the pixels).
-QUALITY = 70
+#: JPEG quality: 85 -- the mshab chain publishes 1280x720 frames and the mp4
+#: is assembled from these same stills, so staging quality IS video quality
+#: (q70 read soft). ~180KB/frame at 720p; the b64 hop is LAN-local.
+QUALITY = 85
 
 #: Offscreen camera preference, first present in the model wins: the robocasa
 #: kitchen head cam, then the robosuite tabletop views. None (free camera) as
@@ -168,7 +169,8 @@ def _video_event(seq: int, kind: str) -> None:
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(VIDEO_FPS),
              "-i", os.path.join(staging, "%06d.jpg"), "-c:v", "libx264",
-             "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary],
+             "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+             temporary],
             check=True, timeout=120, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         os.replace(temporary, output)
