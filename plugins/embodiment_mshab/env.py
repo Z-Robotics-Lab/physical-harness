@@ -288,6 +288,12 @@ def make_env(spec: EpisodeSpec) -> MshabEnv:
         env_cfg = EnvConfig(
             env_id="SequentialTask-v0",
             num_envs=1,
+            # CPU physics + GPU render: at num_envs=1 the GPU PhysX kernel
+            # launches cost a FIXED ~26ms/step (measured) -- two thirds of
+            # the whole step -- which capped the live feed at ~13fps. Every
+            # _gpu_* call in the driver is hasattr-guarded, so the CPU
+            # backend just skips them.
+            sim_backend="cpu",
             max_episode_steps=int(spec.horizon),
             continuous_task=True,
             # Mirror the teammate's PROVEN chain-runner config bit for bit

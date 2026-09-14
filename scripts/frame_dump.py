@@ -70,6 +70,32 @@ VIDEO_FPS = 20
 
 #: last RECORDED video frame, stride-8 subsampled (freeze-skip comparator)
 _VIDEO_PREV = None
+
+#: One background encoder thread: the two JPEG encodes (viewport + video
+#: still) cost ~30ms of the ~73ms sim step when done inline -- the live
+#: feed's rhythm IS the sim's wall rate, so encode off the hot path (PIL
+#: releases the GIL). One worker keeps frame order; the backlog cap drops
+#: frames instead of ballooning memory if encoding ever falls behind.
+import concurrent.futures as _cf
+
+_ENC_POOL = _cf.ThreadPoolExecutor(max_workers=1)
+_ENC_PENDING = 0
+_ENC_CAP = 16
+
+
+def _enc_done(_fut) -> None:
+    global _ENC_PENDING
+    _ENC_PENDING -= 1
+
+
+def _submit_encode(fn, *args) -> bool:
+    """Queue one encode; False (dropped) when the backlog cap is hit."""
+    global _ENC_PENDING
+    if _ENC_PENDING >= _ENC_CAP:
+        return False
+    _ENC_PENDING += 1
+    _ENC_POOL.submit(fn, *args).add_done_callback(_enc_done)
+    return True
 MAX_VIDEO_FRAMES = 6000
 _VIDEO_ACTIVE = False
 _VIDEO_SEQ = 0
@@ -154,8 +180,13 @@ def _record_video_frame(image, px) -> None:
         directory = os.path.join(os.path.dirname(_PATH), "rollout-frames")
         os.makedirs(directory, exist_ok=True)
         _VIDEO_SEQ += 1
-        image.save(os.path.join(directory, f"{_VIDEO_SEQ:06d}.jpg"),
-                   "JPEG", quality=QUALITY)
+        out = os.path.join(directory, f"{_VIDEO_SEQ:06d}.jpg")
+
+        def _write(im=image, o=out):
+            im.save(o, "JPEG", quality=QUALITY)
+
+        if not _submit_encode(_write):
+            _write()
     except Exception:  # noqa: BLE001, S110 -- rollout capture cannot affect the task
         pass
 
@@ -182,6 +213,12 @@ def _video_event(seq: int, kind: str) -> None:
     if kind not in {"task_done", "task_failed", "task_cancelled"}:
         return
     _VIDEO_ACTIVE = False
+    # drain the background encoder before assembly: one worker executes in
+    # order, so this barrier resolves only after every queued still landed.
+    try:
+        _ENC_POOL.submit(lambda: None).result(timeout=30)
+    except Exception:  # noqa: BLE001 -- a wedged encoder loses frames, not the task
+        pass
     if _VIDEO_SEQ == 0:
         shutil.rmtree(staging, ignore_errors=True)
         return
@@ -249,10 +286,16 @@ def dump(env, path: str | None = None) -> None:
         # LIVE feed's rhythm). The mp4 keeps the full resolution.
         view = (image if image.width <= 640 else
                 image.resize((640, image.height * 640 // image.width)))
-        view.save(tmp, "JPEG", quality=75)
-        os.replace(tmp, dest)
+
+        def _publish(v=view, t=tmp, d=dest):
+            v.save(t, "JPEG", quality=75)
+            os.replace(t, d)
+
         if path is None:
+            _submit_encode(_publish)
             _record_video_frame(image, px)
+        else:
+            _publish()   # keyframes are one-shot stills; keep them sync
     except Exception:  # noqa: BLE001, S110 -- viewport capture cannot affect the task
         pass
 
@@ -301,9 +344,18 @@ class _FrameEnv:
 
     def step(self, action):
         global _LAST_ENV
+        import time as _t
+        _t0 = _t.perf_counter()
         out = self._env.step(action)
+        self._t_env = getattr(self, "_t_env", 0.0) + (_t.perf_counter() - _t0)
         self._steps += 1
         _LAST_ENV = self._env
+        if self._steps % 400 == 0:
+            _tw = _t.perf_counter() - getattr(self, "_t_wall0", _t.perf_counter())
+            print(f"[frame_dump timing] {self._steps} steps: env.step "
+                  f"{self._t_env:.1f}s of wall {_tw:.1f}s", flush=True)
+        if not hasattr(self, "_t_wall0"):
+            self._t_wall0 = _t.perf_counter()
         # An env exposing frames_suppressed=True is mid-bookkeeping (teleport
         # dock probing): those frames are strobing pose-candidates, not
         # execution, and rendering is not evidence either way.

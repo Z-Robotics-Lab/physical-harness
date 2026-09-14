@@ -80,6 +80,19 @@ _SEGMENT_CAPS = {"navigate": 2400, "pick": 280, "place": 280, "open": 200, "clos
 _ARM_QIDX = (5, 7, 8, 9, 10, 11, 12)
 
 
+def _sync_sim(uenv) -> None:
+    """Push set_qpos/set_pose edits into the live sim and re-anchor the PD
+    controller. GPU backend needs the apply/kinematics/fetch trio; the CPU
+    backend applies edits synchronously (guarding on the SCENE's methods is
+    wrong -- they exist on both backends and explode on CPU internally)."""
+    scene = uenv.scene
+    if getattr(scene, "gpu_sim_enabled", False):
+        scene._gpu_apply_all()
+        scene.px.gpu_update_articulation_kinematics()
+        scene._gpu_fetch_all()
+    uenv.agent.controller.reset()
+
+
 class ChainDriver:
     """Heterogeneous episodic driver over the official MS-HAB RL checkpoints.
 
@@ -164,11 +177,17 @@ class ChainDriver:
             if algo.name == "ppo":
                 from mshab.agents.ppo import Agent as PPOAgent
 
-                policy = PPOAgent(self._env.pipeline_obs, act_shape)
+                from mshab.utils.array import to_tensor
+
+                policy = PPOAgent(
+                    to_tensor(self._env.pipeline_obs, device=device), act_shape)
                 policy.eval(); policy.load_state_dict(state); policy.to(device)
 
                 def act(obs, policy=policy):
                     with torch.no_grad():
+                        # device move only (dtype untouched): the CPU sim
+                        # hands CPU tensors to a CUDA policy.
+                        obs = to_tensor(obs, device=device)
                         return policy.get_action(obs, deterministic=True)
             elif algo.name == "sac":
                 # evaluate.py's SAC branch verbatim: per-camera 4D frame-stacked
@@ -412,10 +431,7 @@ class ChainDriver:
         root_p = robot.pose.p
 
         def _flush():
-            scene._gpu_apply_all()
-            scene.px.gpu_update_articulation_kinematics()
-            scene._gpu_fetch_all()
-            uenv.agent.controller.reset()
+            _sync_sim(uenv)
 
         hold = torch.zeros(1, 13)
         hold[0, 7] = -1.0 if skill == "place" else 0.0
@@ -565,12 +581,7 @@ class ChainDriver:
                 # GPU sim: push + refresh BEFORE the controller re-anchor, or
                 # reset() reads the stale pre-teleport qpos as its PD target
                 # and drags the base back to origin (probed: within 5 steps).
-                if hasattr(scene, "_gpu_apply_all"):
-                    scene._gpu_apply_all()
-                if hasattr(scene.px, "gpu_update_articulation_kinematics"):
-                    scene.px.gpu_update_articulation_kinematics()
-                if hasattr(scene, "_gpu_fetch_all"):
-                    scene._gpu_fetch_all()
+                _sync_sim(uenv)
 
             # Snapshot for restore: a FAILED docking candidate must leave no
             # side effect -- an abandoned attempt once teleported the held
@@ -915,13 +926,7 @@ class ChainDriver:
 
         def _apply_state():
             scene = uenv.scene
-            if hasattr(scene, "_gpu_apply_all"):
-                scene._gpu_apply_all()
-            if hasattr(scene.px, "gpu_update_articulation_kinematics"):
-                scene.px.gpu_update_articulation_kinematics()
-            if hasattr(scene, "_gpu_fetch_all"):
-                scene._gpu_fetch_all()
-            uenv.agent.controller.reset()
+            _sync_sim(uenv)
 
         def _glide_to_dock(n_steps: int):
             # NO hard cut: interpolate the BASE ONLY (x, y, yaw) to the dock
